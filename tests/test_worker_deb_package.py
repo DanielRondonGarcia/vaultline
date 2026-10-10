@@ -120,6 +120,10 @@ class WorkerDebPackageTests(unittest.TestCase):
         self.assertIn("WORKER_NAME=", example)
         self.assertIn("WORKER_CREDENTIAL_FILE=/var/lib/docker-volume-backup/worker_credentials.json", example)
         self.assertIn("WORKER_RUNTIME=native", example)
+        # The file is an optional override set: enroll persists the URL for the service.
+        self.assertIn("OPTIONAL", example)
+        self.assertIn("vaultline-worker enroll --control-plane-url", example)
+        self.assertIn("worker.json", example)
         self.assertNotIn("WORKER_ENROLLMENT_TOKEN", example)
         self.assertNotIn("WORKER_SECRET", example)
         self.assertNotIn("change-me", example.lower())

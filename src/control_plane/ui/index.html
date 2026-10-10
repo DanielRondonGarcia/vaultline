@@ -1257,10 +1257,12 @@
       });
     }
 
+    // `key` is the release asset served as the primary download; `secondaryKey`
+    // (Windows only) is the portable exe offered for foreground diagnostics.
     const NATIVE_WORKER_PLATFORMS = {
-      "linux-amd64": { label: "Linux amd64 (.deb)", os: "linux", key: "linux-amd64" },
-      "linux-arm64": { label: "Linux arm64 (.deb)", os: "linux", key: "linux-arm64" },
-      "windows-amd64": { label: "Windows x64 portable (.exe)", os: "windows", key: "windows-amd64" },
+      "linux-amd64": { label: "Linux amd64 (.deb)", os: "linux", key: "linux-amd64", packageSuffix: "amd64.deb" },
+      "linux-arm64": { label: "Linux arm64 (.deb)", os: "linux", key: "linux-arm64", packageSuffix: "arm64.deb" },
+      "windows-amd64": { label: "Windows x64 instalador (.msi)", os: "windows", key: "windows-amd64-msi", packageSuffix: "windows-amd64.msi", secondaryKey: "windows-amd64", secondaryLabel: "Ejecutable portable (.exe) para diagnostico" },
     };
 
     function nativeWorkerReleaseUrl() {
@@ -1270,38 +1272,61 @@
     function assetForSelectedNativePlatform() {
       const platform = addWorkerState.nativePlatform || "linux-amd64";
       const assets = state.latestAssets || {};
-      return { platform, info: NATIVE_WORKER_PLATFORMS[platform] || NATIVE_WORKER_PLATFORMS["linux-amd64"], asset: assets[platform] || null, checksums: assets.checksums || null };
+      const info = NATIVE_WORKER_PLATFORMS[platform] || NATIVE_WORKER_PLATFORMS["linux-amd64"];
+      return {
+        platform,
+        info,
+        asset: assets[info.key] || null,
+        secondaryAsset: info.secondaryKey ? assets[info.secondaryKey] || null : null,
+        checksums: assets.checksums || null,
+      };
     }
 
-    function renderAssetMetadata(asset, checksums) {
+    function renderAssetMetadata(asset, checksums, secondaryAsset, secondaryLabel) {
       if (!asset) return `<p class="helper">No hay assets nativos publicados para esta version. Usa la pagina de release y conserva la opcion Docker Compose.</p>`;
-      return `<dl class="native-asset-meta"><div><dt>Tag</dt><dd>${escapeHtml(state.latestVersion || "release")}</dd></div><div><dt>Archivo</dt><dd><a href="${escapeHtml(asset.url)}" target="_blank" rel="noopener">${escapeHtml(asset.name || "descargar")}</a></dd></div>${asset.sha256 ? `<div><dt>SHA256</dt><dd><code>${escapeHtml(asset.sha256)}</code></dd></div>` : ""}${checksums ? `<div><dt>Checksums</dt><dd><a href="${escapeHtml(checksums.url)}" target="_blank" rel="noopener">SHA256SUMS</a></dd></div>` : ""}</dl>`;
+      const secondary = secondaryAsset
+        ? `<div><dt>${escapeHtml(secondaryLabel || "Alternativa")}</dt><dd><a href="${escapeHtml(secondaryAsset.url)}" target="_blank" rel="noopener">${escapeHtml(secondaryAsset.name || "descargar")}</a></dd></div>`
+        : "";
+      return `<dl class="native-asset-meta"><div><dt>Tag</dt><dd>${escapeHtml(state.latestVersion || "release")}</dd></div><div><dt>Archivo</dt><dd><a href="${escapeHtml(asset.url)}" target="_blank" rel="noopener">${escapeHtml(asset.name || "descargar")}</a></dd></div>${asset.sha256 ? `<div><dt>SHA256</dt><dd><code>${escapeHtml(asset.sha256)}</code></dd></div>` : ""}${checksums ? `<div><dt>Checksums</dt><dd><a href="${escapeHtml(checksums.url)}" target="_blank" rel="noopener">SHA256SUMS</a></dd></div>` : ""}${secondary}</dl>`;
     }
 
     function renderNativeWorkerTab(cpUrl) {
-      const { platform, info, asset, checksums } = assetForSelectedNativePlatform();
+      const { platform, info, asset, secondaryAsset, checksums } = assetForSelectedNativePlatform();
       const downloadUrl = asset ? asset.url : nativeWorkerReleaseUrl();
       const downloadLabel = asset ? "Descargar asset directo" : "Abrir pagina de release";
-      const linuxCommands = `# Instala el paquete descargado y conserva los nombres operativos existentes.
-sudo install -d -m 0750 /etc/docker-volume-backup
-sudo install -d -m 0700 -o dvb-worker -g dvb-worker /var/lib/docker-volume-backup
-sudo editor /etc/docker-volume-backup/worker.env
+      const packageName = (asset && asset.name) || `vaultline-worker_${state.latestVersion || "<version>"}_${info.packageSuffix}`;
+      const linuxCommands = `# 1. Instala el paquete: crea el usuario dvb-worker, habilita y arranca
+#    docker-volume-backup-worker.service, que espera el enrolamiento.
+sudo dpkg -i ${packageName}
+
+# 2. Enrola una sola vez (pega el secreto solo en el prompt oculto).
+#    Guarda la credencial y la URL del Control Plane en /var/lib/docker-volume-backup.
 sudo vaultline-worker enroll --control-plane-url ${cpUrl}
-sudo systemctl enable --now docker-volume-backup-worker.service`;
-      const windowsCommands = `# Descargar el ejecutable portable x64 y ejecutar en PowerShell elevado.
-.\\vaultline-worker.exe enroll --control-plane-url ${cpUrl}
-$Action = New-ScheduledTaskAction -Execute "C:\\Vaultline\\vaultline-worker.exe" -Argument "daemon" -WorkingDirectory "C:\\Vaultline"
-$Trigger = New-ScheduledTaskTrigger -AtStartup
-Register-ScheduledTask -TaskName "VaultlineWorker" -Action $Action -Trigger $Trigger -User "DOMAIN\\dvb-worker" -RunLevel Limited`;
+
+# 3. El servicio toma la credencial en el siguiente ciclo (30 s) sin reiniciar.
+systemctl status docker-volume-backup-worker.service
+journalctl -u docker-volume-backup-worker.service -f`;
+      const windowsCommands = `# 1. Instala el MSI (doble clic o silencioso): registra y arranca el servicio
+#    VaultlineWorker (LocalSystem, inicio automatico), que espera el enrolamiento.
+msiexec /i ${packageName} /qn /norestart
+
+# 2. Abre una PowerShell elevada NUEVA (refresca el PATH) y enrola una sola vez.
+#    Pega el secreto solo en el prompt oculto; la credencial y la URL del
+#    Control Plane quedan en C:\\ProgramData\\Vaultline\\worker.
+vaultline-worker enroll --control-plane-url ${cpUrl}
+
+# 3. El servicio toma la credencial en el siguiente ciclo (30 s) sin reiniciar.
+vaultline-worker service status
+Get-Content C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log -Tail 50`;
       const commands = info.os === "windows" ? windowsCommands : linuxCommands;
       const platformNote = info.os === "windows"
-        ? "Windows usa ejecutable portable x64 con Task Scheduler. No usa Windows SCM ni instala un servicio SCM. Puede aparecer SmartScreen porque el binario no esta firmado."
-        : "Linux requiere glibc >= 2.17, usuario dvb-worker, /etc/docker-volume-backup/worker.env, /var/lib/docker-volume-backup y docker-volume-backup-worker.service.";
+        ? "Windows x64 instala el servicio SCM VaultlineWorker desde el MSI. Estado y credenciales en C:\\ProgramData\\Vaultline\\worker; logs en C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log. El MSI y el ejecutable no estan firmados: puede aparecer SmartScreen. El ejecutable portable queda solo para diagnostico (vaultline-worker.exe daemon) o para registrar el servicio a mano (service install)."
+        : "Linux requiere glibc >= 2.17. El .deb crea el usuario dvb-worker, /var/lib/docker-volume-backup y docker-volume-backup-worker.service. /etc/docker-volume-backup/worker.env es opcional: solo para overrides como WORKER_NAME o WORKER_POLL_INTERVAL_SECONDS (el entorno siempre gana sobre worker.json).";
       return `<div class="native-worker-panel" data-native-worker-platform="${escapeHtml(platform)}">
         <div class="field"><label for="nativePlatformSelect">Plataforma del worker remoto</label><select id="nativePlatformSelect" aria-describedby="nativePlatformHint">${Object.entries(NATIVE_WORKER_PLATFORMS).map(([key, value]) => `<option value="${escapeHtml(key)}" ${key === platform ? "selected" : ""}>${escapeHtml(value.label)}</option>`).join("")}</select><div class="hint" id="nativePlatformHint">Selecciona explicitamente la plataforma del host remoto. No se infiere desde el navegador.</div></div>
-        <div class="card compact"><div class="eyebrow">Asset nativo</div>${renderAssetMetadata(asset, checksums)}<a class="btn secondary sm" href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener">${downloadLabel}</a></div>
+        <div class="card compact"><div class="eyebrow">Asset nativo</div>${renderAssetMetadata(asset, checksums, secondaryAsset, info.secondaryLabel)}<a class="btn secondary sm" href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener">${downloadLabel}</a></div>
         <div class="alert info" role="status"><strong>Secreto separado.</strong> Usa <strong>Copiar secreto de enrolamiento</strong>. Pegar solo en el prompt oculto de <code>vaultline-worker enroll</code>. No lo pegues en comandos, archivos, artefactos ni tareas.</div>
-        <p class="helper">${escapeHtml(platformNote)} El paquete no arranca ni enrola automaticamente. Las herramientas externas restic, tar, gpg, rclone, aws, ssh y scp se instalan por separado segun el target.</p>
+        <p class="helper">El paquete instala y arranca el servicio, que espera el enrolamiento sin salir; <code>enroll</code> se ejecuta una sola vez como administrador o root y el servicio toma la credencial sin reiniciar. Al actualizar, instala el paquete nuevo encima: el estado y la credencial se conservan y no hace falta re-enrolar. ${escapeHtml(platformNote)} Las herramientas externas restic, tar, gpg, rclone, aws, ssh y scp se instalan por separado segun el target.</p>
         <div class="code-block"><button class="copy-btn" data-code-id="modalCode">Copiar</button><pre id="modalCode">${escapeHtml(commands)}</pre></div>
       </div>`;
     }

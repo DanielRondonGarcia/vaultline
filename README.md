@@ -44,8 +44,8 @@ graph TB
     end
 
     subgraph NATIVE["Native worker / local engine"]
-        NW["Native worker service<br/>docker-volume-backup-worker.service<br/>WORKER_RUNTIME=native<br/>/etc/docker-volume-backup/worker.env"]
-        NE["Local engine<br/>explicit filesystem_paths[]<br/>worker state: /var/lib/docker-volume-backup"]
+        NW["Native worker service<br/>VaultlineWorker (Windows MSI) / docker-volume-backup-worker.service (Linux .deb)<br/>WORKER_RUNTIME=native<br/>install, then vaultline-worker enroll once"]
+        NE["Local engine<br/>explicit filesystem_paths[]<br/>worker state: /var/lib/docker-volume-backup or C:\ProgramData\Vaultline\worker"]
         NW -->|"run local engine"| NE
     end
 
@@ -109,7 +109,7 @@ El worker incluye un servicio `demo-app` (nginx) de ejemplo. Edita
 `deploy/worker/docker-compose.yml` para añadir tus propios servicios con
 sus volúmenes — el worker los descubrirá automáticamente vía `docker.sock`.
 
-Para hosts sin Docker, usa la guía de [Worker nativo empaquetado](doc/control-plane-quickstart.md#worker-nativo-empaquetado-v2-seguro): la UI ofrece paquetes Linux/Windows y enrolamiento V2 con prompt oculto.
+Para hosts sin Docker, usa la guía de [Worker nativo empaquetado](doc/control-plane-quickstart.md#worker-nativo-empaquetado-v2-seguro): instala el `.deb` (Linux) o el `.msi` (Windows), que deja el servicio corriendo a la espera del enrolamiento, y ejecuta una sola vez `vaultline-worker enroll --control-plane-url <url>` como root/administrador pegando el secreto en el prompt oculto. La UI ofrece los paquetes y el secreto V2.
 
 ### 3. Configurar el backup desde la UI
 

@@ -203,26 +203,36 @@ Variables útiles del Worker:
 
 La opción recomendada para nuevos workers nativos es el flujo V2 seguro desde la UI: **Workers → Agregar worker → Worker nativo**. La UI mantiene Docker Compose como opción por defecto, pero permite elegir explícitamente la plataforma del host remoto: Linux amd64, Linux arm64 o Windows x64. No se infiere desde el navegador.
 
-Flujo seguro:
+El modelo es el mismo en ambas plataformas, al estilo `tailscaled` + `tailscale up`:
 
-1. Descarga el asset que corresponda a la plataforma remota. Si la API de release no trae assets, usa la [página canónica de releases de Vaultline](https://github.com/DanielRondonGarcia/vaultline/releases).
-2. Verifica el archivo con `SHA256SUMS` cuando esté disponible.
-3. Ejecuta `vaultline-worker enroll --control-plane-url <url>` y pega el secreto solo en el prompt oculto.
-4. No pongas el token en argumentos, archivos, artefactos, scripts, tareas programadas ni logs.
-5. Arranca el daemon solo después de completar el enrolamiento.
+1. **Instala el paquete.** El instalador registra y arranca el servicio del SO. El servicio espera el enrolamiento sin salir: reporta `not_ready` en `/healthz` y revisa la credencial en cada ciclo.
+2. **Enrola una sola vez** como administrador o root: `vaultline-worker enroll --control-plane-url <url>`. Pega el secreto solo en el prompt oculto. El comando guarda la credencial durable y la URL del Control Plane (`worker.json`) en el directorio de estado.
+3. **Listo.** El servicio toma la credencial en el siguiente ciclo de polling (30 s por defecto) sin reiniciar.
 
-El paquete no arranca ni enrola automaticamente. Las herramientas externas `restic, tar, gpg, rclone, aws, ssh y scp` siguen instalándose aparte según el backup/storage usado.
+Reglas que no cambian:
 
-Requisitos y advertencias:
+- No pongas el token en argumentos, archivos, artefactos, scripts, variables de entorno persistentes ni logs.
+- Descarga el asset desde la UI o desde la [página canónica de releases de Vaultline](https://github.com/DanielRondonGarcia/vaultline/releases) y verifícalo con `SHA256SUMS` cuando esté disponible.
+- Las herramientas externas `restic, tar, gpg, rclone, aws, ssh y scp` se instalan aparte según el backup/storage usado.
+- V2 seguro separa el bootstrap token de la credencial durable generada por el cliente. V1 legacy con variable de entorno de token sigue documentado solo para workers existentes o despliegues Compose heredados.
 
-- Linux amd64/arm64: paquetes `.deb`, baseline `glibc >= 2.17`, usuario `dvb-worker`, `/etc/docker-volume-backup/worker.env`, `/var/lib/docker-volume-backup` y `docker-volume-backup-worker.service`.
-- Windows x64: ejecutable portable x64; usa Task Scheduler. No usa Windows SCM ni instala un servicio SCM. El binario no está firmado y Windows SmartScreen puede advertirlo.
-- V2 seguro separa el bootstrap token de la credencial durable generada por el cliente.
-- V1 legacy con variable de entorno de token sigue documentado solo para workers existentes o despliegues Compose heredados.
+| Plataforma | Paquete | Servicio | Estado y credenciales |
+|------------|---------|----------|-----------------------|
+| Linux amd64/arm64 (`glibc >= 2.17`) | `vaultline-worker_<version>_<arch>.deb` | `docker-volume-backup-worker.service` (usuario `dvb-worker`) | `/var/lib/docker-volume-backup` |
+| Windows x64 | `vaultline-worker_<version>_windows-amd64.msi` (instalador) + `.exe` portable para diagnóstico | `VaultlineWorker` (Windows SCM, `LocalSystem`, inicio automático) | `C:\ProgramData\Vaultline\worker` |
+
+Los binarios y el MSI no están firmados: Windows SmartScreen puede advertirlo. Los pasos detallados por plataforma están en [Runner Linux con systemd](#runner-linux-con-systemd) y [Runner Windows como servicio (MSI)](#runner-windows-como-servicio-msi).
+
+Actualizar y desinstalar:
+
+- **Actualizar**: instala el `.deb` o el MSI nuevo encima del anterior. El directorio de estado y la credencial se conservan; no hace falta re-enrolar. En Linux el `postinst` reinicia la unidad si estaba activa; en Windows el MSI detiene y vuelve a arrancar el servicio.
+- **Desinstalar**: `sudo apt remove vaultline-worker` detiene y deshabilita la unidad; el MSI (Panel de control o `msiexec /x`) elimina el servicio y el ejecutable. Ninguno borra el directorio de estado, así que una reinstalación posterior arranca ya enrolada. Bórralo a mano si quieres retirar la credencial del host y revoca el worker en la UI.
 
 ### Worker nativo para filesystem
 
-El wrapper recomendado para respaldos de filesystem nativo es:
+Esta sección cubre la ejecución desde un checkout del repositorio (desarrollo o
+depuración); los paquetes publicados usan el mismo CLI bajo el nombre
+`vaultline-worker`. El wrapper para respaldos de filesystem nativo es:
 
 ```powershell
 python -m src.worker_agent.cli daemon
@@ -251,11 +261,13 @@ operaciones habilitadas.
 
 Configuración recomendada:
 
-- guarda `CONTROL_PLANE_URL`, `WORKER_NAME`, `WORKER_CREDENTIAL_FILE` y otros
-  valores no secretos en un archivo de entorno protegido;
-- expón `WORKER_ENROLLMENT_TOKEN` solo durante el primer registro: es de un solo
-  uso y debe retirarse del archivo de arranque después de que el worker guarde
-  sus credenciales;
+- en un checkout de desarrollo, guarda `CONTROL_PLANE_URL`, `WORKER_NAME`,
+  `WORKER_CREDENTIAL_FILE` y otros valores no secretos en un archivo de entorno
+  protegido (los paquetes publicados toman la URL de `worker.json`, escrito por
+  `enroll`; el entorno siempre gana si defines ambos);
+- expón `WORKER_ENROLLMENT_TOKEN` (flujo V1 legacy) solo durante el primer
+  registro: es de un solo uso y debe retirarse del archivo de arranque después
+  de que el worker guarde sus credenciales;
 - no escribas tokens, contraseñas, secretos Restic/Rclone ni contenido de
   credenciales en unidades systemd, tareas programadas, scripts compartidos o
   logs;
@@ -268,70 +280,109 @@ Configuración recomendada:
 
 #### Runner Linux con systemd
 
-El repositorio incluye una unidad de ejemplo en
-`deploy/worker/native/docker-volume-backup-worker.service`. Cópiala a
-`/etc/systemd/system/`, ajusta `User`, `Group`, `WorkingDirectory`,
-`EnvironmentFile` y `ReadWritePaths`, y crea el archivo de entorno fuera del
-repositorio, por ejemplo `/etc/docker-volume-backup/worker.env`. La unidad deja
-escribible `/var/lib/docker-volume-backup` para credenciales y estado del worker;
-si cambias `WORKER_CREDENTIAL_FILE` o añades cache/estado local, mantenlos dentro
-de esa ruta o añade una ruta de estado igualmente acotada en `ReadWritePaths`:
+El paquete `.deb` hace todo el trabajo de instalación: crea el usuario
+`dvb-worker`, instala `/usr/bin/vaultline-worker`, prepara
+`/var/lib/docker-volume-backup` y habilita y arranca
+`docker-volume-backup-worker.service`, que espera el enrolamiento.
 
-```ini
-CONTROL_PLANE_URL=https://backups.example.com
-WORKER_NAME=worker-linux-01
-WORKER_CREDENTIAL_FILE=/var/lib/docker-volume-backup/worker_credentials.json
-WORKER_HEALTH_PORT=8081
+```bash
+# 1. Instalar (el servicio queda arrancado, esperando el enrolamiento)
+sudo dpkg -i vaultline-worker_<version>_amd64.deb
+
+# 2. Enrolar una sola vez; pega el secreto solo en el prompt oculto.
+#    Escribe worker_credentials.json y worker.json en /var/lib/docker-volume-backup
+#    con dueño dvb-worker.
+sudo vaultline-worker enroll --control-plane-url https://backups.example.com
+
+# 3. Verificar: el servicio toma la credencial en el siguiente ciclo (30 s)
+systemctl status docker-volume-backup-worker.service
+journalctl -u docker-volume-backup-worker.service -f
+vaultline-worker service status
 ```
 
-No incluyas secretos permanentes en la unidad. Para enrolar, ejecuta `sudo vaultline-worker enroll --control-plane-url <url>` y pega el secreto únicamente en el prompt oculto. Después habilita el servicio continuo; no escribas el token en `worker.env`.
+`/etc/docker-volume-backup/worker.env` es **opcional**. Créalo solo para
+overrides no secretos (`WORKER_NAME`, `WORKER_POLL_INTERVAL_SECONDS`,
+`WORKER_HEALTH_PORT`, `CONTROL_PLANE_CA_FILE`, ...). El entorno siempre gana
+sobre `worker.json`, así que si defines `CONTROL_PLANE_URL` ahí, esa URL es la
+que usa el servicio. El paquete deja un ejemplo en
+`/usr/share/doc/vaultline-worker/worker.env.example`. No escribas el token ni
+ningún secreto permanente en `worker.env` ni en la unidad.
 
 El sandbox de systemd usa `ProtectSystem=full` y `ProtectHome=read-only`: el
 usuario del worker debe conservar lectura sobre cada `filesystem_path` de origen,
-pero solo puede escribir en las rutas listadas en `ReadWritePaths`. Para restore
-a destinos bloqueados por `ProtectHome` o `ProtectSystem`, añade únicamente el
-destino aprobado (por ejemplo `/srv/app-restore`) a `ReadWritePaths`; no
-deshabilites el sandbox globalmente por defecto.
+pero solo puede escribir en las rutas listadas en `ReadWritePaths`
+(`/var/lib/docker-volume-backup`). Para restore a destinos bloqueados por
+`ProtectHome` o `ProtectSystem`, añade únicamente el destino aprobado (por
+ejemplo `/srv/app-restore`) a `ReadWritePaths` con un drop-in
+(`systemctl edit docker-volume-backup-worker.service`); no deshabilites el
+sandbox globalmente por defecto.
 
-Comandos típicos:
+Sin paquete (checkout del repositorio): la misma unidad está en
+`deploy/worker/native/docker-volume-backup-worker.service`. Cópiala a
+`/etc/systemd/system/`, ajusta `User`, `Group`, `WorkingDirectory`,
+`ExecStart` y `ReadWritePaths`, crea los directorios y habilítala a mano:
 
 ```bash
 sudo install -d -m 0700 -o dvb-worker -g dvb-worker /var/lib/docker-volume-backup
 sudo install -d -m 0750 /etc/docker-volume-backup
 sudo systemctl daemon-reload
 sudo systemctl enable --now docker-volume-backup-worker.service
-sudo systemctl status docker-volume-backup-worker.service
-journalctl -u docker-volume-backup-worker.service -n 50 --no-pager
 ```
 
-#### Runner Windows MVP con Task Scheduler
+#### Runner Windows como servicio (MSI)
 
-El MVP de Windows no instala un servicio nativo de Windows SCM y no requiere
-wrappers de terceros. Usa el ejecutable portable x64 descargado de la release y
-una tarea de inicio de Windows Task Scheduler:
+El MSI instala `C:\Program Files\Vaultline\vaultline-worker.exe`, añade esa
+carpeta al `PATH` del sistema, crea `C:\ProgramData\Vaultline\worker` y
+registra y arranca el servicio `VaultlineWorker` (Windows SCM, cuenta
+`LocalSystem`, inicio automático). No usa wrappers de terceros. El servicio
+espera el enrolamiento escribiendo "Waiting for enrollment" en
+`C:\ProgramData\Vaultline\worker\logs\worker.log`.
 
 ```powershell
-$WorkerAccount = "DOMAIN\dvb-worker"
-$WorkerExe = "C:\Vaultline\vaultline-worker.exe"
-$WorkingDirectory = "C:\Vaultline"
-& $WorkerExe enroll --control-plane-url "https://backups.example.com"  # pega el secreto solo en el prompt oculto
-$Credential = Get-Credential -UserName $WorkerAccount -Message "Credencial de la cuenta dedicada del worker"
+# 1. Instalar (doble clic sobre el .msi o silencioso). SmartScreen puede advertir:
+#    el MSI no esta firmado.
+msiexec /i vaultline-worker_<version>_windows-amd64.msi /qn /norestart
 
-$Action = New-ScheduledTaskAction -Execute $WorkerExe -Argument "daemon" -WorkingDirectory $WorkingDirectory
-$Trigger = New-ScheduledTaskTrigger -AtStartup
-Register-ScheduledTask -TaskName "VaultlineWorker" -Action $Action -Trigger $Trigger -User $Credential.UserName -Password $Credential.GetNetworkCredential().Password -RunLevel Limited
-Remove-Variable Credential
+# 2. Abrir una PowerShell elevada NUEVA (para que cargue el PATH) y enrolar una
+#    sola vez; pega el secreto solo en el prompt oculto.
+vaultline-worker enroll --control-plane-url https://backups.example.com
+
+# 3. Verificar: el servicio toma la credencial en el siguiente ciclo (30 s)
+vaultline-worker service status
+Get-Content C:\ProgramData\Vaultline\worker\logs\worker.log -Tail 50
 ```
 
-Ejecuta el registro desde PowerShell elevado; el prompt recoge la contraseña sin
-escribirla en el archivo ni en el argumento de la tarea. La cuenta debe tener
-permiso de inicio de sesión por lotes y acceso a las rutas configuradas.
+`service status` imprime JSON con el estado del servicio y la ruta `log_file`.
+`enroll` escribe `worker_credentials.json` y `worker.json` (URL del Control
+Plane) en `C:\ProgramData\Vaultline\worker` y concede acceso a `SYSTEM` y
+`Administradores` con ACLs por SID, de modo que el servicio en `LocalSystem`
+pueda leerlos. Para variables no secretas (`WORKER_NAME`,
+`WORKER_POLL_INTERVAL_SECONDS`, ...) usa variables de entorno de sistema; el
+entorno siempre gana sobre `worker.json`. Reinicia el servicio después de
+cambiarlas: `vaultline-worker service stop` y `vaultline-worker service start`.
 
-Define variables de entorno no secretas en el perfil del usuario de la tarea o
-en un mecanismo administrado por el operador. No insertes tokens ni contraseñas
-en el argumento de la tarea. Aplica ACLs restrictivas al directorio de estado,
-al archivo de credenciales y a cualquier archivo de configuración usado por el
-worker; el usuario de la tarea también debe poder leer los paths origen.
+Actualizar: instala el MSI nuevo encima del anterior; el estado se conserva y no
+hace falta re-enrolar. Desinstalar: `msiexec /x vaultline-worker_<version>_windows-amd64.msi /qn`
+(o Panel de control) elimina el servicio y el ejecutable, pero conserva
+`C:\ProgramData\Vaultline\worker`.
+
+##### Alternativa: ejecutable portable
+
+El `.exe` portable sigue publicándose para dos usos:
+
+- **Diagnóstico en primer plano**: `.\vaultline-worker.exe daemon` (o
+  `daemon --once` para un solo ciclo) desde una consola. Detén antes el
+  servicio si ya está instalado para no correr dos workers con la misma
+  credencial.
+- **Registro manual del servicio** cuando no puedes usar el MSI: desde una
+  PowerShell elevada, `.\vaultline-worker.exe service install` registra
+  `VaultlineWorker` apuntando al ejecutable en su ubicación actual (no lo
+  muevas después) y `service uninstall` lo retira. Luego sigue con `enroll`
+  igual que arriba.
+
+El `.exe` tampoco está firmado: SmartScreen puede advertirlo. Aplica ACLs
+restrictivas al directorio de estado y a la credencial si los colocas fuera de
+`C:\ProgramData\Vaultline\worker`.
 
 El worker publica `GET /healthz` con un payload similar a:
 

@@ -1459,18 +1459,75 @@ class WorkerUiStateTests(unittest.TestCase):
             "/etc/docker-volume-backup/worker.env",
             "/var/lib/docker-volume-backup",
             "docker-volume-backup-worker.service",
-            "Task Scheduler",
-            "Register-ScheduledTask",
-            "portable x64",
-            "No usa Windows SCM",
+            "VaultlineWorker",
+            "ProgramData\\\\Vaultline\\\\worker",
             "glibc >= 2.17",
             "SmartScreen",
             "restic, tar, gpg, rclone, aws, ssh y scp",
-            "no arranca ni enrola automaticamente",
+            "espera el enrolamiento",
         ):
             self.assertIn(marker, self.source)
         self.assertNotIn("navigator.platform", self.source)
         self.assertNotIn("userAgent", self.source)
+
+    def test_worker_enrollment_native_tab_teaches_install_then_enroll_service_flow(self):
+        platforms = re.search(r"const NATIVE_WORKER_PLATFORMS = \{.*?\n    \};", self.source, re.S)
+        self.assertIsNotNone(platforms)
+        platforms_source = platforms.group(0)
+        # The MSI is the primary Windows download; the portable exe is secondary.
+        self.assertIn('"windows-amd64": { label: "Windows x64 instalador (.msi)"', platforms_source)
+        self.assertIn('key: "windows-amd64-msi"', platforms_source)
+        self.assertIn('secondaryKey: "windows-amd64"', platforms_source)
+        self.assertIn("Ejecutable portable (.exe) para diagnostico", platforms_source)
+        self.assertIn('key: "linux-amd64"', platforms_source)
+        self.assertIn('key: "linux-arm64"', platforms_source)
+        self.assertNotIn("Windows x64 portable (.exe)", platforms_source)
+
+        selector = re.search(r"function assetForSelectedNativePlatform\(\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(selector)
+        self.assertIn("assets[info.key]", selector.group(0))
+        self.assertIn("assets[info.secondaryKey]", selector.group(0))
+
+        tab = re.search(r"function renderNativeWorkerTab\(.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(tab)
+        tab_source = tab.group(0)
+        windows = re.search(r"const windowsCommands = `(.*?)`;", tab_source, re.S)
+        linux = re.search(r"const linuxCommands = `(.*?)`;", tab_source, re.S)
+        self.assertIsNotNone(windows)
+        self.assertIsNotNone(linux)
+        windows_commands = windows.group(1)
+        linux_commands = linux.group(1)
+
+        self.assertIn("msiexec /i ${packageName} /qn /norestart", windows_commands)
+        self.assertIn("vaultline-worker enroll --control-plane-url ${cpUrl}", windows_commands)
+        self.assertIn("vaultline-worker service status", windows_commands)
+        self.assertIn("espera el enrolamiento", windows_commands)
+        self.assertLess(windows_commands.index("msiexec /i"), windows_commands.index("enroll --control-plane-url"))
+        self.assertLess(windows_commands.index("enroll --control-plane-url"), windows_commands.index("service status"))
+
+        self.assertIn("sudo dpkg -i ${packageName}", linux_commands)
+        self.assertIn("sudo vaultline-worker enroll --control-plane-url ${cpUrl}", linux_commands)
+        self.assertIn("systemctl status docker-volume-backup-worker.service", linux_commands)
+        self.assertIn("espera el enrolamiento", linux_commands)
+        self.assertLess(linux_commands.index("dpkg -i"), linux_commands.index("enroll --control-plane-url"))
+        self.assertLess(linux_commands.index("enroll --control-plane-url"), linux_commands.index("systemctl status"))
+
+        # The service is already running after install: no manual enable/start and no Task Scheduler.
+        for stale in (
+            "Task Scheduler",
+            "ScheduledTask",
+            "systemctl enable --now",
+            "sudo editor",
+            "No usa Windows SCM",
+            "no arranca ni enrola automaticamente",
+        ):
+            self.assertNotIn(stale, tab_source)
+        self.assertIn("SmartScreen", tab_source)
+        self.assertIn("sin reiniciar", tab_source)
+        self.assertIn("no hace falta re-enrolar", tab_source)
+        self.assertIn("worker.env es opcional", tab_source)
+        self.assertIn("vaultline-worker.exe daemon", tab_source)
+        self.assertIn("service install", tab_source)
 
     def test_worker_enrollment_renewal_preserves_stable_id_and_reuses_compose_flow(self):
         for marker in (

@@ -6,6 +6,8 @@ from pathlib import Path
 PACKAGING_ROOT = Path("packaging/debian")
 CONTROL = PACKAGING_ROOT / "control.in"
 POSTINST = PACKAGING_ROOT / "postinst"
+PRERM = PACKAGING_ROOT / "prerm"
+UNIT_NAME = "docker-volume-backup-worker.service"
 SERVICE = PACKAGING_ROOT / "lib/systemd/system/docker-volume-backup-worker.service"
 ENV_EXAMPLE = PACKAGING_ROOT / "usr/share/doc/vaultline-worker/worker.env.example"
 BUILDER = Path("scripts/build_worker_deb.sh")
@@ -27,6 +29,8 @@ class WorkerDebPackageTests(unittest.TestCase):
         self.assertRegex(control, r"(?m)^Depends: .*systemd")
         self.assertNotIn("WORKER_ENROLLMENT_TOKEN", control)
         self.assertNotIn("WORKER_SECRET", control)
+        self.assertIn("auto-started systemd unit that waits for enrollment", control)
+        self.assertNotIn("inactive systemd unit", control)
 
     def test_builder_validates_semver_and_arch_and_names_assets_deterministically(self):
         builder = self.read_text(BUILDER)
@@ -55,7 +59,7 @@ class WorkerDebPackageTests(unittest.TestCase):
         self.assertNotIn("/opt/docker-volume-backup", service)
         self.assertNotIn("python3 -m", service)
 
-    def test_postinst_prepares_state_safely_without_enabling_or_starting_service(self):
+    def test_postinst_prepares_state_safely_before_touching_systemd(self):
         postinst = self.read_text(POSTINST)
 
         self.assertRegex(postinst, r"addgroup.*dvb-worker")
@@ -65,10 +69,49 @@ class WorkerDebPackageTests(unittest.TestCase):
         self.assertRegex(postinst, r"install -d -m 0750 .* /etc/docker-volume-backup")
         self.assertRegex(postinst, r"install -d -m 0700 .* /var/lib/docker-volume-backup")
         self.assertNotIn("worker.env", postinst)
-        self.assertNotRegex(postinst, r"systemctl\s+(enable|start|restart)")
         self.assertIn("systemctl daemon-reload", postinst)
+        self.assertLess(postinst.index("install -d -m 0700"), postinst.index("systemctl daemon-reload"))
         self.assertNotIn("WORKER_ENROLLMENT_TOKEN", postinst)
         self.assertNotIn("WORKER_SECRET", postinst)
+
+    def test_postinst_enables_and_starts_unit_on_configure_only_when_systemd_runs(self):
+        postinst = self.read_text(POSTINST)
+
+        configure = re.search(r"(?ms)^\s*configure\)\n(.*?)^\s*;;", postinst)
+        self.assertIsNotNone(configure, "postinst must handle the configure action")
+        body = configure.group(1)
+        self.assertIn("/run/systemd/system", body)
+        enable = re.search(r"systemctl enable --now " + re.escape(UNIT_NAME) + r"\s*\|\|\s*true", body)
+        self.assertIsNotNone(enable, "unit must be enabled and started tolerantly")
+        self.assertLess(body.index("systemctl daemon-reload"), enable.start())
+        # Upgrades restart an already-active unit so the new binary runs.
+        self.assertRegex(body, r"systemctl is-active --quiet " + re.escape(UNIT_NAME))
+        self.assertRegex(body, r"systemctl restart " + re.escape(UNIT_NAME) + r"\s*\|\|\s*true")
+        self.assertLess(body.index("/run/systemd/system"), body.index("systemctl enable --now"))
+        mutating = [line for line in postinst.splitlines() if re.search(r"systemctl (enable|start|restart) ", line)]
+        self.assertTrue(mutating)
+        for line in mutating:
+            self.assertRegex(line, r"\|\|\s*true\s*$", f"not tolerant: {line.strip()}")
+        self.assertIn("exit 0", postinst)
+
+    def test_prerm_stops_and_disables_unit_tolerantly_on_remove(self):
+        prerm = self.read_text(PRERM)
+
+        self.assertTrue(prerm.startswith("#!/bin/sh"))
+        self.assertIn("set -e", prerm)
+        remove = re.search(r"(?ms)^\s*remove\)\n(.*?)^\s*;;", prerm)
+        self.assertIsNotNone(remove, "prerm must handle the remove action")
+        body = remove.group(1)
+        self.assertIn("/run/systemd/system", body)
+        self.assertRegex(body, r"systemctl stop " + re.escape(UNIT_NAME) + r"\s*\|\|\s*true")
+        self.assertRegex(body, r"systemctl disable " + re.escape(UNIT_NAME) + r"\s*\|\|\s*true")
+        self.assertLess(body.index("systemctl stop"), body.index("systemctl disable"))
+        self.assertNotIn("/var/lib/docker-volume-backup", prerm, "state (credentials) must survive removal")
+        self.assertNotIn("rm ", prerm)
+        self.assertNotIn("deluser", prerm)
+        self.assertIn("exit 0", prerm)
+        self.assertNotIn("WORKER_ENROLLMENT_TOKEN", prerm)
+        self.assertNotIn("WORKER_SECRET", prerm)
 
     def test_package_contains_only_non_secret_environment_example(self):
         example = self.read_text(ENV_EXAMPLE)
@@ -87,6 +130,8 @@ class WorkerDebPackageTests(unittest.TestCase):
 
         self.assertIn("DEBIAN/control", builder)
         self.assertIn("DEBIAN/postinst", builder)
+        self.assertRegex(builder, r'install -m 0755 "\$\{TEMPLATE_ROOT\}/prerm" "\$\{PACKAGE_ROOT\}/DEBIAN/prerm"')
+        self.assertIn('test -x "${PACKAGE_ROOT}/DEBIAN/prerm"', builder)
         self.assertIn("usr/bin/vaultline-worker", builder)
         self.assertIn("lib/systemd/system/docker-volume-backup-worker.service", builder)
         self.assertIn("usr/share/doc/vaultline-worker/worker.env.example", builder)

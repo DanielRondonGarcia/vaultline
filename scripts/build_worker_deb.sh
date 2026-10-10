@@ -73,6 +73,7 @@ sed \
 chmod 0644 "${PACKAGE_ROOT}/DEBIAN/control"
 
 install -m 0755 "${TEMPLATE_ROOT}/postinst" "${PACKAGE_ROOT}/DEBIAN/postinst"
+install -m 0755 "${TEMPLATE_ROOT}/prerm" "${PACKAGE_ROOT}/DEBIAN/prerm"
 install -m 0755 "${FROZEN_BINARY}" "${PACKAGE_ROOT}/usr/bin/vaultline-worker"
 install -m 0644 "${TEMPLATE_ROOT}/lib/systemd/system/docker-volume-backup-worker.service" \
   "${PACKAGE_ROOT}/lib/systemd/system/docker-volume-backup-worker.service"
@@ -81,6 +82,7 @@ install -m 0644 "${TEMPLATE_ROOT}/usr/share/doc/vaultline-worker/worker.env.exam
 
 test -f "${PACKAGE_ROOT}/DEBIAN/control"
 test -x "${PACKAGE_ROOT}/DEBIAN/postinst"
+test -x "${PACKAGE_ROOT}/DEBIAN/prerm"
 test -x "${PACKAGE_ROOT}/usr/bin/vaultline-worker"
 test -f "${PACKAGE_ROOT}/lib/systemd/system/docker-volume-backup-worker.service"
 test -f "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/worker.env.example"

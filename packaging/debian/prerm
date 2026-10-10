@@ -1,0 +1,17 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove)
+        # Stop and disable the unit before its binary disappears. The state
+        # directory (enrollment config and credential) is left in place so a
+        # reinstall resumes without a new enrollment. Tolerant of hosts without
+        # a running systemd.
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl stop docker-volume-backup-worker.service || true
+            systemctl disable docker-volume-backup-worker.service || true
+        fi
+        ;;
+esac
+
+exit 0

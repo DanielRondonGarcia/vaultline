@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Vaultline Worker MSI (WiX v4/v5 schema).
+
+  Install -> enroll flow (Tailscale-style):
+    1. `msiexec /i vaultline-worker_<version>_windows-amd64.msi` installs
+       vaultline-worker.exe under "Program Files\Vaultline", adds that folder to
+       the system PATH, registers the Windows service "VaultlineWorker"
+       (LocalSystem, auto-start, command line `vaultline-worker.exe service run`)
+       and starts it. The service idles, logging "Waiting for enrollment" to
+       %ProgramData%\Vaultline\worker\logs\worker.log, until it is enrolled.
+    2. An administrator runs the enroll subcommand (see the service Description
+       below for the exact command line), which writes the enrollment state
+       into %ProgramData%\Vaultline\worker; the running service picks it up on
+       its next poll without a restart.
+
+  The state directory is marked Permanent so the enrollment state survives
+  uninstall and reinstall/upgrade. The package ships no configuration file.
+
+  Build (CI):
+    wix build -arch x64 -d Version=<semver> -d WorkerExe=dist\vaultline-worker.exe \
+      -o dist\release\vaultline-worker_<semver>_windows-amd64.msi packaging\windows\vaultline-worker.wxs
+-->
+<?ifndef Version ?>
+  <?error Version must be defined: wix build -d Version=<semver> ?>
+<?endif?>
+<?ifndef WorkerExe ?>
+  <?define WorkerExe = "dist\vaultline-worker.exe" ?>
+<?endif?>
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Vaultline Worker"
+      Manufacturer="Vaultline"
+      Version="$(var.Version)"
+      UpgradeCode="61D954FF-093C-408B-8764-78834B55FAA2"
+      Scope="perMachine"
+      InstallerVersion="500"
+      Compressed="yes"
+      Language="1033">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Vaultline Worker is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="WorkerFeature" Title="Vaultline Worker" Level="1">
+      <ComponentRef Id="WorkerExecutable" />
+      <ComponentRef Id="WorkerStateDir" />
+      <ComponentRef Id="WorkerLogsDir" />
+    </Feature>
+
+    <!-- Program Files\Vaultline: binary, service registration, PATH entry. -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Vaultline">
+        <Component Id="WorkerExecutable">
+          <File Id="WorkerExe" Source="$(var.WorkerExe)" Name="vaultline-worker.exe" KeyPath="yes" />
+          <ServiceInstall
+              Id="VaultlineWorkerService"
+              Name="VaultlineWorker"
+              DisplayName="Vaultline Worker"
+              Description="Vaultline native backup worker (enroll with: vaultline-worker enroll --control-plane-url &lt;url&gt;)"
+              Type="ownProcess"
+              Start="auto"
+              ErrorControl="normal"
+              Account="LocalSystem"
+              Arguments="service run"
+              Vital="yes" />
+          <ServiceControl
+              Id="VaultlineWorkerServiceControl"
+              Name="VaultlineWorker"
+              Start="install"
+              Stop="both"
+              Remove="uninstall"
+              Wait="yes" />
+          <Environment
+              Id="WorkerPathEntry"
+              Name="PATH"
+              Value="[INSTALLFOLDER]"
+              Action="set"
+              Part="last"
+              System="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <!--
+      %ProgramData%\Vaultline\worker: state written by `enroll` and by the
+      service (worker.log). Permanent: never removed on uninstall.
+    -->
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="VaultlineDataDir" Name="Vaultline">
+        <Directory Id="WorkerStateFolder" Name="worker">
+          <Component Id="WorkerStateDir" Guid="3029A7D9-EDF5-4832-ACA0-56E18F08D1CC" Permanent="yes">
+            <CreateFolder />
+          </Component>
+          <Directory Id="WorkerLogsFolder" Name="logs">
+            <Component Id="WorkerLogsDir" Guid="85FD8EDB-5E1D-4DB1-8BF9-9DB052800D14" Permanent="yes">
+              <CreateFolder />
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+  </Package>
+</Wix>

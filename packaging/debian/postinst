@@ -17,6 +17,19 @@ case "$1" in
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true
         fi
+
+        # Start the service like tailscaled: it idles until an administrator
+        # runs `vaultline-worker enroll`. Only act when systemd is the running
+        # init (containers and chroots have no /run/systemd/system) and never
+        # fail the package configuration because of a service-state problem.
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+            if systemctl is-active --quiet docker-volume-backup-worker.service; then
+                # Upgrade: the unit is already running the previous binary.
+                systemctl restart docker-volume-backup-worker.service || true
+            else
+                systemctl enable --now docker-volume-backup-worker.service || true
+            fi
+        fi
         ;;
 esac
 

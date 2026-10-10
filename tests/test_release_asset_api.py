@@ -26,6 +26,7 @@ class LatestReleaseAssetAPITests(unittest.TestCase):
                 self.asset("vaultline-worker_1.2.3_amd64.deb", digest),
                 self.asset("vaultline-worker_1.2.3_arm64.deb", "sha256:" + "b" * 64),
                 self.asset("vaultline-worker_1.2.3_windows-amd64.exe", "sha256:" + "c" * 64),
+                self.asset("vaultline-worker_1.2.3_windows-amd64.msi", "sha256:" + "d" * 64),
                 self.asset("vaultline-worker_1.2.3_SHA256SUMS"),
             ],
         }
@@ -34,11 +35,50 @@ class LatestReleaseAssetAPITests(unittest.TestCase):
 
         self.assertEqual(payload["tag_name"], "1.2.3")
         self.assertEqual(payload["html_url"], data["html_url"])
-        self.assertEqual(set(payload["assets"]), {"linux-amd64", "linux-arm64", "windows-amd64", "checksums"})
+        self.assertEqual(
+            set(payload["assets"]),
+            {"linux-amd64", "linux-arm64", "windows-amd64", "windows-amd64-msi", "checksums"},
+        )
         self.assertEqual(payload["assets"]["linux-amd64"]["name"], "vaultline-worker_1.2.3_amd64.deb")
         self.assertEqual(payload["assets"]["linux-amd64"]["url"], f"{OFFICIAL_BASE}/vaultline-worker_1.2.3_amd64.deb")
         self.assertEqual(payload["assets"]["linux-amd64"]["sha256"], "a" * 64)
+        self.assertEqual(payload["assets"]["windows-amd64"]["name"], "vaultline-worker_1.2.3_windows-amd64.exe")
+        self.assertEqual(payload["assets"]["windows-amd64-msi"]["name"], "vaultline-worker_1.2.3_windows-amd64.msi")
+        self.assertEqual(
+            payload["assets"]["windows-amd64-msi"]["url"], f"{OFFICIAL_BASE}/vaultline-worker_1.2.3_windows-amd64.msi"
+        )
+        self.assertEqual(payload["assets"]["windows-amd64-msi"]["sha256"], "d" * 64)
         self.assertNotIn("sha256", payload["assets"]["checksums"])
+
+    def test_releases_without_msi_still_expose_the_portable_exe(self):
+        data = {
+            "tag_name": "1.2.3",
+            "html_url": "https://github.com/DanielRondonGarcia/vaultline/releases/tag/1.2.3",
+            "assets": [
+                self.asset("vaultline-worker_1.2.3_windows-amd64.exe", "sha256:" + "c" * 64),
+                self.asset("vaultline-worker_1.2.3_SHA256SUMS"),
+            ],
+        }
+
+        payload = _latest_release_payload(data)
+
+        self.assertEqual(set(payload["assets"]), {"windows-amd64", "checksums"})
+        self.assertNotIn("windows-amd64-msi", payload["assets"])
+
+    def test_msi_asset_from_external_url_is_ignored(self):
+        data = {
+            "tag_name": "1.2.3",
+            "html_url": "x",
+            "assets": [
+                self.asset(
+                    "vaultline-worker_1.2.3_windows-amd64.msi",
+                    "sha256:" + "d" * 64,
+                    "https://evil.example/releases/download/1.2.3",
+                )
+            ],
+        }
+
+        self.assertEqual(_latest_release_payload(data)["assets"], {})
 
     def test_old_releases_without_assets_return_empty_assets_object(self):
         payload = _latest_release_payload({"tag_name": "1.2.3", "html_url": "https://example.test/release"})

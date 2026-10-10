@@ -102,6 +102,7 @@ LATEST_RELEASE_ASSET_KEYS = {
     "linux-amd64": "vaultline-worker_{tag}_amd64.deb",
     "linux-arm64": "vaultline-worker_{tag}_arm64.deb",
     "windows-amd64": "vaultline-worker_{tag}_windows-amd64.exe",
+    "windows-amd64-msi": "vaultline-worker_{tag}_windows-amd64.msi",
     "checksums": "vaultline-worker_{tag}_SHA256SUMS",
 }
 

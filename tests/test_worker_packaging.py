@@ -4,6 +4,33 @@ import unittest
 from pathlib import Path
 
 
+def _string_constants(node):
+    return {
+        child.value
+        for child in ast.walk(node)
+        if isinstance(child, ast.Constant) and isinstance(child.value, str)
+    }
+
+
+def _is_win32_platform_check(test):
+    return (
+        isinstance(test, ast.Compare)
+        and isinstance(test.left, ast.Attribute)
+        and isinstance(test.left.value, ast.Name)
+        and test.left.value.id == "sys"
+        and test.left.attr == "platform"
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.Eq)
+        and len(test.comparators) == 1
+        and isinstance(test.comparators[0], ast.Constant)
+        and test.comparators[0].value == "win32"
+    )
+
+
+def _win32_blocks(tree):
+    return [node for node in tree.body if isinstance(node, ast.If) and _is_win32_platform_check(node.test)]
+
+
 class WorkerPackagingTests(unittest.TestCase):
     def test_vaultline_worker_pyinstaller_spec_declares_one_file_worker_cli(self):
         spec_path = Path("build/vaultline-worker.spec")
@@ -27,38 +54,52 @@ class WorkerPackagingTests(unittest.TestCase):
         tree = ast.parse(spec)
         backports_imports = {"backports", "backports.tarfile"}
 
-        def string_constants(node):
-            return {
-                child.value
-                for child in ast.walk(node)
-                if isinstance(child, ast.Constant) and isinstance(child.value, str)
-            }
-
-        def is_win32_platform_check(test):
-            return (
-                isinstance(test, ast.Compare)
-                and isinstance(test.left, ast.Attribute)
-                and isinstance(test.left.value, ast.Name)
-                and test.left.value.id == "sys"
-                and test.left.attr == "platform"
-                and len(test.ops) == 1
-                and isinstance(test.ops[0], ast.Eq)
-                and len(test.comparators) == 1
-                and isinstance(test.comparators[0], ast.Constant)
-                and test.comparators[0].value == "win32"
-            )
-
-        win32_blocks = [node for node in tree.body if isinstance(node, ast.If) and is_win32_platform_check(node.test)]
+        win32_blocks = _win32_blocks(tree)
         self.assertEqual(1, len(win32_blocks), 'spec must gate backports imports with sys.platform == "win32"')
-        self.assertTrue(backports_imports.issubset(string_constants(win32_blocks[0])))
+        self.assertTrue(backports_imports.issubset(_string_constants(win32_blocks[0])))
 
         for node in tree.body:
             if node is win32_blocks[0]:
                 continue
             self.assertTrue(
-                backports_imports.isdisjoint(string_constants(node)),
+                backports_imports.isdisjoint(_string_constants(node)),
                 "backports hidden imports must not be declared outside the Windows-only block",
             )
+
+    def test_vaultline_worker_spec_adds_pywin32_hiddenimports_only_on_windows(self):
+        spec = Path("build/vaultline-worker.spec").read_text(encoding="utf-8")
+        tree = ast.parse(spec)
+        pywin32_imports = {
+            "win32serviceutil",
+            "win32service",
+            "win32event",
+            "servicemanager",
+            "win32api",
+            "win32timezone",
+            "pywintypes",
+            "win32con",
+        }
+
+        win32_blocks = _win32_blocks(tree)
+        self.assertEqual(1, len(win32_blocks), "pywin32 hidden imports must reuse the single Windows-only block")
+        self.assertTrue(pywin32_imports.issubset(_string_constants(win32_blocks[0])))
+        self.assertIn("src.worker_agent.windows_service", spec)
+
+        for node in tree.body:
+            if node is win32_blocks[0]:
+                continue
+            self.assertTrue(
+                pywin32_imports.isdisjoint(_string_constants(node)),
+                "pywin32 hidden imports must not be declared outside the Windows-only block",
+            )
+
+    def test_runtime_requirements_declare_pywin32_for_windows_only(self):
+        requirements = Path("requirements.txt").read_text(encoding="utf-8")
+
+        match = re.search(r"^pywin32\s*([^;]*);\s*(.+)$", requirements, re.MULTILINE)
+        self.assertIsNotNone(match, "pywin32 must be declared with an environment marker")
+        self.assertRegex(match.group(2).strip(), r'^sys_platform\s*==\s*"win32"$')
+        self.assertRegex(match.group(1).strip(), r"^>=\s*306")
 
     def test_vaultline_worker_spec_resolves_cli_from_pyinstaller_spec_dir(self):
         spec_path = Path("build/vaultline-worker.spec")

@@ -4,3 +4,4 @@ requests
 cryptography
 redis>=6,<7
 kubernetes>=29,<35
+pywin32>=306; sys_platform == "win32"

@@ -7,7 +7,9 @@ import getpass
 import json
 import os
 import secrets
+import shutil
 import socket
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -182,6 +184,95 @@ def _enroll(args: argparse.Namespace) -> int:
     return 0
 
 
+SERVICE_VERBS = ("install", "uninstall", "start", "stop", "status", "run")
+LINUX_SERVICE_UNIT = "docker-volume-backup-worker.service"
+_LINUX_PACKAGE_MANAGED_VERBS = frozenset({"install", "uninstall", "run"})
+
+
+def _is_windows() -> bool:
+    return sys.platform == "win32"
+
+
+def _windows_service_error_message(verb: str, error: Exception) -> str:
+    from src.worker_agent.windows_service import (
+        ERROR_FAILED_SERVICE_CONTROLLER_CONNECT,
+        SERVICE_NAME,
+    )
+
+    winerror = getattr(error, "winerror", None)
+    if verb == "run" and winerror == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT:
+        return (
+            "'service run' is the Service Control Manager entry point and cannot be started from an "
+            "interactive console; use 'daemon' to run the worker in the foreground."
+        )
+    if getattr(error, "access_denied", False):
+        return f"Access denied while running 'service {verb}': run from an elevated PowerShell (Run as administrator)."
+    if getattr(error, "not_installed", False):
+        return f"Service {SERVICE_NAME} is not installed; run 'service install' from an elevated PowerShell."
+    return f"service {verb} failed: {error}"
+
+
+def _service_windows(verb: str) -> int:
+    from src.worker_agent import windows_service
+
+    try:
+        if verb == "run":
+            windows_service.run_as_service()
+            return 0
+        if verb == "install":
+            result = windows_service.install_service()
+            print(f"Service {result['name']} {result['action']}: {result['command_line']}")
+            return 0
+        if verb == "uninstall":
+            result = windows_service.uninstall_service()
+            print(f"Service {result['name']} {result['action']}")
+            return 0
+        actions = {
+            "start": windows_service.start_service,
+            "stop": windows_service.stop_service,
+            "status": windows_service.service_status,
+        }
+        print(json.dumps(actions[verb](), sort_keys=True))
+        return 0
+    except ImportError as exc:
+        print(f"pywin32 is required to manage the Windows service (pip install pywin32): {exc}", file=sys.stderr)
+        return 1
+    except windows_service.ServiceError as exc:
+        print(_windows_service_error_message(verb, exc), file=sys.stderr)
+        return 1
+
+
+def _service_systemd(verb: str) -> int:
+    if verb in _LINUX_PACKAGE_MANAGED_VERBS:
+        print(
+            f"'service {verb}' is not available on this platform: the Debian package installs and manages "
+            f"{LINUX_SERVICE_UNIT}; use 'daemon' to run the worker in the foreground.",
+            file=sys.stderr,
+        )
+        return 2
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        print("systemctl was not found on PATH; this host does not appear to run systemd.", file=sys.stderr)
+        return 1
+    if verb == "status":
+        # is-active/is-enabled exit non-zero for inactive/disabled units; the
+        # state is reported as data rather than as a command failure.
+        payload = {"name": LINUX_SERVICE_UNIT}
+        for key, query in (("active", "is-active"), ("enabled", "is-enabled")):
+            completed = subprocess.run([systemctl, query, LINUX_SERVICE_UNIT], capture_output=True, text=True)
+            payload[key] = (completed.stdout or "").strip() or "unknown"
+        print(json.dumps(payload, sort_keys=True))
+        return 0
+    completed = subprocess.run([systemctl, verb, LINUX_SERVICE_UNIT])
+    return completed.returncode
+
+
+def _service(args: argparse.Namespace) -> int:
+    if _is_windows():
+        return _service_windows(args.verb)
+    return _service_systemd(args.verb)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m src.worker_agent.cli",
@@ -231,6 +322,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print a redacted native worker diagnostic payload.",
     )
     self_check.set_defaults(handler=_self_check)
+
+    service = subcommands.add_parser(
+        "service",
+        help=(
+            "Manage the OS service hosting the worker: Windows SCM service VaultlineWorker "
+            f"(install/uninstall need an elevated PowerShell), or systemd unit {LINUX_SERVICE_UNIT} on Linux."
+        ),
+    )
+    service.add_argument(
+        "verb",
+        choices=SERVICE_VERBS,
+        help="install|uninstall|run are Windows-only (Linux packages manage the unit); 'run' is the SCM entry point.",
+    )
+    service.set_defaults(handler=_service)
     return parser
 
 

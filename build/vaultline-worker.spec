@@ -24,12 +24,23 @@ hiddenimports = [
     "src.worker_agent.infrastructure.adapters.native_runtime",
     "src.worker_agent.infrastructure.api_client.control_plane_client",
     "src.worker_agent.infrastructure.security.credential_store",
+    "src.worker_agent.windows_service",
 ]
 
 if sys.platform == "win32":
     hiddenimports.extend([
         "backports",
         "backports.tarfile",
+        # pywin32 modules imported lazily by src.worker_agent.windows_service so
+        # the frozen exe can host the VaultlineWorker SCM service.
+        "win32serviceutil",
+        "win32service",
+        "win32event",
+        "servicemanager",
+        "win32api",
+        "win32timezone",
+        "pywintypes",
+        "win32con",
     ])
 
 

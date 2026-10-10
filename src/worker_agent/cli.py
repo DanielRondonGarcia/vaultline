@@ -19,6 +19,10 @@ from src.worker_agent import main as worker_main
 from src.worker_agent.infrastructure.adapters.native_runtime import NativeRuntimeAdapter
 from src.worker_agent.infrastructure.api_client.control_plane_client import ControlPlaneClient
 from src.worker_agent.infrastructure.security.credential_store import WorkerCredentialStore
+from src.worker_agent.state_paths import (
+    resolve_credential_file,
+    resolve_enrollment_config_file,
+)
 
 
 def _env_present(name: str) -> bool:
@@ -42,11 +46,10 @@ def _configuration_presence() -> dict[str, bool]:
         "worker_id_configured": _env_present("WORKER_ID"),
         "enrollment_token_configured": _env_present("WORKER_ENROLLMENT_TOKEN")
         or _env_present("WORKER_SECRET"),
+        "state_dir_configured": _env_present("WORKER_STATE_DIR"),
+        "enrollment_config_exists": resolve_enrollment_config_file().exists(),
         "credential_file_configured": _env_present("WORKER_CREDENTIAL_FILE"),
-        "credential_file_exists": _file_exists_from_env(
-            "WORKER_CREDENTIAL_FILE",
-            ".worker_credentials.json",
-        ),
+        "credential_file_exists": resolve_credential_file().exists(),
         "ca_file_configured": _env_present("CONTROL_PLANE_CA_FILE"),
         "ca_file_exists": _file_exists_from_env("CONTROL_PLANE_CA_FILE"),
     }
@@ -101,12 +104,35 @@ def _new_pending_enrollment(store: WorkerCredentialStore, token_digest: str):
     return store.save_pending_enrollment(attempt_id, durable_credential, token_digest)
 
 
+def _optional(value: str | None) -> str | None:
+    return value.strip() if value and value.strip() else None
+
+
+def _enrollment_config_payload(control_plane_url: str, ca_file: str | None, worker_name: str | None) -> dict[str, str]:
+    payload = {"control_plane_url": control_plane_url}
+    if ca_file:
+        payload["control_plane_ca_file"] = ca_file
+    if worker_name:
+        payload["worker_name"] = worker_name
+    return payload
+
+
 def _enroll(args: argparse.Namespace) -> int:
-    store = WorkerCredentialStore(os.environ.get("WORKER_CREDENTIAL_FILE", ".worker_credentials.json"))
+    store = WorkerCredentialStore(resolve_credential_file())
     if args.reset_pending:
         store.delete_pending_enrollment()
         print("Pending enrollment reset. Run enroll again with a valid bootstrap token to start over.")
         return 0
+
+    control_plane_url = _optional(args.control_plane_url) or _optional(os.environ.get("CONTROL_PLANE_URL"))
+    if not control_plane_url:
+        print(
+            "Control Plane URL is required: pass --control-plane-url <url> or set CONTROL_PLANE_URL.",
+            file=sys.stderr,
+        )
+        return 2
+    ca_file = _optional(args.ca_file) or _optional(os.environ.get("CONTROL_PLANE_CA_FILE"))
+    worker_name = _optional(args.worker_name) or _optional(os.environ.get("WORKER_NAME"))
 
     bootstrap_token = getpass.getpass("Bootstrap token: ")
     token_digest = digest_secret(bootstrap_token)
@@ -122,8 +148,8 @@ def _enroll(args: argparse.Namespace) -> int:
         return 2
 
     client = ControlPlaneClient(
-        os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8080"),
-        ca_file=os.environ.get("CONTROL_PLANE_CA_FILE") or None,
+        control_plane_url,
+        ca_file=ca_file,
         credential_store=store,
     )
     try:
@@ -144,7 +170,15 @@ def _enroll(args: argparse.Namespace) -> int:
     if store.load() is None:
         store.save(response["worker_id"], pending.durable_credential, response["credential_version"])
     store.delete_pending_enrollment()
-    print("Enrollment completed. Durable worker credentials were stored for daemon use.")
+    # Persist only after success so a failed attempt never leaves a half-configured daemon.
+    store.write_json(
+        resolve_enrollment_config_file(),
+        _enrollment_config_payload(control_plane_url, ca_file, worker_name),
+    )
+    print(
+        "Enrollment completed. Durable worker credentials and the Control Plane connection settings "
+        "were stored for daemon use."
+    )
     return 0
 
 
@@ -158,6 +192,21 @@ def build_parser() -> argparse.ArgumentParser:
     enroll = subcommands.add_parser(
         "enroll",
         help="Securely complete native worker first-run enrollment using a hidden bootstrap token prompt.",
+    )
+    enroll.add_argument(
+        "--control-plane-url",
+        default=None,
+        help="Control Plane base URL (required unless CONTROL_PLANE_URL is set). Persisted to worker.json for the daemon.",
+    )
+    enroll.add_argument(
+        "--ca-file",
+        default=None,
+        help="Optional CA bundle used to verify the Control Plane TLS certificate (falls back to CONTROL_PLANE_CA_FILE).",
+    )
+    enroll.add_argument(
+        "--worker-name",
+        default=None,
+        help="Optional worker display name persisted for the daemon (falls back to WORKER_NAME).",
     )
     enroll.add_argument(
         "--reset-pending",

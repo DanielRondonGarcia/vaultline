@@ -2,6 +2,10 @@ import getpass, json, os, subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+# Well-known SIDs: icacls accepts "*<SID>" so grants do not depend on the OS locale.
+WINDOWS_SYSTEM_SID = "*S-1-5-18"
+WINDOWS_ADMINISTRATORS_SID = "*S-1-5-32-544"
+
 
 @dataclass(frozen=True)
 class StoredWorkerCredential:
@@ -63,6 +67,10 @@ class WorkerCredentialStore:
         except FileNotFoundError:
             pass
 
+    def write_json(self, path, payload):
+        """Atomically write a non-credential JSON file (e.g. worker.json) with the same ownership rules."""
+        self._atomic_write_json(path, payload)
+
     def _atomic_write_json(self, path, payload):
         path = Path(path)
         self._prepare_parent(path.parent)
@@ -84,6 +92,7 @@ class WorkerCredentialStore:
             os.replace(temp, path)
             replaced = True
             self._restrict_file(path)
+            self._align_owner_with_parent(path)
         finally:
             if not replaced:
                 try:
@@ -102,8 +111,25 @@ class WorkerCredentialStore:
             return
         os.chmod(path, 0o600)
 
+    def _align_owner_with_parent(self, path):
+        # When enroll runs as root on Linux and the state directory belongs to the
+        # service account (e.g. dvb-worker), hand the written file to that owner so
+        # the daemon can read it without running as root.
+        if os.name == "nt":
+            return
+        geteuid = getattr(os, "geteuid", None)
+        chown = getattr(os, "chown", None)
+        if geteuid is None or chown is None or geteuid() != 0:
+            return
+        parent_stat = os.stat(Path(path).parent)
+        if parent_stat.st_uid == 0:
+            return
+        chown(path, parent_stat.st_uid, parent_stat.st_gid)
+
     def _restrict_file_windows(self, path):
         # chmod(0600) is not ACL protection on Windows. Use icacls and fail closed.
+        # SYSTEM and Administrators are granted by SID (locale-independent) so the
+        # LocalSystem service can read credentials written by an administrator.
         try:
             user = os.getlogin()
         except OSError:
@@ -114,6 +140,10 @@ class WorkerCredentialStore:
             "/inheritance:r",
             "/grant:r",
             f"{user}:(R,W)",
+            "/grant:r",
+            f"{WINDOWS_SYSTEM_SID}:(R,W)",
+            "/grant:r",
+            f"{WINDOWS_ADMINISTRATORS_SID}:(R,W)",
         ]
         try:
             subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

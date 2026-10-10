@@ -1316,10 +1316,11 @@ class WorkerMainPollingTests(unittest.TestCase):
             sleep_calls.append(delay)
             if len(sleep_calls) == 3:
                 raise StopIteration("stop controlled worker loop")
+            return False
 
         with patch.object(worker_main, "build_service", return_value=service), patch.object(worker_main, "start_health_server"), patch.object(
             worker_main.time, "monotonic", side_effect=clock.monotonic
-        ), patch.object(worker_main.time, "sleep", side_effect=controlled_sleep), patch.dict(
+        ), patch.object(worker_main, "_wait_for_stop", side_effect=controlled_sleep), patch.dict(
             os.environ,
             {
                 "WORKER_RUN_ONCE": "false",

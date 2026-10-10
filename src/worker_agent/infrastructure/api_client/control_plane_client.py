@@ -116,6 +116,17 @@ class ControlPlaneClient:
         self.worker_id = worker_id
         self.enrollment_secret = enrollment_secret
 
+    def reconfigure(self, base_url: str | None = None, ca_file: str | None = None) -> None:
+        """Point the client at another Control Plane after enrollment settings appear.
+
+        The SSL context is derived per request from ``base_url``/``ca_file``, so
+        updating these two fields is enough; no cached state needs rebuilding.
+        """
+        if base_url:
+            self.base_url = base_url.rstrip("/")
+        if ca_file is not None:
+            self.ca_file = ca_file or None
+
     def register_worker(
         self,
         name: str,

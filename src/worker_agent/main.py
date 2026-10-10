@@ -25,9 +25,39 @@ from src.worker_agent.infrastructure.api_client.control_plane_client import (
     ControlPlaneHTTPError,
 )
 from src.worker_agent.infrastructure.security.credential_store import WorkerCredentialStore
+from src.worker_agent.state_paths import (
+    load_enrollment_config,
+    resolve_credential_file,
+    resolve_enrollment_config_file,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Process-wide stop request honored by the main loop sleeps so a service host
+# (Windows SCM, systemd) can stop the worker cleanly between loop iterations.
+_STOP_EVENT = Event()
+_WAITING_FOR_ENROLLMENT = "waiting for enrollment"
+_IDLE_LOG_EVERY_CYCLES = 20
+
+
+def request_stop() -> None:
+    """Ask the main loop to exit after the current iteration."""
+    _STOP_EVENT.set()
+
+
+def reset_stop() -> None:
+    """Clear a previous stop request before hosting a new main loop."""
+    _STOP_EVENT.clear()
+
+
+def stop_requested() -> bool:
+    return _STOP_EVENT.is_set()
+
+
+def _wait_for_stop(delay: float) -> bool:
+    """Sleep up to ``delay`` seconds; return True as soon as a stop was requested."""
+    return _STOP_EVENT.wait(max(0.0, float(delay)))
 
 
 def _utcnow() -> str:
@@ -73,6 +103,11 @@ class WorkerHealthState:
             self._snapshot.poll_interval_seconds = poll_interval_seconds
             self._snapshot.runtime_kind = runtime_kind
             self._snapshot.capabilities = list(capabilities or [runtime_kind])
+
+    def set_connection(self, control_plane_url: str, worker_name: str):
+        with self._lock:
+            self._snapshot.control_plane_url = control_plane_url
+            self._snapshot.worker_name = worker_name
 
     def record_control_plane_success(self, worker_id: str, processed_jobs: Optional[int] = None):
         with self._lock:
@@ -337,15 +372,21 @@ def build_service() -> WorkerAgentService:
             return av
         return wv or av or "dev"
 
-    credential_file = os.environ.get("WORKER_CREDENTIAL_FILE", ".worker_credentials.json")
+    credential_file = resolve_credential_file()
     recovery_file = os.environ.get("WORKER_JOB_RECOVERY_FILE") or str(
-        Path(credential_file).with_name("worker_job_recovery.json")
+        credential_file.with_name("worker_job_recovery.json")
     )
+    # Environment always wins; worker.json written by `enroll` is the fallback.
+    enrollment_config = load_enrollment_config(resolve_enrollment_config_file())
     credential_store = WorkerCredentialStore(credential_file)
+    # The identity is re-resolved on every loop iteration (see main); this initial
+    # load only seeds the config for workers that are already enrolled.
     stored = credential_store.load()
     config = WorkerAgentConfig(
-        control_plane_url=os.environ.get("CONTROL_PLANE_URL", "http://127.0.0.1:8080"),
-        name=os.environ.get("WORKER_NAME", socket.gethostname()),
+        control_plane_url=os.environ.get("CONTROL_PLANE_URL")
+        or enrollment_config.get("control_plane_url")
+        or "http://127.0.0.1:8080",
+        name=os.environ.get("WORKER_NAME") or enrollment_config.get("worker_name") or socket.gethostname(),
         host_name=os.environ.get("WORKER_HOST_NAME", socket.gethostname()),
         version=_resolve_version(),
         worker_id=os.environ.get("WORKER_ID") or (stored.worker_id if stored else None),
@@ -359,7 +400,7 @@ def build_service() -> WorkerAgentService:
     )
     client = ControlPlaneClient(
         config.control_plane_url,
-        ca_file=os.environ.get("CONTROL_PLANE_CA_FILE") or None,
+        ca_file=os.environ.get("CONTROL_PLANE_CA_FILE") or enrollment_config.get("control_plane_ca_file") or None,
         credential_store=credential_store,
         worker_id=config.worker_id,
         enrollment_secret=config.enrollment_token,
@@ -394,6 +435,72 @@ def start_health_server(state: WorkerHealthState):
     return server
 
 
+def _apply_enrollment_config(service: WorkerAgentService, health_state: Optional[WorkerHealthState] = None) -> None:
+    """Re-read ``worker.json`` once enrollment is detected at runtime.
+
+    ``build_service()`` resolved the connection settings before ``enroll`` ran, so
+    an idle daemon would otherwise keep the default URL. Environment always wins:
+    each value is applied only when its environment variable is not set.
+    """
+
+    enrollment_config = load_enrollment_config(resolve_enrollment_config_file())
+    config = service.config
+    client = getattr(service, "control_plane_client", None)
+    control_plane_url = None if os.environ.get("CONTROL_PLANE_URL") else enrollment_config.get("control_plane_url")
+    ca_file = None if os.environ.get("CONTROL_PLANE_CA_FILE") else enrollment_config.get("control_plane_ca_file")
+    worker_name = None if os.environ.get("WORKER_NAME") else enrollment_config.get("worker_name")
+    if control_plane_url:
+        config.control_plane_url = control_plane_url
+    if worker_name:
+        config.name = worker_name
+    if client is not None and (control_plane_url or ca_file):
+        reconfigure = getattr(client, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(base_url=control_plane_url, ca_file=ca_file)
+        else:
+            if control_plane_url:
+                client.base_url = control_plane_url.rstrip("/")
+            if ca_file:
+                client.ca_file = ca_file
+    if health_state is not None:
+        health_state.set_connection(config.control_plane_url, config.name)
+    logger.info("Enrollment detected; using Control Plane %s", config.control_plane_url)
+
+
+def _resolve_worker_identity(service: WorkerAgentService, health_state: Optional[WorkerHealthState] = None) -> bool:
+    """Refresh ``worker_id`` from the credential store on every loop.
+
+    Returns False only when the worker is positively unenrolled: no worker id is
+    known yet, a credential store is reachable, it holds no credential, and no V1
+    enrollment token is configured. Any other situation (worker id already set,
+    no store to inspect, unreadable credential, token present) returns True so
+    ``ensure_registered`` decides and real failures keep the startup retry cap.
+
+    The first time a stored credential is found, ``worker.json`` is re-applied so
+    the connection settings written by ``enroll`` take effect without a restart.
+    """
+
+    config = service.config
+    client = getattr(service, "control_plane_client", None)
+    if getattr(config, "worker_id", None):
+        return True
+    store = getattr(client, "credential_store", None)
+    if store is None or not callable(getattr(store, "load", None)):
+        return True
+    try:
+        stored = store.load()
+    except Exception:
+        return True
+    stored_worker_id = getattr(stored, "worker_id", None)
+    if isinstance(stored_worker_id, str) and stored_worker_id:
+        _apply_enrollment_config(service, health_state)
+        config.worker_id = stored_worker_id
+        if client is not None and not getattr(client, "worker_id", None):
+            client.worker_id = stored_worker_id
+        return True
+    return bool(getattr(config, "enrollment_token", None))
+
+
 def main():
     service = build_service()
     run_once = os.environ.get("WORKER_RUN_ONCE", "true").strip().lower() in ("1", "true", "yes", "on")
@@ -421,8 +528,27 @@ def main():
     )
     start_health_server(health_state)
     live_lane = start_live_lane(service, interactive_interval)
+    idle_cycles = 0
 
-    while True:
+    while not _STOP_EVENT.is_set():
+        if not _resolve_worker_identity(service, health_state):
+            # Idle until an administrator runs `enroll`; this is not a failure and
+            # never counts against the startup retry cap.
+            health_state.record_not_ready(_WAITING_FOR_ENROLLMENT)
+            health_state.record_loop_completed()
+            if run_once:
+                raise RuntimeError("worker is not enrolled")
+            if idle_cycles % _IDLE_LOG_EVERY_CYCLES == 0:
+                logger.warning(
+                    "Waiting for enrollment: run 'vaultline-worker enroll --control-plane-url <url>' "
+                    "on this host; the daemon re-checks the credential store every %ss",
+                    poll_interval,
+                )
+            idle_cycles += 1
+            if _wait_for_stop(poll_interval):
+                break
+            continue
+        idle_cycles = 0
         try:
             worker_id = service.ensure_registered()
             if last_logged_worker_id != worker_id:
@@ -471,8 +597,6 @@ def main():
         finally:
             health_state.record_loop_completed()
         if run_once and attempts == 0:
-            if live_lane:
-                live_lane[0].set()
             break
         if attempts or not run_once:
             retry_delay = _bounded_interval(
@@ -481,7 +605,10 @@ def main():
                 0.0,
                 86400.0,
             ) if attempts else interactive_interval
-            time.sleep(retry_delay)
+            if _wait_for_stop(retry_delay):
+                break
+    if live_lane:
+        live_lane[0].set()
 
 
 if __name__ == "__main__":

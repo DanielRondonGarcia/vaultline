@@ -69,6 +69,12 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertRegex(job, r"wix build .*-d Version=\$Version")
         self.assertRegex(job, r"wix build .*-d WorkerExe=dist[\\/]vaultline-worker\.exe")
         self.assertIn('vaultline-worker_${Version}_windows-amd64.msi', job)
+        # util:ServiceConfig (service recovery) needs the Util extension, pinned
+        # to the same version as the wix CLI and added globally so the CLI finds it.
+        self.assertIn("wix extension add -g WixToolset.Util.wixext/5.0.2", job)
+        self.assertRegex(job, r"dotnet tool install --global wix --version 5\.0\.2")
+        self.assertRegex(job, r"wix build .*-ext WixToolset\.Util\.wixext")
+        self.assertLess(job.index("wix extension add -g WixToolset.Util.wixext"), job.index("wix build"))
         self.assertIn("vaultline-worker_${{ needs.prepare.outputs.new_version }}_windows-amd64.msi", job)
         self.assertIn("vaultline-worker_${{ needs.prepare.outputs.new_version }}_windows-amd64.exe", job)
         # The exe is moved to its release name before the msi is built, so the

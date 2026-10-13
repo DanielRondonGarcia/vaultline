@@ -24,6 +24,9 @@ from src.worker_agent.infrastructure.security.credential_store import WorkerCred
 from src.worker_agent.state_paths import (
     resolve_credential_file,
     resolve_enrollment_config_file,
+    resolve_state_dir,
+    secure_state_dir,
+    state_dir_is_managed,
 )
 
 
@@ -73,7 +76,13 @@ def _self_check(_args: argparse.Namespace) -> int:
 def _daemon(args: argparse.Namespace) -> int:
     os.environ["WORKER_RUNTIME"] = "native"
     os.environ["WORKER_RUN_ONCE"] = "true" if args.once else "false"
-    worker_main.main()
+    try:
+        worker_main.main()
+    except RuntimeError as exc:
+        if str(exc) == "worker is not enrolled":
+            print("error: worker is not enrolled; run 'vaultline-worker enroll --control-plane-url <url>'", file=sys.stderr)
+            return 3
+        raise
     return 0
 
 
@@ -135,6 +144,22 @@ def _enroll(args: argparse.Namespace) -> int:
         return 2
     ca_file = _optional(args.ca_file) or _optional(os.environ.get("CONTROL_PLANE_CA_FILE"))
     worker_name = _optional(args.worker_name) or _optional(os.environ.get("WORKER_NAME"))
+
+    # enroll runs elevated (administrator/root): lock the dedicated state
+    # directory down before any enrollment state lands in it, so the service
+    # never adopts files a standard user could have planted there.
+    if state_dir_is_managed():
+        state_dir = resolve_state_dir()
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            secure_state_dir(state_dir)
+        except OSError as exc:
+            print(
+                f"error: could not restrict permissions on {state_dir} ({exc.__class__.__name__}); "
+                "run enroll from an elevated PowerShell (Run as administrator) or as root.",
+                file=sys.stderr,
+            )
+            return 1
 
     bootstrap_token = getpass.getpass("Bootstrap token: ")
     token_digest = digest_secret(bootstrap_token)

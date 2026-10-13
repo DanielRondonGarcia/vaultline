@@ -6,11 +6,16 @@ from pathlib import Path
 
 WXS = Path("packaging/windows/vaultline-worker.wxs")
 WIX_NS = "http://wixtoolset.org/schemas/v4/wxs"
+WIX_UTIL_NS = "http://wixtoolset.org/schemas/v4/wxs/util"
 GUID_RE = re.compile(r"^\{?[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\}?$")
 
 
 def _tag(local: str) -> str:
     return f"{{{WIX_NS}}}{local}"
+
+
+def _util(local: str) -> str:
+    return f"{{{WIX_UTIL_NS}}}{local}"
 
 
 class WorkerMsiPackageTests(unittest.TestCase):
@@ -129,6 +134,43 @@ class WorkerMsiPackageTests(unittest.TestCase):
             self.assertIsNone(component.find(_tag("RemoveFile")))
             self.assertRegex(component.get("Guid", ""), GUID_RE)
         self.assertNotIn("RemoveFolder", self.source)
+
+    def test_state_and_logs_dirs_are_restricted_to_system_and_administrators(self):
+        # %ProgramData% lets BUILTIN\Users create files; without an explicit ACL
+        # any local user could plant enrollment files for the LocalSystem service.
+        expected_sddl = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        state_components = {
+            component.get("Id"): component
+            for component in self.find_all("Component")
+            if component.find(_tag("CreateFolder")) is not None
+        }
+        self.assertEqual(set(state_components), {"WorkerStateDir", "WorkerLogsDir"})
+        for component_id, component in state_components.items():
+            with self.subTest(component=component_id):
+                folder = component.find(_tag("CreateFolder"))
+                permission_ex = folder.findall(_tag("PermissionEx"))
+                self.assertEqual(len(permission_ex), 1)
+                self.assertEqual(permission_ex[0].get("Sddl"), expected_sddl)
+                self.assertTrue(expected_sddl.startswith("D:P"), "D:P must protect the DACL from inheritance")
+                self.assertNotRegex(expected_sddl, r";;;(?:BU|AU)(?:\)|$)")
+                self.assertEqual(folder.findall(_tag("Permission")), [])
+                self.assertEqual(component.get("Permanent"), "yes")
+
+    def test_service_recovery_restarts_on_failure_through_util_extension(self):
+        self.assertIn(f'xmlns:util="{WIX_UTIL_NS}"', self.source)
+        configs = list(self.root.iter(_util("ServiceConfig")))
+        self.assertEqual(len(configs), 1)
+        config = configs[0]
+        self.assertEqual(config.get("ServiceName"), "VaultlineWorker")
+        for action in ("FirstFailureActionType", "SecondFailureActionType", "ThirdFailureActionType"):
+            self.assertEqual(config.get(action), "restart", action)
+        self.assertEqual(config.get("RestartServiceDelayInSeconds"), "10")
+        self.assertEqual(config.get("ResetPeriodInDays"), "1")
+
+        exe_component = next(
+            component for component in self.find_all("Component") if component.find(_tag("File")) is not None
+        )
+        self.assertIs(exe_component.find(_util("ServiceConfig")), config)
 
     def test_package_ships_no_secrets_or_configuration(self):
         lowered = self.source.lower()

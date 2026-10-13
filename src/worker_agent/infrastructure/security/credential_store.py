@@ -2,6 +2,8 @@ import getpass, json, os, subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.worker_agent.state_paths import resolve_state_dir, secure_state_dir, state_dir_is_managed
+
 # Well-known SIDs: icacls accepts "*<SID>" so grants do not depend on the OS locale.
 WINDOWS_SYSTEM_SID = "*S-1-5-18"
 WINDOWS_ADMINISTRATORS_SID = "*S-1-5-32-544"
@@ -91,7 +93,7 @@ class WorkerCredentialStore:
                 self._restrict_file(temp)
             os.replace(temp, path)
             replaced = True
-            self._restrict_file(path)
+            self._restrict_file(path, set_managed_owner=True)
             self._align_owner_with_parent(path)
         finally:
             if not replaced:
@@ -101,13 +103,23 @@ class WorkerCredentialStore:
                     pass
 
     def _prepare_parent(self, parent):
+        created = not parent.exists()
         parent.mkdir(parents=True, exist_ok=True)
-        if os.name != "nt":
-            os.chmod(parent, 0o700)
+        managed_state_dir = state_dir_is_managed() and os.path.normcase(os.path.abspath(parent)) == os.path.normcase(
+            os.path.abspath(resolve_state_dir())
+        )
+        if not managed_state_dir:
+            return
+        # A directory this store just created under a dedicated state location
+        # must not inherit the permissive %ProgramData% ACL (BUILTIN\Users can
+        # create files there). Existing or developer-mode directories are left
+        # alone: re-ACLing an arbitrary working directory is not our call.
+        if created:
+            secure_state_dir(parent)
 
-    def _restrict_file(self, path):
+    def _restrict_file(self, path, set_managed_owner=False):
         if os.name == "nt":
-            self._restrict_file_windows(path)
+            self._restrict_file_windows(path, set_managed_owner=set_managed_owner)
             return
         os.chmod(path, 0o600)
 
@@ -126,7 +138,7 @@ class WorkerCredentialStore:
             return
         chown(path, parent_stat.st_uid, parent_stat.st_gid)
 
-    def _restrict_file_windows(self, path):
+    def _restrict_file_windows(self, path, set_managed_owner=False):
         # chmod(0600) is not ACL protection on Windows. Use icacls and fail closed.
         # SYSTEM and Administrators are granted by SID (locale-independent) so the
         # LocalSystem service can read credentials written by an administrator.
@@ -147,5 +159,14 @@ class WorkerCredentialStore:
         ]
         try:
             subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if set_managed_owner and state_dir_is_managed() and os.path.normcase(os.path.abspath(Path(path).parent)) == os.path.normcase(
+                os.path.abspath(resolve_state_dir())
+            ):
+                subprocess.run(
+                    ["icacls", str(path), "/setowner", WINDOWS_ADMINISTRATORS_SID],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
         except Exception as exc:
             raise PermissionError("could not restrict worker credential ACL with icacls") from exc

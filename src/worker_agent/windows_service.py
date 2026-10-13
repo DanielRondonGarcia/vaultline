@@ -15,6 +15,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -27,7 +28,10 @@ DISPLAY_NAME = "Vaultline Worker"
 DESCRIPTION = "Vaultline native backup worker (enroll with: vaultline-worker enroll --control-plane-url <url>)"
 
 START_WAIT_SECONDS = 30
-STOP_WAIT_SECONDS = 30
+STOP_WAIT_SECONDS = 180
+STOP_INITIAL_WAIT_HINT_MS = 120000
+STOP_WAIT_HINT_MS = 30000
+STOP_WATCHDOG_INTERVAL_SECONDS = 10
 
 # A service process has no console: sys.stderr is None and the StreamHandler
 # installed by logging.basicConfig in worker_agent.main drops every record.
@@ -353,13 +357,32 @@ def build_service_class() -> type:
         def __init__(self, args):
             super().__init__(args)
             self.stop_event = win32event.CreateEvent(None, 0, 0, None)
+            self.worker_done = threading.Event()
+            self.stop_requested = False
 
         def SvcStop(self):
-            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+            self.stop_requested = True
+            self.ReportServiceStatus(
+                win32service.SERVICE_STOP_PENDING,
+                waitHint=STOP_INITIAL_WAIT_HINT_MS,
+                checkPoint=1,
+            )
             # The worker main loop checks this between iterations; a job in
             # flight finishes its current loop iteration before main() returns.
             worker_main.request_stop()
             win32event.SetEvent(self.stop_event)
+
+            def report_progress():
+                checkpoint = 1
+                while not self.worker_done.wait(STOP_WATCHDOG_INTERVAL_SECONDS):
+                    checkpoint += 1
+                    self.ReportServiceStatus(
+                        win32service.SERVICE_STOP_PENDING,
+                        waitHint=STOP_WAIT_HINT_MS,
+                        checkPoint=checkpoint,
+                    )
+
+            threading.Thread(target=report_progress, daemon=True, name="worker-stop-watchdog").start()
 
         def SvcDoRun(self):
             servicemanager.LogInfoMsg(f"{DISPLAY_NAME} starting")
@@ -377,6 +400,7 @@ def build_service_class() -> type:
                 servicemanager.LogInfoMsg(f"{DISPLAY_NAME} logging to {log_file}")
             os.environ["WORKER_RUNTIME"] = "native"
             os.environ["WORKER_RUN_ONCE"] = "false"
+            os.environ["WORKER_SERVICE_MODE"] = "true"
             worker_main.reset_stop()
             try:
                 worker_main.main()
@@ -384,8 +408,16 @@ def build_service_class() -> type:
                 servicemanager.LogErrorMsg(
                     f"{DISPLAY_NAME} stopped after an unhandled error ({exc.__class__.__name__}): {exc}"
                 )
+                if not self.stop_requested:
+                    self.ReportServiceStatus(
+                        win32service.SERVICE_STOPPED,
+                        win32ExitCode=getattr(win32service, "ERROR_SERVICE_SPECIFIC_ERROR", 1066),
+                        svcExitCode=1,
+                    )
             else:
                 servicemanager.LogInfoMsg(f"{DISPLAY_NAME} stopped")
+            finally:
+                self.worker_done.set()
 
     return VaultlineWorkerService
 

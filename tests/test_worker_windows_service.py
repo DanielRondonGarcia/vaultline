@@ -30,9 +30,11 @@ class FakeServiceFramework:
     def __init__(self, args):
         self.args = args
         self.reported_statuses = []
+        self.reported_status_details = []
 
     def ReportServiceStatus(self, status, *_args, **_kwargs):
         self.reported_statuses.append(status)
+        self.reported_status_details.append((status, _kwargs))
 
 
 def build_fake_pywin32():
@@ -325,6 +327,35 @@ class ServiceClassTests(RootLoggerIsolationMixin, FakePywin32TestCase):
         message = self.fakes["servicemanager"].LogErrorMsg.call_args.args[0]
         self.assertIn("RuntimeError", message)
         self.assertIn("worker startup failed after 5 attempts", message)
+        self.assertEqual(service.reported_status_details[-1], (1, {"win32ExitCode": 1066, "svcExitCode": 1}))
+
+    def test_svc_do_run_does_not_report_failure_status_when_stop_was_requested(self):
+        from src.worker_agent import windows_service
+
+        service = windows_service.build_service_class()(["VaultlineWorker"])
+        service.stop_requested = True
+        with patch("src.worker_agent.main.reset_stop"), patch(
+            "src.worker_agent.main.main", side_effect=RuntimeError("worker stopped")
+        ):
+            service.SvcDoRun()
+
+        self.assertNotIn(1, service.reported_statuses)
+
+    def test_svc_stop_reports_bounded_pending_status_and_starts_watchdog(self):
+        from src.worker_agent import windows_service
+
+        with patch("src.worker_agent.main.request_stop"), patch(
+            "src.worker_agent.windows_service.threading.Thread"
+        ) as thread:
+            service = windows_service.build_service_class()(["VaultlineWorker"])
+            service.SvcStop()
+
+        status, details = service.reported_status_details[0]
+        self.assertEqual(status, 3)
+        self.assertEqual(details, {"waitHint": 120000, "checkPoint": 1})
+        thread.assert_called_once()
+        self.assertTrue(thread.call_args.kwargs["daemon"])
+        self.assertEqual(windows_service.STOP_WAIT_SECONDS, 180)
 
     def test_svc_stop_requests_worker_stop_and_signals_event(self):
         from src.worker_agent import windows_service
@@ -474,6 +505,7 @@ class LifecycleTests(FakePywin32TestCase):
 
         self.win32serviceutil.WaitForServiceStatus.assert_called_once_with("VaultlineWorker", 1, windows_service.STOP_WAIT_SECONDS)
         self.assertEqual(result["state"], "stopped")
+        self.assertEqual(windows_service.STOP_WAIT_SECONDS, 180)
 
     def test_stop_timeout_surfaces_as_service_error(self):
         from src.worker_agent import windows_service

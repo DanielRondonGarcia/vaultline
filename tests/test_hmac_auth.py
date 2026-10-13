@@ -1,4 +1,4 @@
-import os, stat, tempfile, time, unittest; from unittest.mock import patch
+import os, stat, tempfile, time, unittest; from unittest.mock import Mock, patch
 from src.control_plane.infrastructure.security.worker_auth import WorkerAuthState
 from src.security.hmac_protocol import digest_secret, sign_request, verify_request
 from src.worker_agent.infrastructure.api_client.control_plane_client import ControlPlaneClient
@@ -23,6 +23,43 @@ class HmacAuthTests(unittest.TestCase):
     def test_startup_retry_cap(self):
         import src.worker_agent.main as worker_main; failed = type("Failed", (), {"config": type("Config", (), {"control_plane_url": "", "name": ""})(), "ensure_registered": lambda self: (_ for _ in ()).throw(OSError("down"))})()
         with patch.object(worker_main, "build_service", return_value=failed), patch.dict(os.environ, {"WORKER_RUN_ONCE": "true", "WORKER_HEALTH_PORT": "0", "WORKER_STARTUP_RETRY_DELAY_SECONDS": "0"}): self.assertRaisesRegex(RuntimeError, "5 attempts", worker_main.main)
+
+    def test_registered_worker_retries_more_than_five_failures_and_recovers(self):
+        from src.worker_agent import main as worker_main
+        from types import SimpleNamespace
+
+        worker_main.reset_stop()
+        service = SimpleNamespace(
+            config=SimpleNamespace(control_plane_url="http://cp", name="worker"),
+            runtime=SimpleNamespace(runtime_kind="docker"),
+            cleanup_orphaned_runtime_containers=lambda: {},
+            send_heartbeat=Mock(side_effect=[OSError("offline")] * 6 + [None]),
+            sync_inventory=lambda: None,
+            ensure_registered=lambda: "worker-1",
+        )
+        waits = []
+
+        def stop_after_recovery(_delay):
+            waits.append(_delay)
+            if len(waits) == 7:
+                worker_main.request_stop()
+                return True
+            return False
+
+        try:
+            with patch.object(worker_main, "build_service", return_value=service), \
+                    patch.object(worker_main, "start_health_server"), \
+                    patch.object(worker_main, "start_live_lane", return_value=None), \
+                    patch.object(worker_main, "_resolve_worker_identity", return_value=True), \
+                    patch.object(worker_main, "_poll_worker", return_value=[]), \
+                    patch.object(worker_main, "_wait_for_stop", side_effect=stop_after_recovery), \
+                    patch.dict(os.environ, {"WORKER_RUN_ONCE": "false", "WORKER_HEALTH_PORT": "0", "WORKER_POLL_INTERVAL_SECONDS": "0.1"}, clear=True):
+                worker_main.main()
+        finally:
+            worker_main.reset_stop()
+
+        self.assertEqual(service.send_heartbeat.call_count, 7)
+        self.assertEqual(len(waits), 7)
     def test_documentation_like_input_is_not_executed(self):
         from unittest.mock import Mock
         from src.control_plane.domain.models import JobStatus

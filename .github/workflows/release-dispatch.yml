@@ -202,13 +202,15 @@ jobs:
           dotnet tool install --global wix --version 5.0.2
           if ($LASTEXITCODE -ne 0) { throw "dotnet tool install wix failed with $LASTEXITCODE" }
           wix --version
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          if ($LASTEXITCODE -ne 0) { throw "wix Util extension install failed with $LASTEXITCODE" }
 
       - name: Build MSI installer
         shell: pwsh
         run: |
           $Version = "${{ needs.prepare.outputs.new_version }}"
           New-Item -ItemType Directory -Force -Path dist\release | Out-Null
-          wix build -arch x64 -d Version=$Version -d WorkerExe=dist\vaultline-worker.exe -o "dist\release\vaultline-worker_${Version}_windows-amd64.msi" packaging\windows\vaultline-worker.wxs
+          wix build -arch x64 -ext WixToolset.Util.wixext -d Version=$Version -d WorkerExe=dist\vaultline-worker.exe -o "dist\release\vaultline-worker_${Version}_windows-amd64.msi" packaging\windows\vaultline-worker.wxs
           if ($LASTEXITCODE -ne 0) { throw "wix build exited with $LASTEXITCODE" }
           if (-not (Test-Path "dist\release\vaultline-worker_${Version}_windows-amd64.msi")) { throw "missing Windows MSI asset" }
 

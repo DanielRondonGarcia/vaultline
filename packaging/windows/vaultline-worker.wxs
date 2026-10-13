@@ -16,9 +16,16 @@
 
   The state directory is marked Permanent so the enrollment state survives
   uninstall and reinstall/upgrade. The package ships no configuration file.
+  %ProgramData% lets BUILTIN\Users create files, so the state and logs folders
+  carry an explicit ACL (SYSTEM and Administrators only): a standard user must
+  not be able to plant enrollment files for the LocalSystem service.
 
-  Build (CI):
-    wix build -arch x64 -d Version=<semver> -d WorkerExe=dist\vaultline-worker.exe \
+  The service is configured to restart on failure (util:ServiceConfig), so a
+  worker process that exits with an error is brought back by the SCM.
+
+  Build (CI; the Util extension must be added first with
+  `wix extension add -g WixToolset.Util.wixext/<wix version>`):
+    wix build -arch x64 -ext WixToolset.Util.wixext -d Version=<semver> -d WorkerExe=dist\vaultline-worker.exe \
       -o dist\release\vaultline-worker_<semver>_windows-amd64.msi packaging\windows\vaultline-worker.wxs
 -->
 <?ifndef Version ?>
@@ -28,7 +35,7 @@
   <?define WorkerExe = "dist\vaultline-worker.exe" ?>
 <?endif?>
 
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
       Name="Vaultline Worker"
       Manufacturer="Vaultline"
@@ -71,6 +78,15 @@
               Stop="both"
               Remove="uninstall"
               Wait="yes" />
+          <!-- SCM recovery: the service host exits with a non-zero code on an
+               unhandled worker error so these actions fire. -->
+          <util:ServiceConfig
+              ServiceName="VaultlineWorker"
+              FirstFailureActionType="restart"
+              SecondFailureActionType="restart"
+              ThirdFailureActionType="restart"
+              RestartServiceDelayInSeconds="10"
+              ResetPeriodInDays="1" />
           <Environment
               Id="WorkerPathEntry"
               Name="PATH"
@@ -85,16 +101,22 @@
     <!--
       %ProgramData%\Vaultline\worker: state written by `enroll` and by the
       service (worker.log). Permanent: never removed on uninstall.
+      The protected PermissionEx DACL prevents inherited grants; only SYSTEM
+      (the service) and Administrators (who run `enroll`) can access this tree.
     -->
     <StandardDirectory Id="CommonAppDataFolder">
       <Directory Id="VaultlineDataDir" Name="Vaultline">
         <Directory Id="WorkerStateFolder" Name="worker">
           <Component Id="WorkerStateDir" Guid="3029A7D9-EDF5-4832-ACA0-56E18F08D1CC" Permanent="yes">
-            <CreateFolder />
+            <CreateFolder>
+              <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+            </CreateFolder>
           </Component>
           <Directory Id="WorkerLogsFolder" Name="logs">
             <Component Id="WorkerLogsDir" Guid="85FD8EDB-5E1D-4DB1-8BF9-9DB052800D14" Permanent="yes">
-              <CreateFolder />
+              <CreateFolder>
+                <PermissionEx Sddl="D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+              </CreateFolder>
             </Component>
           </Directory>
         </Directory>

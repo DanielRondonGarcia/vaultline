@@ -26,9 +26,11 @@ from src.worker_agent.infrastructure.api_client.control_plane_client import (
 )
 from src.worker_agent.infrastructure.security.credential_store import WorkerCredentialStore
 from src.worker_agent.state_paths import (
+    enrollment_files_trusted,
     load_enrollment_config,
     resolve_credential_file,
     resolve_enrollment_config_file,
+    state_dir_is_managed,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -39,6 +41,9 @@ logger = logging.getLogger(__name__)
 _STOP_EVENT = Event()
 _WAITING_FOR_ENROLLMENT = "waiting for enrollment"
 _IDLE_LOG_EVERY_CYCLES = 20
+# State directories whose enrollment files were already refused; the error is
+# logged once per directory so an idle service does not flood its log.
+_UNTRUSTED_ENROLLMENT_DIRS: set[str] = set()
 
 
 def request_stop() -> None:
@@ -467,6 +472,35 @@ def _apply_enrollment_config(service: WorkerAgentService, health_state: Optional
     logger.info("Enrollment detected; using Control Plane %s", config.control_plane_url)
 
 
+def _enrollment_files_are_trusted(store) -> bool:
+    """Defense in depth before adopting enrollment files found at runtime.
+
+    The service runs as LocalSystem/root; a credential or ``worker.json``
+    owned by anyone other than SYSTEM/Administrators (root/the current user on
+    POSIX) could redirect it to an attacker-controlled Control Plane.
+    """
+
+    # Developer-mode direct credential stores are intentionally not subject to
+    # machine-service ownership rules. Frozen services and explicitly managed
+    # state directories must fail closed before adopting newly written files.
+    if not state_dir_is_managed() and os.environ.get("WORKER_SERVICE_MODE") != "true":
+        return True
+    credential_path = getattr(store, "path", None)
+    paths = [Path(credential_path)] if credential_path else []
+    paths.append(resolve_enrollment_config_file())
+    if enrollment_files_trusted(paths):
+        return True
+    directory = str(paths[0].parent)
+    if directory not in _UNTRUSTED_ENROLLMENT_DIRS:
+        _UNTRUSTED_ENROLLMENT_DIRS.add(directory)
+        logger.error(
+            "refusing untrusted enrollment files in %s: they must be owned by SYSTEM/Administrators (root on Linux); "
+            "re-run 'vaultline-worker enroll' from an elevated shell",
+            directory,
+        )
+    return False
+
+
 def _resolve_worker_identity(service: WorkerAgentService, health_state: Optional[WorkerHealthState] = None) -> bool:
     """Refresh ``worker_id`` from the credential store on every loop.
 
@@ -478,6 +512,8 @@ def _resolve_worker_identity(service: WorkerAgentService, health_state: Optional
 
     The first time a stored credential is found, ``worker.json`` is re-applied so
     the connection settings written by ``enroll`` take effect without a restart.
+    A credential whose files fail the ownership check is never adopted: the
+    worker stays idle as if it were unenrolled.
     """
 
     config = service.config
@@ -493,6 +529,8 @@ def _resolve_worker_identity(service: WorkerAgentService, health_state: Optional
         return True
     stored_worker_id = getattr(stored, "worker_id", None)
     if isinstance(stored_worker_id, str) and stored_worker_id:
+        if not _enrollment_files_are_trusted(store):
+            return False
         _apply_enrollment_config(service, health_state)
         config.worker_id = stored_worker_id
         if client is not None and not getattr(client, "worker_id", None):
@@ -510,6 +548,7 @@ def main():
     orphan_sweep_interval = _runtime_orphan_sweep_interval()
     last_logged_worker_id = None
     attempts = 0
+    registered_once = False
     next_orphan_sweep_at = None
     last_heartbeat_at = 0.0
     last_inventory_sync_at = 0.0
@@ -551,6 +590,7 @@ def main():
         idle_cycles = 0
         try:
             worker_id = service.ensure_registered()
+            registered_once = True
             if last_logged_worker_id != worker_id:
                 logger.info("Worker registered with id %s", worker_id)
                 last_logged_worker_id = worker_id
@@ -591,7 +631,7 @@ def main():
             error_message = _format_worker_loop_error(exc)
             health_state.record_control_plane_failure(error_message)
             logger.warning("%s", error_message)
-            if attempts >= 5:
+            if attempts >= 5 and not registered_once:
                 health_state.record_not_ready(error_message)
                 raise RuntimeError("worker startup failed after 5 attempts") from None
         finally:

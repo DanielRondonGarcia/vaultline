@@ -18,9 +18,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,19 @@ CREDENTIAL_FILE_NAME = "worker_credentials.json"
 DEVELOPER_CREDENTIAL_FILE_NAME = ".worker_credentials.json"
 ENROLLMENT_CONFIG_FILE_NAME = "worker.json"
 ENROLLMENT_CONFIG_KEYS = ("control_plane_url", "control_plane_ca_file", "worker_name")
+
+# Well-known SIDs. icacls accepts "*<SID>" so the grants do not depend on the OS
+# locale; the same SIDs identify trusted owners of the enrollment files.
+WINDOWS_SYSTEM_SID = "S-1-5-18"
+WINDOWS_ADMINISTRATORS_SID = "S-1-5-32-544"
+TRUSTED_WINDOWS_OWNER_SIDS = frozenset({WINDOWS_SYSTEM_SID, WINDOWS_ADMINISTRATORS_SID})
+STATE_DIR_POSIX_MODE = 0o700
+
+# Owner identities are plain strings so a resolver can be injected in tests:
+# "S-1-5-..." on Windows, "uid:<n>" on POSIX, None when the owner is unknown.
+OwnerResolver = Callable[[Path], Optional[str]]
+
+_owner_check_warned = False
 
 
 def _env(name: str) -> str | None:
@@ -57,6 +71,123 @@ def resolve_state_dir() -> Path:
             return Path(program_data) / "Vaultline" / "worker"
         return Path(LINUX_DEFAULT_STATE_DIR)
     return Path.cwd()
+
+
+def state_dir_is_managed() -> bool:
+    """True when the state directory is dedicated to the worker.
+
+    Only then may its permissions be rewritten. In developer mode the state
+    directory is the current working directory (a repository checkout, for
+    instance) and must never be re-ACLed.
+    """
+
+    return _env("WORKER_STATE_DIR") is not None or _is_frozen()
+
+
+def secure_state_dir(path: Path | str) -> None:
+    """Restrict an existing state directory to the service identity and administrators.
+
+    Windows: inheritance is removed and only SYSTEM and Administrators keep
+    full control, so a standard user cannot plant ``worker_credentials.json``
+    or ``worker.json`` for the LocalSystem service to adopt. POSIX: ``0700``.
+    Raises ``PermissionError`` when the ACL cannot be applied and
+    ``FileNotFoundError`` when the directory does not exist.
+    """
+
+    target = Path(path)
+    if not target.is_dir():
+        raise FileNotFoundError(f"worker state directory does not exist: {target}")
+    if _platform_is_windows():
+        args = [
+            "icacls",
+            str(target),
+            "/inheritance:r",
+            "/grant:r",
+            f"*{WINDOWS_SYSTEM_SID}:(OI)(CI)F",
+            "/grant:r",
+            f"*{WINDOWS_ADMINISTRATORS_SID}:(OI)(CI)F",
+        ]
+        try:
+            subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            raise PermissionError(f"could not restrict permissions on {target} with icacls") from exc
+        return
+    try:
+        os.chmod(target, STATE_DIR_POSIX_MODE)
+    except OSError as exc:
+        raise PermissionError(f"could not restrict permissions on {target}") from exc
+
+
+def _current_uid() -> int | None:
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid() if geteuid is not None else None
+
+
+def _warn_owner_check_unavailable_once() -> None:
+    global _owner_check_warned
+    if _owner_check_warned:
+        return
+    _owner_check_warned = True
+    logger.warning("Cannot verify the owner of the enrollment files (pywin32 unavailable); refusing to adopt them")
+
+
+def _reset_owner_check_warning() -> None:
+    global _owner_check_warned
+    _owner_check_warned = False
+
+
+def _windows_file_owner(path: Path) -> str | None:
+    try:
+        import win32security
+    except ImportError:
+        return None
+    descriptor = win32security.GetFileSecurity(str(path), win32security.OWNER_SECURITY_INFORMATION)
+    return str(win32security.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner()))
+
+
+def _posix_file_owner(path: Path) -> str:
+    return f"uid:{os.stat(path).st_uid}"
+
+
+def _default_owner_resolver() -> OwnerResolver:
+    return _windows_file_owner if _platform_is_windows() else _posix_file_owner
+
+
+def _trusted_owners() -> frozenset[str]:
+    trusted = set(TRUSTED_WINDOWS_OWNER_SIDS)
+    trusted.add("uid:0")
+    uid = _current_uid()
+    if uid is not None:
+        trusted.add(f"uid:{uid}")
+    return frozenset(trusted)
+
+
+def enrollment_files_trusted(paths: Iterable[Path | str], owner_resolver: OwnerResolver | None = None) -> bool:
+    """Return True when every existing file in ``paths`` is owned by a trusted identity.
+
+    Trusted owners are SYSTEM or Administrators on Windows and root or the
+    current user on POSIX. Missing files are ignored. An owner that cannot be
+    determined (no pywin32) is skipped with a single warning; an error while
+    reading ownership counts as untrusted.
+    """
+
+    resolve = owner_resolver or _default_owner_resolver()
+    trusted = _trusted_owners()
+    for raw in paths:
+        path = Path(raw)
+        if not path.exists():
+            continue
+        try:
+            owner = resolve(path)
+        except Exception as exc:
+            logger.error("Could not read the owner of %s (%s)", path.name, exc.__class__.__name__)
+            return False
+        if owner is None:
+            _warn_owner_check_unavailable_once()
+            return False
+        if owner not in trusted:
+            return False
+    return True
 
 
 def resolve_credential_file() -> Path:

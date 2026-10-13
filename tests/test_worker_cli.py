@@ -65,6 +65,19 @@ class WorkerNativeCLITests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         worker_main.assert_called_once_with()
 
+    def test_daemon_once_unenrolled_prints_actionable_error_and_exits_three(self):
+        from src.worker_agent import cli
+
+        stderr = io.StringIO()
+        with patch("src.worker_agent.main.main", side_effect=RuntimeError("worker is not enrolled")), redirect_stderr(stderr):
+            exit_code = cli.main(["daemon", "--once"])
+
+        self.assertEqual(exit_code, 3)
+        self.assertEqual(
+            stderr.getvalue().strip(),
+            "error: worker is not enrolled; run 'vaultline-worker enroll --control-plane-url <url>'",
+        )
+
     def test_self_check_reports_presence_without_secret_values(self):
         from src.worker_agent import cli
 

@@ -72,6 +72,123 @@ class StatePathResolutionTests(unittest.TestCase):
             missing.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
             self.assertEqual(state_paths.load_enrollment_config(missing), {})
 
+    def test_state_dir_is_managed_only_with_env_or_frozen_executable(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(sys, "frozen", False, create=True):
+            self.assertFalse(state_paths.state_dir_is_managed())
+        with patch.dict(os.environ, {"WORKER_STATE_DIR": "managed"}, clear=True), patch.object(sys, "frozen", False, create=True):
+            self.assertTrue(state_paths.state_dir_is_managed())
+        with patch.dict(os.environ, {}, clear=True), _frozen():
+            self.assertTrue(state_paths.state_dir_is_managed())
+
+
+class SecureStateDirTests(unittest.TestCase):
+    def test_windows_resets_inheritance_and_grants_system_and_administrators_full_control(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(state_paths, "_platform_is_windows", return_value=True), \
+                patch.object(state_paths.subprocess, "run") as run:
+            state_paths.secure_state_dir(directory)
+        args = run.call_args.args[0]
+        self.assertEqual(args[:3], ["icacls", str(Path(directory)), "/inheritance:r"])
+        grants = [args[index + 1] for index, token in enumerate(args) if token == "/grant:r"]
+        self.assertEqual(grants, ["*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F"])
+        self.assertTrue(run.call_args.kwargs.get("check"))
+
+    def test_windows_icacls_failure_raises_permission_error(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(state_paths, "_platform_is_windows", return_value=True), \
+                patch.object(state_paths.subprocess, "run", side_effect=OSError("icacls missing")):
+            with self.assertRaises(PermissionError) as raised:
+                state_paths.secure_state_dir(directory)
+        self.assertIn(str(Path(directory)), str(raised.exception))
+
+    def test_posix_chmods_directory_to_owner_only(self):
+        chmods = []
+        with tempfile.TemporaryDirectory() as directory, patch.object(state_paths, "_platform_is_windows", return_value=False), \
+                patch.object(state_paths.os, "chmod", side_effect=lambda *a, **k: chmods.append(a)), patch.object(state_paths.subprocess, "run") as run:
+            state_paths.secure_state_dir(directory)
+        run.assert_not_called()
+        self.assertEqual(chmods, [(Path(directory), 0o700)])
+
+    def test_posix_chmod_failure_raises_permission_error(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(state_paths, "_platform_is_windows", return_value=False), \
+                patch.object(state_paths.os, "chmod", side_effect=PermissionError("read-only")):
+            with self.assertRaises(PermissionError):
+                state_paths.secure_state_dir(directory)
+
+    def test_missing_directory_is_rejected_before_touching_acls(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(state_paths.subprocess, "run") as run:
+            with self.assertRaises(FileNotFoundError):
+                state_paths.secure_state_dir(Path(directory) / "absent")
+        run.assert_not_called()
+
+
+class EnrollmentFilesTrustedTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.directory, ignore_errors=True))
+        self.credential = Path(self.directory) / "worker_credentials.json"
+        self.config = Path(self.directory) / "worker.json"
+        self.credential.write_text("{}", encoding="utf-8")
+        self.config.write_text("{}", encoding="utf-8")
+
+    def test_system_and_administrators_owners_are_trusted_on_windows(self):
+        for sid in ("S-1-5-18", "S-1-5-32-544"):
+            with self.subTest(sid=sid):
+                self.assertTrue(state_paths.enrollment_files_trusted([self.credential, self.config], owner_resolver=lambda _path: sid))
+
+    def test_standard_user_owner_is_rejected(self):
+        self.assertFalse(
+            state_paths.enrollment_files_trusted([self.credential, self.config], owner_resolver=lambda _path: "S-1-5-21-1-2-3-1001")
+        )
+
+    def test_one_untrusted_file_is_enough_to_reject(self):
+        owners = {self.credential: "S-1-5-18", self.config: "S-1-5-21-1-2-3-1001"}
+        self.assertFalse(state_paths.enrollment_files_trusted([self.credential, self.config], owner_resolver=lambda path: owners[Path(path)]))
+
+    def test_posix_root_and_current_user_are_trusted_but_other_uids_are_not(self):
+        with patch.object(state_paths, "_current_uid", return_value=1000):
+            self.assertTrue(state_paths.enrollment_files_trusted([self.credential], owner_resolver=lambda _path: "uid:0"))
+            self.assertTrue(state_paths.enrollment_files_trusted([self.credential], owner_resolver=lambda _path: "uid:1000"))
+            self.assertFalse(state_paths.enrollment_files_trusted([self.credential], owner_resolver=lambda _path: "uid:1001"))
+
+    def test_missing_files_are_skipped(self):
+        calls = []
+        absent = Path(self.directory) / "absent.json"
+        self.assertTrue(state_paths.enrollment_files_trusted([absent], owner_resolver=lambda path: calls.append(path) or "uid:1001"))
+        self.assertEqual(calls, [])
+
+    def test_unknown_owner_is_skipped_with_a_single_warning(self):
+        state_paths._reset_owner_check_warning()
+        with self.assertLogs("src.worker_agent.state_paths", level="WARNING") as logs:
+            self.assertFalse(state_paths.enrollment_files_trusted([self.credential, self.config], owner_resolver=lambda _path: None))
+            self.assertFalse(state_paths.enrollment_files_trusted([self.credential], owner_resolver=lambda _path: None))
+        self.assertEqual(sum("owner" in line for line in logs.output), 1)
+
+    def test_owner_resolution_error_is_treated_as_untrusted(self):
+        def broken(_path):
+            raise OSError("access denied")
+
+        self.assertFalse(state_paths.enrollment_files_trusted([self.credential], owner_resolver=broken))
+
+    def test_posix_default_resolver_reports_uid(self):
+        fake_stat = types.SimpleNamespace(st_uid=4242)
+        with patch.object(state_paths, "_platform_is_windows", return_value=False), patch.object(state_paths.os, "stat", return_value=fake_stat):
+            self.assertEqual(state_paths._default_owner_resolver()(self.credential), "uid:4242")
+
+    def test_windows_default_resolver_uses_pywin32_owner_sid(self):
+        win32security = types.ModuleType("win32security")
+        win32security.OWNER_SECURITY_INFORMATION = 1
+        descriptor = Mock()
+        descriptor.GetSecurityDescriptorOwner.return_value = "sid-object"
+        win32security.GetFileSecurity = Mock(return_value=descriptor)
+        win32security.ConvertSidToStringSid = Mock(return_value="S-1-5-18")
+        with patch.object(state_paths, "_platform_is_windows", return_value=True), patch.dict(sys.modules, {"win32security": win32security}):
+            self.assertEqual(state_paths._default_owner_resolver()(self.credential), "S-1-5-18")
+        win32security.GetFileSecurity.assert_called_once_with(str(self.credential), 1)
+        win32security.ConvertSidToStringSid.assert_called_once_with("sid-object")
+
+    def test_windows_default_resolver_without_pywin32_returns_unknown(self):
+        with patch.object(state_paths, "_platform_is_windows", return_value=True), patch.dict(sys.modules, {"win32security": None}):
+            self.assertIsNone(state_paths._default_owner_resolver()(self.credential))
+
 
 class EnrollPersistsConfigTests(unittest.TestCase):
     class FakeClient:
@@ -90,15 +207,54 @@ class EnrollPersistsConfigTests(unittest.TestCase):
     def setUp(self):
         self.FakeClient.instances = []
 
-    def _run(self, argv, env):
+    def _run(self, argv, env, secure_state_dir=None):
         from src.worker_agent import cli
 
         out, err = io.StringIO(), io.StringIO()
         with patch.dict(os.environ, env, clear=True), patch("getpass.getpass", return_value="b" * 40), \
                 patch("src.worker_agent.cli.ControlPlaneClient", side_effect=self.FakeClient), \
+                patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run"), \
+                patch("src.worker_agent.cli.secure_state_dir", side_effect=secure_state_dir) as secured, \
                 redirect_stdout(out), redirect_stderr(err):
             code = cli.main(argv)
+        self.secured = secured
         return code, out.getvalue(), err.getvalue()
+
+    def test_enroll_locks_down_managed_state_dir_before_writing_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "fresh"
+            order = []
+
+            def record(path):
+                order.append(("secure", Path(path), (Path(path) / "worker_credentials.json").exists()))
+
+            code, _, err = self._run(["enroll", "--control-plane-url", "http://cp"], {"WORKER_STATE_DIR": str(state_dir)}, secure_state_dir=record)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(order, [("secure", state_dir, False)])
+            self.assertTrue(state_dir.is_dir())
+
+    def test_enroll_in_developer_mode_leaves_cwd_permissions_alone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            credential = Path(directory) / "c.json"
+            with patch.object(sys, "frozen", False, create=True):
+                code, _, err = self._run(["enroll", "--control-plane-url", "http://cp"], {"WORKER_CREDENTIAL_FILE": str(credential)})
+            self.assertEqual(code, 0, err)
+            self.secured.assert_not_called()
+
+    def test_enroll_without_permission_to_lock_down_state_dir_fails_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            def deny(path):
+                raise PermissionError(f"could not restrict permissions on {path}")
+
+            code, out, err = self._run(["enroll", "--control-plane-url", "http://cp"], {"WORKER_STATE_DIR": directory}, secure_state_dir=deny)
+            self.assertEqual(code, 1)
+            self.assertEqual(self.FakeClient.instances, [])
+            self.assertEqual(out, "")
+            self.assertEqual(len(err.strip().splitlines()), 1)
+            self.assertIn("administrator", err.lower())
+            self.assertNotIn("Traceback", err)
+            self.assertFalse((Path(directory) / "worker_credentials.json").exists())
+            self.assertFalse(list(Path(directory).glob(".*.pending.json")))
 
     def test_enroll_flags_persist_worker_json_in_state_dir(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -145,6 +301,7 @@ class EnrollPersistsConfigTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"WORKER_STATE_DIR": directory}, clear=True), \
                 patch("getpass.getpass", return_value="b" * 40), patch("src.worker_agent.cli.ControlPlaneClient", side_effect=FailingClient), \
+                patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run"), \
                 redirect_stderr(io.StringIO()):
             code = cli.main(["enroll", "--control-plane-url", "http://cp"])
         self.assertEqual(code, 1)
@@ -311,19 +468,25 @@ class IdleUntilEnrolledTests(unittest.TestCase):
         self.assertTrue(any("vaultline-worker enroll --control-plane-url" in line for line in logs.output))
         self.assertEqual(sum("Waiting for enrollment" in line for line in logs.output), 1)
 
-    def _run_transition(self, directory, env_overrides, enroll_payload):
+    def _run_transition(self, directory, env_overrides, enroll_payload, trusted=True, max_waits=2):
         """Start unenrolled, write worker.json + credential during the idle wait, stop after one registered loop."""
         store = _FakeStore()
+        store.path = Path(directory) / "worker_credentials.json"
         service = _FakeService(store, control_plane_url="http://127.0.0.1:8080")
         health = {}
+        waits = []
 
         def fake_wait(delay):
+            waits.append(delay)
             if store.credential is None:
                 (Path(directory) / "worker.json").write_text(json.dumps(enroll_payload), encoding="utf-8")
+                store.path.write_text("{}", encoding="utf-8")
                 store.credential = StoredWorkerCredential("worker-late", "s" * 32, "1")
                 return False
-            self.worker_main.request_stop()
-            return True
+            if len(waits) >= max_waits:
+                self.worker_main.request_stop()
+                return True
+            return False
 
         health_cls = self.worker_main.WorkerHealthState
 
@@ -335,9 +498,33 @@ class IdleUntilEnrolledTests(unittest.TestCase):
         env.update(env_overrides)
         with patch.dict(os.environ, env, clear=True), patch.object(self.worker_main, "build_service", return_value=service), \
                 patch.object(self.worker_main, "start_health_server"), patch.object(self.worker_main, "WorkerHealthState", side_effect=capture_state), \
+                patch.object(self.worker_main, "enrollment_files_trusted", return_value=trusted) as trust_check, \
                 patch.object(self.worker_main, "_wait_for_stop", side_effect=fake_wait), self.assertLogs(self.worker_main.logger, level="INFO") as logs:
             self.worker_main.main()
+        self.trust_check = trust_check
         return service, health["state"], logs.output
+
+    def test_runtime_enrollment_is_adopted_only_after_both_files_pass_the_owner_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service, _, _ = self._run_transition(directory, {}, {"control_plane_url": "https://cp.enrolled"})
+        self.assertEqual(service.config.worker_id, "worker-late")
+        checked = [Path(p) for p in self.trust_check.call_args.args[0]]
+        self.assertEqual(checked, [Path(directory) / "worker_credentials.json", Path(directory) / "worker.json"])
+
+    def test_untrusted_enrollment_files_are_refused_and_worker_stays_idle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service, state, logs = self._run_transition(directory, {}, {"control_plane_url": "https://cp.attacker"}, trusted=False, max_waits=4)
+        self.assertIsNone(service.config.worker_id)
+        self.assertIsNone(service.control_plane_client.worker_id)
+        self.assertEqual(service.ensure_registered_calls, 0)
+        self.assertEqual(service.config.control_plane_url, "http://127.0.0.1:8080")
+        self.assertEqual(service.control_plane_client.reconfigure_calls, [])
+        self.assertEqual(state.snapshot()["status"], "not_ready")
+        refusals = [line for line in logs if "refusing untrusted enrollment files" in line]
+        self.assertEqual(len(refusals), 1)
+        self.assertIn(directory, refusals[0])
+        self.assertTrue(refusals[0].startswith("ERROR:"))
+        self.assertNotIn("Enrollment detected", "\n".join(logs))
 
     def test_enrollment_detected_at_runtime_applies_worker_json_connection_settings(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -466,6 +653,78 @@ class CredentialOwnershipTests(unittest.TestCase):
             self.assertIn("*S-1-5-18:(R,W)", grants)
             self.assertIn("*S-1-5-32-544:(R,W)", grants)
             self.assertEqual(len(grants), 3)
+
+    def test_windows_locks_down_a_managed_state_dir_it_just_created(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "fresh"
+            store = WorkerCredentialStore(state_dir / "credentials.json")
+            with patch.dict(os.environ, {"WORKER_STATE_DIR": str(state_dir)}), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.os", _OSProxy("nt")), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run"), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.secure_state_dir") as secure:
+                store.save("worker-acl", "c" * 32, "1")
+                secure.assert_called_once_with(state_dir)
+                store.save("worker-acl", "d" * 32, "1")
+            # The directory existed on the second write: its ACL is not rewritten.
+            self.assertEqual(secure.call_count, 1)
+
+    def test_windows_never_re_acls_an_existing_or_unmanaged_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            existing = WorkerCredentialStore(Path(directory) / "credentials.json")
+            unmanaged = WorkerCredentialStore(Path(directory) / "dev" / "credentials.json")
+            with patch.dict(os.environ, {}, clear=True), patch.object(sys, "frozen", False, create=True), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.os", _OSProxy("nt")), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run"), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.secure_state_dir") as secure:
+                existing.save("worker-a", "c" * 32, "1")
+                unmanaged.save("worker-b", "c" * 32, "1")
+            secure.assert_not_called()
+
+    def test_windows_does_not_acl_legacy_credential_parent_outside_managed_state_dir(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "managed"
+            legacy_parent = Path(directory) / "legacy"
+            legacy_parent.mkdir()
+            store = WorkerCredentialStore(legacy_parent / "credentials.json")
+            with patch.dict(os.environ, {"WORKER_STATE_DIR": str(state_dir)}), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.os", _OSProxy("nt")), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run"), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.secure_state_dir") as secure:
+                store.save("worker-legacy", "e" * 32, "1")
+
+            secure.assert_not_called()
+
+    def test_windows_sets_administrators_as_owner_only_for_managed_final_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory) / "managed"
+            state_dir.mkdir()
+            store = WorkerCredentialStore(state_dir / "worker_credentials.json")
+            calls = []
+            with patch.dict(os.environ, {"WORKER_STATE_DIR": str(state_dir)}), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.os", _OSProxy("nt")), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run", side_effect=lambda args, **kwargs: calls.append((args, kwargs))), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.os.getlogin", return_value="enroller"), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.getpass.getuser", return_value="enroller"):
+                store.save("worker-managed", "c" * 32, "1")
+
+            owner_calls = [args for args, _ in calls if "/setowner" in args]
+            self.assertEqual(len(owner_calls), 1)
+            self.assertEqual(owner_calls[0][-2:], ["/setowner", "*S-1-5-32-544"])
+            self.assertEqual(owner_calls[0][1], str(state_dir / "worker_credentials.json"))
+            self.assertTrue(any("enroller:(R,W)" in arg for args, _ in calls for arg in args))
+            self.assertTrue(any("*S-1-5-18:(R,W)" in arg for args, _ in calls for arg in args))
+            self.assertTrue(any("*S-1-5-32-544:(R,W)" in arg for args, _ in calls for arg in args))
+
+    def test_windows_does_not_set_administrators_owner_for_unmanaged_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = WorkerCredentialStore(Path(directory) / "worker_credentials.json")
+            calls = []
+            with patch.dict(os.environ, {}, clear=True), patch.object(sys, "frozen", False, create=True), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.os", _OSProxy("nt")), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run", side_effect=lambda args, **kwargs: calls.append(args)), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.getpass.getuser", return_value="developer"):
+                store.save("worker-dev", "d" * 32, "1")
+            self.assertFalse(any("/setowner" in args for args in calls))
 
     def test_posix_root_write_chowns_to_state_dir_owner(self):
         chowns = []

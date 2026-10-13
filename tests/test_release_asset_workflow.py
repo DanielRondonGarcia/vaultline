@@ -1,4 +1,5 @@
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -48,7 +49,29 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertIn("/tmp/pbs/python/lib:${LD_LIBRARY_PATH:-}", self.workflow)
         self.assertIn("Py_ENABLE_SHARED=1", self.workflow)
         self.assertIn("libpython3.11.so", self.workflow)
+        linux_job = self.workflow.split("  native-linux:", 1)[1].split("  native-windows:", 1)[0]
+        self.assertLess(linux_job.index("scripts/set_worker_build_version.py"), linux_job.index("python -m PyInstaller"))
         self.assertRegex(self.workflow, r"dist/vaultline-worker --help")
+
+    def test_version_stamp_precedes_windows_pyinstaller_and_defaults_to_dev(self):
+        job = self.windows_job()
+        self.assertLess(job.index("scripts/set_worker_build_version.py"), job.index("python -m PyInstaller"))
+        from src.worker_agent._build_info import VERSION
+        self.assertEqual(VERSION, "dev")
+
+    def test_version_stamp_script_accepts_only_semver(self):
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "_build_info.py"
+            script = ROOT / "scripts" / "set_worker_build_version.py"
+            result = subprocess.run([sys.executable, str(script), "3.8.1", "--output", str(target)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), 'VERSION = "3.8.1"\n')
+            original = target.read_text(encoding="utf-8")
+            invalid = subprocess.run([sys.executable, str(script), '__import__("os").system("whoami")', "--output", str(target)], capture_output=True, text=True)
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
 
     def test_windows_build_names_smokes_and_uploads_exact_exe(self):
         self.assertIn("runs-on: windows-2022", self.workflow)

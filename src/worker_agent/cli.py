@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import getpass
 import json
 import os
@@ -18,6 +19,7 @@ from typing import Sequence
 from src.app import main as app_main
 from src.security.hmac_protocol import digest_secret
 from src.worker_agent import main as worker_main
+from src.worker_agent._build_info import VERSION as BUILD_VERSION
 from src.worker_agent.infrastructure.adapters.native_runtime import NativeRuntimeAdapter
 from src.worker_agent.infrastructure.api_client.control_plane_client import ControlPlaneClient
 from src.worker_agent.infrastructure.security.credential_store import WorkerCredentialStore
@@ -148,6 +150,10 @@ def _enroll(args: argparse.Namespace) -> int:
     # enroll runs elevated (administrator/root): lock the dedicated state
     # directory down before any enrollment state lands in it, so the service
     # never adopts files a standard user could have planted there.
+    if state_dir_is_managed() and _is_windows() and not is_user_admin():
+        print("error: open PowerShell as Administrator and rerun 'vaultline-worker enroll ...'", file=sys.stderr)
+        return 1
+
     if state_dir_is_managed():
         state_dir = resolve_state_dir()
         try:
@@ -155,8 +161,7 @@ def _enroll(args: argparse.Namespace) -> int:
             secure_state_dir(state_dir)
         except OSError as exc:
             print(
-                f"error: could not restrict permissions on {state_dir} ({exc.__class__.__name__}); "
-                "run enroll from an elevated PowerShell (Run as administrator) or as root.",
+                "error: could not secure worker state; run 'vaultline-worker enroll ...' from PowerShell as Administrator or as root.",
                 file=sys.stderr,
             )
             return 1
@@ -207,6 +212,14 @@ def _enroll(args: argparse.Namespace) -> int:
         "were stored for daemon use."
     )
     return 0
+
+
+def is_user_admin() -> bool:
+    """Return whether this Windows process has an elevated administrator token."""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
 
 
 SERVICE_VERBS = ("install", "uninstall", "start", "stop", "status", "run")
@@ -300,10 +313,11 @@ def _service(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="python -m src.worker_agent.cli",
+        prog="vaultline-worker",
         description="Native filesystem worker CLI.",
     )
-    subcommands = parser.add_subparsers(dest="command", required=True)
+    parser.add_argument("--version", action="version", version=f"%(prog)s {BUILD_VERSION}")
+    subcommands = parser.add_subparsers(dest="command")
 
     enroll = subcommands.add_parser(
         "enroll",
@@ -369,8 +383,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments == ["backup-engine"]:
         return _backup_engine(argparse.Namespace(command="backup-engine"))
     parser = build_parser()
+    if not arguments:
+        parser.print_help()
+        return 0
     args = parser.parse_args(arguments)
-    return args.handler(args)
+    if args.command is None:
+        parser.print_help()
+        return 0
+    try:
+        return args.handler(args)
+    except OSError as exc:
+        if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 5 or getattr(exc, "errno", None) in (1, 13):
+            print("error: worker state could not be saved; rerun from an elevated PowerShell (Run as administrator) or as root.", file=sys.stderr)
+        else:
+            print("error: worker state could not be saved; check filesystem permissions and retry.", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

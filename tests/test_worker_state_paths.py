@@ -212,6 +212,7 @@ class EnrollPersistsConfigTests(unittest.TestCase):
 
         out, err = io.StringIO(), io.StringIO()
         with patch.dict(os.environ, env, clear=True), patch("getpass.getpass", return_value="b" * 40), \
+                patch("src.worker_agent.cli.is_user_admin", return_value=True), \
                 patch("src.worker_agent.cli.ControlPlaneClient", side_effect=self.FakeClient), \
                 patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run"), \
                 patch("src.worker_agent.cli.secure_state_dir", side_effect=secure_state_dir) as secured, \

@@ -152,6 +152,7 @@ jobs:
               export LD_LIBRARY_PATH="/tmp/pbs/python/lib:${LD_LIBRARY_PATH:-}"
               python -c "import pathlib, sysconfig; shared = sysconfig.get_config_var(\"Py_ENABLE_SHARED\"); assert shared == 1, f\"Py_ENABLE_SHARED={shared}\"; assert pathlib.Path(\"/tmp/pbs/python/lib/libpython3.11.so\").is_file(), \"missing libpython3.11.so\"; print(\"Py_ENABLE_SHARED=1\")"
               python -m pip install -r requirements-build.txt
+              python scripts/set_worker_build_version.py "${{ needs.prepare.outputs.new_version }}"
               python -m PyInstaller build/vaultline-worker.spec --distpath /workspace/dist --workpath /workspace/build/pyinstaller-${{ matrix.arch }} --noconfirm
               /workspace/dist/vaultline-worker --help
             '
@@ -187,6 +188,7 @@ jobs:
       - name: Build onefile worker
         shell: pwsh
         run: |
+          python scripts/set_worker_build_version.py "${{ needs.prepare.outputs.new_version }}"
           python -m pip install -r requirements-build.txt
           python -m PyInstaller build/vaultline-worker.spec --distpath dist --workpath build/pyinstaller-windows-amd64 --noconfirm
 

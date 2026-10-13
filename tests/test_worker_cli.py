@@ -10,6 +10,45 @@ from src.worker_agent.windows_service import ServiceError
 
 
 class WorkerNativeCLITests(unittest.TestCase):
+    def test_root_parser_uses_vaultline_command_name(self):
+        from src.worker_agent import cli
+
+        self.assertEqual(cli.build_parser().prog, "vaultline-worker")
+
+    def test_no_arguments_prints_help_and_succeeds(self):
+        from src.worker_agent import cli
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            code = cli.main([])
+
+        self.assertEqual(code, 0)
+        for command in ("enroll", "daemon", "service"):
+            self.assertIn(command, output.getvalue())
+        self.assertIn("usage: vaultline-worker", output.getvalue())
+
+    def test_version_reports_build_version(self):
+        from src.worker_agent import cli
+
+        output = io.StringIO()
+        with patch("src.worker_agent.cli.BUILD_VERSION", "3.8.0"), redirect_stdout(output):
+            with self.assertRaises(SystemExit) as exit_code:
+                cli.main(["--version"])
+
+        self.assertEqual(exit_code.exception.code, 0)
+        self.assertEqual(output.getvalue().strip(), "vaultline-worker 3.8.0")
+
+    def test_invalid_command_remains_an_argparse_error(self):
+        from src.worker_agent import cli
+
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            with self.assertRaises(SystemExit) as raised:
+                cli.main(["not-a-command"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("usage: vaultline-worker", errors.getvalue())
+        self.assertIn("invalid choice", errors.getvalue())
+
     def test_backup_engine_dispatches_to_app_main_and_returns_zero(self):
         from src.worker_agent import cli
 

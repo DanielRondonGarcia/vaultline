@@ -19,6 +19,36 @@ class _WindowsOSProxy:
 
 
 class WorkerEnrollmentCLITests(unittest.TestCase):
+    def test_managed_windows_enrollment_requires_admin_before_prompt(self):
+        from src.worker_agent import cli
+
+        errors = io.StringIO()
+        with patch("src.worker_agent.cli._is_windows", return_value=True), \
+                patch("src.worker_agent.cli.state_dir_is_managed", return_value=True), \
+                patch("src.worker_agent.cli.is_user_admin", return_value=False), \
+                patch("getpass.getpass") as prompt, redirect_stderr(errors):
+            code = cli.main(["enroll", "--control-plane-url", "https://example.invalid"])
+
+        self.assertEqual(code, 1)
+        prompt.assert_not_called()
+        self.assertEqual(errors.getvalue().strip(), "error: open PowerShell as Administrator and rerun 'vaultline-worker enroll ...'")
+
+    def test_pending_state_permission_error_is_friendly(self):
+        from src.worker_agent import cli
+
+        errors = io.StringIO()
+        with patch.dict(os.environ, {"WORKER_CREDENTIAL_FILE": "credentials.json"}, clear=True), \
+                patch("src.worker_agent.cli.state_dir_is_managed", return_value=False), \
+                patch("getpass.getpass", return_value="t" * 32), \
+                patch("src.worker_agent.cli.WorkerCredentialStore.save_pending_enrollment", side_effect=PermissionError(5, "denied")), \
+                redirect_stderr(errors):
+            code = cli.main(["enroll", "--control-plane-url", "https://example.invalid"])
+
+        self.assertEqual(code, 1)
+        self.assertIn("Run as administrator", errors.getvalue())
+        self.assertNotIn("Traceback", errors.getvalue())
+        self.assertNotIn("https://", errors.getvalue())
+
     def run_enroll(self, directory, token="t" * 32, client_factory=None, argv=None):
         from src.worker_agent import cli
 

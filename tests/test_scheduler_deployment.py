@@ -284,8 +284,8 @@ class SchedulerDeploymentTests(unittest.TestCase):
     @staticmethod
     def _service(job_repository=None):
         workers = InMemoryWorkerRepository()
-        workers.save(WorkerRecord(name="worker-a", host_name="test", id="worker-a", last_seen_at=utcnow()))
-        return ControlPlaneService(
+        workers.save(WorkerRecord(name="worker-a", host_name="test", id="worker-a"))
+        service = ControlPlaneService(
             worker_repository=workers,
             inventory_repository=InMemoryInventoryRepository(),
             target_repository=InMemoryTargetRepository(),
@@ -298,6 +298,8 @@ class SchedulerDeploymentTests(unittest.TestCase):
             secret_codec=object(),
             settings_repository=InMemorySettingsRepository(),
         )
+        service.heartbeat("worker-a")
+        return service
 
 
 if __name__ == "__main__":

@@ -143,6 +143,52 @@ class WorkerManagementTests(unittest.TestCase):
         self.assertEqual(auth._get("worker-a", "1").status, "revoked")
         self.assertEqual(auth._get("worker-a", "2").status, "active")
 
+    def test_enrollment_registration_stays_offline_until_authenticated_heartbeat(self):
+        service, _, _, _, _, _ = self.make_service()
+        existing = service.worker_repository.get("worker-a")
+        previous_seen = existing.last_seen_at
+
+        renewed = service.register_worker(
+            name="worker-a",
+            host_name="host-renewed",
+            labels={"tier": "prod"},
+            worker_id="worker-a",
+        )
+
+        self.assertEqual(renewed.status, WorkerStatus.PENDING)
+        self.assertEqual(renewed.last_seen_at, previous_seen)
+        self.assertEqual(service._worker_status(renewed), WorkerStatus.OFFLINE)
+
+        online = service.heartbeat("worker-a", version="3.8.6")
+        self.assertEqual(online.status, WorkerStatus.ONLINE)
+        self.assertIsNotNone(online.last_seen_at)
+        self.assertGreaterEqual(online.last_seen_at, previous_seen)
+        self.assertEqual(service._worker_status(online), WorkerStatus.ONLINE)
+
+    def test_new_enrollment_is_offline_until_heartbeat_and_disabled_status_is_preserved(self):
+        service, _, _, _, _, _ = self.make_service()
+
+        new_worker = service.register_worker(
+            name="worker-new",
+            host_name="host-new",
+            worker_id="worker-new",
+        )
+        self.assertEqual(new_worker.status, WorkerStatus.PENDING)
+        self.assertIsNone(new_worker.last_seen_at)
+        self.assertEqual(service._worker_status(new_worker), WorkerStatus.OFFLINE)
+        self.assertEqual(service.heartbeat("worker-new").status, WorkerStatus.ONLINE)
+
+        disabled = service.worker_repository.get("worker-a")
+        disabled.status = WorkerStatus.DISABLED
+        service.worker_repository.save(disabled)
+        enrolled_disabled = service.register_worker(
+            name="worker-a",
+            host_name="host-a",
+            worker_id="worker-a",
+        )
+        self.assertEqual(enrolled_disabled.status, WorkerStatus.DISABLED)
+        self.assertEqual(service.heartbeat("worker-a").status, WorkerStatus.DISABLED)
+
     def test_worker_enrollment_renewal_rejects_unknown_worker(self):
         service, _, _, _, _, _ = self.make_service()
 

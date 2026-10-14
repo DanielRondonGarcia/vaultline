@@ -24,9 +24,9 @@ from src.control_plane.infrastructure.repositories.sqlite import SQLiteJobReposi
 class JobOwnershipTests(unittest.TestCase):
     def make_service(self, job_repository=None):
         workers = InMemoryWorkerRepository()
-        workers.save(WorkerRecord(name="worker-a", host_name="test", id="worker-a", last_seen_at=utcnow()))
-        workers.save(WorkerRecord(name="worker-b", host_name="test", id="worker-b", last_seen_at=utcnow()))
-        return ControlPlaneService(
+        workers.save(WorkerRecord(name="worker-a", host_name="test", id="worker-a"))
+        workers.save(WorkerRecord(name="worker-b", host_name="test", id="worker-b"))
+        service = ControlPlaneService(
             worker_repository=workers,
             inventory_repository=InMemoryInventoryRepository(),
             target_repository=InMemoryTargetRepository(),
@@ -39,6 +39,9 @@ class JobOwnershipTests(unittest.TestCase):
             secret_codec=object(),
             settings_repository=InMemorySettingsRepository(),
         )
+        service.heartbeat("worker-a")
+        service.heartbeat("worker-b")
+        return service
 
     def test_owner_claim_and_completion(self):
         service = self.make_service()

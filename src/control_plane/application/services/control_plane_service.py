@@ -204,8 +204,7 @@ class ControlPlaneService:
             existing.version = version
             existing.labels = labels or existing.labels or {}
             if existing.status != WorkerStatus.DISABLED:
-                existing.status = WorkerStatus.ONLINE
-            existing.last_seen_at = utcnow()
+                existing.status = WorkerStatus.PENDING
             existing.updated_at = utcnow()
             return self.worker_repository.save(existing)
         worker = WorkerRecord(
@@ -214,8 +213,7 @@ class ControlPlaneService:
             version=version,
             labels=labels or {},
             id=worker_id or str(uuid4()),
-            status=WorkerStatus.ONLINE,
-            last_seen_at=utcnow(),
+            status=WorkerStatus.PENDING,
         )
         return self.worker_repository.save(worker)
 
@@ -4116,7 +4114,7 @@ class ControlPlaneService:
     def _worker_status(cls, worker: WorkerRecord, now: Optional[datetime] = None) -> str:
         if worker.status == WorkerStatus.DISABLED:
             return WorkerStatus.DISABLED
-        if worker.last_seen_at is None:
+        if worker.status != WorkerStatus.ONLINE or worker.last_seen_at is None:
             return WorkerStatus.OFFLINE
         now = now or utcnow()
         last_seen_at = worker.last_seen_at

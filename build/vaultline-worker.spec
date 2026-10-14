@@ -41,6 +41,8 @@ if sys.platform == "win32":
         "win32timezone",
         "pywintypes",
         "win32con",
+        "win32net",
+        "win32netcon",
     ])
 
 

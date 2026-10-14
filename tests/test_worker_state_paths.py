@@ -136,15 +136,22 @@ class EnrollmentFilesTrustedTests(unittest.TestCase):
 
     def test_standard_user_owner_is_rejected(self):
         self.assertFalse(
-            state_paths.enrollment_files_trusted([self.credential, self.config], owner_resolver=lambda _path: "S-1-5-21-1-2-3-1001")
+            state_paths.enrollment_files_trusted(
+                [self.credential, self.config],
+                owner_resolver=lambda _path: "S-1-5-21-1-2-3-1001",
+                membership_resolver=lambda _sid: False,
+            )
         )
 
     def test_one_untrusted_file_is_enough_to_reject(self):
         owners = {self.credential: "S-1-5-18", self.config: "S-1-5-21-1-2-3-1001"}
-        self.assertFalse(state_paths.enrollment_files_trusted([self.credential, self.config], owner_resolver=lambda path: owners[Path(path)]))
+        self.assertFalse(state_paths.enrollment_files_trusted(
+            [self.credential, self.config], owner_resolver=lambda path: owners[Path(path)],
+            membership_resolver=lambda _sid: False,
+        ))
 
     def test_posix_root_and_current_user_are_trusted_but_other_uids_are_not(self):
-        with patch.object(state_paths, "_current_uid", return_value=1000):
+        with patch.object(state_paths, "_platform_is_windows", return_value=False), patch.object(state_paths, "_current_uid", return_value=1000):
             self.assertTrue(state_paths.enrollment_files_trusted([self.credential], owner_resolver=lambda _path: "uid:0"))
             self.assertTrue(state_paths.enrollment_files_trusted([self.credential], owner_resolver=lambda _path: "uid:1000"))
             self.assertFalse(state_paths.enrollment_files_trusted([self.credential], owner_resolver=lambda _path: "uid:1001"))
@@ -188,6 +195,51 @@ class EnrollmentFilesTrustedTests(unittest.TestCase):
     def test_windows_default_resolver_without_pywin32_returns_unknown(self):
         with patch.object(state_paths, "_platform_is_windows", return_value=True), patch.dict(sys.modules, {"win32security": None}):
             self.assertIsNone(state_paths._default_owner_resolver()(self.credential))
+
+    def test_windows_user_owner_is_trusted_only_when_member_of_local_administrators(self):
+        sid = "S-1-5-21-1-2-3-1001"
+        member = Mock(return_value=True)
+        with patch.object(state_paths, "_platform_is_windows", return_value=True):
+            self.assertTrue(state_paths.enrollment_files_trusted(
+                [self.credential], owner_resolver=lambda _path: sid, membership_resolver=member
+            ))
+        member.assert_called_once_with(sid)
+
+        member = Mock(return_value=False)
+        with patch.object(state_paths, "_platform_is_windows", return_value=True):
+            self.assertFalse(state_paths.enrollment_files_trusted(
+                [self.credential], owner_resolver=lambda _path: sid, membership_resolver=member
+            ))
+        member.assert_called_once_with(sid)
+
+    def test_injected_posix_owner_resolver_never_queries_windows_membership(self):
+        with patch.object(state_paths, "_platform_is_windows", return_value=False), \
+                patch.object(state_paths, "_windows_owner_is_local_administrator") as member:
+            self.assertTrue(state_paths.enrollment_files_trusted(
+                [self.credential], owner_resolver=lambda _path: "uid:0", membership_resolver=member
+            ))
+        member.assert_not_called()
+
+    def test_windows_membership_resolution_uses_localized_group_name_and_indirect_membership(self):
+        win32security = types.ModuleType("win32security")
+        win32security.ConvertStringSidToSid = Mock(side_effect=lambda sid: sid)
+        win32security.LookupAccountSid = Mock(side_effect=[("alice", "CONTOSO", 1), ("Administratoren", "BUILTIN", 2)])
+        win32net = types.ModuleType("win32net")
+        win32netcon = types.ModuleType("win32netcon")
+        win32netcon.LG_INCLUDE_INDIRECT = 1
+        win32net.NetUserGetLocalGroups = Mock(return_value=["Benutzer", "Administratoren"])
+
+        with patch.dict(sys.modules, {"win32security": win32security, "win32net": win32net, "win32netcon": win32netcon}):
+            self.assertTrue(state_paths._windows_owner_is_local_administrator("S-1-5-21-1-2-3-1001"))
+
+        win32net.NetUserGetLocalGroups.assert_called_once_with(None, "CONTOSO\\alice", 1)
+        self.assertEqual(win32security.LookupAccountSid.call_args_list[1].args, (None, "S-1-5-32-544"))
+
+    def test_windows_membership_resolution_errors_and_unknown_sids_fail_closed(self):
+        win32security = types.ModuleType("win32security")
+        win32security.ConvertStringSidToSid = Mock(side_effect=ValueError("unknown SID"))
+        with patch.dict(sys.modules, {"win32security": win32security}):
+            self.assertIsNone(state_paths._windows_owner_is_local_administrator("S-1-5-21-1-2-3-1001"))
 
 
 class EnrollPersistsConfigTests(unittest.TestCase):
@@ -252,7 +304,7 @@ class EnrollPersistsConfigTests(unittest.TestCase):
             self.assertEqual(self.FakeClient.instances, [])
             self.assertEqual(out, "")
             self.assertEqual(len(err.strip().splitlines()), 1)
-            self.assertIn("administrator", err.lower())
+            self.assertIn("state directory acl", err.lower())
             self.assertNotIn("Traceback", err)
             self.assertFalse((Path(directory) / "worker_credentials.json").exists())
             self.assertFalse(list(Path(directory).glob(".*.pending.json")))
@@ -642,6 +694,26 @@ class _OSProxy:
 
 
 class CredentialOwnershipTests(unittest.TestCase):
+    def test_pending_creation_uses_atomic_no_replace_link_on_posix_and_windows(self):
+        for platform in ("posix", "nt"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as directory:
+                store = WorkerCredentialStore(Path(directory) / "credentials.json")
+                with patch("src.worker_agent.infrastructure.security.credential_store.os", _OSProxy(platform)), \
+                        patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run") as run, \
+                        patch("src.worker_agent.infrastructure.security.credential_store.os.link", wraps=os.link) as link, \
+                        patch("src.worker_agent.infrastructure.security.credential_store.os.replace") as replace:
+                    store.save_pending_enrollment("attempt-first123456", "a" * 48, "digest-first")
+                    with self.assertRaises(FileExistsError):
+                        store.save_pending_enrollment("attempt-second123456", "b" * 48, "digest-second")
+
+                current = store.load_pending_enrollment()
+                self.assertEqual((current.attempt_id, current.durable_credential, current.token_digest),
+                                 ("attempt-first123456", "a" * 48, "digest-first"))
+                self.assertEqual(link.call_count, 2)
+                replace.assert_not_called()
+                if platform == "nt":
+                    self.assertTrue(run.called)
+
     def test_windows_acl_grants_system_and_administrators_by_sid(self):
         with tempfile.TemporaryDirectory() as directory:
             store = WorkerCredentialStore(os.path.join(directory, "credentials.json"))
@@ -695,7 +767,7 @@ class CredentialOwnershipTests(unittest.TestCase):
 
             secure.assert_not_called()
 
-    def test_windows_sets_administrators_as_owner_only_for_managed_final_files(self):
+    def test_windows_never_changes_file_owner(self):
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory) / "managed"
             state_dir.mkdir()
@@ -708,13 +780,21 @@ class CredentialOwnershipTests(unittest.TestCase):
                     patch("src.worker_agent.infrastructure.security.credential_store.getpass.getuser", return_value="enroller"):
                 store.save("worker-managed", "c" * 32, "1")
 
-            owner_calls = [args for args, _ in calls if "/setowner" in args]
-            self.assertEqual(len(owner_calls), 1)
-            self.assertEqual(owner_calls[0][-2:], ["/setowner", "*S-1-5-32-544"])
-            self.assertEqual(owner_calls[0][1], str(state_dir / "worker_credentials.json"))
+            self.assertFalse(any("/setowner" in args for args, _ in calls))
             self.assertTrue(any("enroller:(R,W)" in arg for args, _ in calls for arg in args))
             self.assertTrue(any("*S-1-5-18:(R,W)" in arg for args, _ in calls for arg in args))
             self.assertTrue(any("*S-1-5-32-544:(R,W)" in arg for args, _ in calls for arg in args))
+
+    def test_windows_pending_creation_never_replaces_existing_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = WorkerCredentialStore(Path(directory) / "worker_credentials.json")
+            store.save_pending_enrollment("attempt-original123456", "a" * 32, digest_secret("t" * 32))
+            with patch("src.worker_agent.infrastructure.security.credential_store.os", _OSProxy("nt")), \
+                    patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run"):
+                with self.assertRaises(FileExistsError):
+                    store.save_pending_enrollment("attempt-replacement123", "b" * 32, digest_secret("u" * 32))
+
+            self.assertEqual(store.load_pending_enrollment().attempt_id, "attempt-original123456")
 
     def test_windows_does_not_set_administrators_owner_for_unmanaged_file(self):
         with tempfile.TemporaryDirectory() as directory:

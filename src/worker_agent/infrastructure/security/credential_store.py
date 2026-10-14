@@ -9,6 +9,13 @@ WINDOWS_SYSTEM_SID = "*S-1-5-18"
 WINDOWS_ADMINISTRATORS_SID = "*S-1-5-32-544"
 
 
+class WorkerStateACLPermissionError(PermissionError):
+    def __init__(self, message, *, icacls_error_code=None, pending_state_may_exist=False):
+        super().__init__(message)
+        self.icacls_error_code = icacls_error_code
+        self.pending_state_may_exist = pending_state_may_exist
+
+
 @dataclass(frozen=True)
 class StoredWorkerCredential:
     worker_id: str
@@ -60,6 +67,7 @@ class WorkerCredentialStore:
                 "durable_credential": str(durable_credential),
                 "token_digest": str(token_digest),
             },
+            exclusive=True,
         )
         return PendingWorkerEnrollment(str(attempt_id), str(durable_credential), str(token_digest))
 
@@ -73,10 +81,11 @@ class WorkerCredentialStore:
         """Atomically write a non-credential JSON file (e.g. worker.json) with the same ownership rules."""
         self._atomic_write_json(path, payload)
 
-    def _atomic_write_json(self, path, payload):
+    def _atomic_write_json(self, path, payload, *, exclusive=False):
         path = Path(path)
         self._prepare_parent(path.parent)
         temp = path.with_name(f".{path.name}.tmp")
+        path_existed_before = path.exists()
         replaced = False
         try:
             if os.name == "nt":
@@ -91,10 +100,31 @@ class WorkerCredentialStore:
                 os.fsync(stream.fileno())
             if os.name != "nt":
                 self._restrict_file(temp)
-            os.replace(temp, path)
+            if exclusive:
+                os.link(temp, path)
+                temp.unlink()
+            else:
+                os.replace(temp, path)
             replaced = True
-            self._restrict_file(path, set_managed_owner=True)
+            self._restrict_file(path)
             self._align_owner_with_parent(path)
+        except PermissionError as exc:
+            if replaced and os.name == "nt" and path.name.endswith(".pending.json"):
+                if path_existed_before:
+                    raise WorkerStateACLPermissionError(
+                        "could not secure worker credential ACL with icacls",
+                        icacls_error_code=getattr(exc, "icacls_error_code", None),
+                        pending_state_may_exist=True,
+                    ) from exc
+                try:
+                    path.unlink()
+                except OSError:
+                    raise WorkerStateACLPermissionError(
+                        "could not secure worker credential ACL with icacls",
+                        icacls_error_code=getattr(exc, "icacls_error_code", None),
+                        pending_state_may_exist=True,
+                    ) from exc
+            raise
         finally:
             if not replaced:
                 try:
@@ -117,9 +147,9 @@ class WorkerCredentialStore:
         if created:
             secure_state_dir(parent)
 
-    def _restrict_file(self, path, set_managed_owner=False):
+    def _restrict_file(self, path):
         if os.name == "nt":
-            self._restrict_file_windows(path, set_managed_owner=set_managed_owner)
+            self._restrict_file_windows(path)
             return
         os.chmod(path, 0o600)
 
@@ -138,7 +168,7 @@ class WorkerCredentialStore:
             return
         chown(path, parent_stat.st_uid, parent_stat.st_gid)
 
-    def _restrict_file_windows(self, path, set_managed_owner=False):
+    def _restrict_file_windows(self, path):
         # chmod(0600) is not ACL protection on Windows. Use icacls and fail closed.
         # SYSTEM and Administrators are granted by SID (locale-independent) so the
         # LocalSystem service can read credentials written by an administrator.
@@ -159,14 +189,8 @@ class WorkerCredentialStore:
         ]
         try:
             subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if set_managed_owner and state_dir_is_managed() and os.path.normcase(os.path.abspath(Path(path).parent)) == os.path.normcase(
-                os.path.abspath(resolve_state_dir())
-            ):
-                subprocess.run(
-                    ["icacls", str(path), "/setowner", WINDOWS_ADMINISTRATORS_SID],
-                    check=True,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
         except Exception as exc:
-            raise PermissionError("could not restrict worker credential ACL with icacls") from exc
+            code = getattr(exc, "winerror", None) or getattr(exc, "returncode", None)
+            raise WorkerStateACLPermissionError(
+                "could not restrict worker credential ACL with icacls", icacls_error_code=code
+            ) from exc

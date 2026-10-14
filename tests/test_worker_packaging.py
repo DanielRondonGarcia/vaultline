@@ -78,6 +78,8 @@ class WorkerPackagingTests(unittest.TestCase):
             "win32timezone",
             "pywintypes",
             "win32con",
+            "win32net",
+            "win32netcon",
         }
 
         win32_blocks = _win32_blocks(tree)

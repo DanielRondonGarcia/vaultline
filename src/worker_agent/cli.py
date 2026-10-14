@@ -160,18 +160,35 @@ def _enroll(args: argparse.Namespace) -> int:
             state_dir.mkdir(parents=True, exist_ok=True)
             secure_state_dir(state_dir)
         except OSError as exc:
-            print(
-                "error: could not secure worker state; run 'vaultline-worker enroll ...' from PowerShell as Administrator or as root.",
-                file=sys.stderr,
-            )
+            if _is_windows() and is_user_admin():
+                if getattr(exc, "icacls_error_code", None) == 5:
+                    message = (
+                        "error: Windows denied access while securing worker state (icacls error 5); "
+                        "verify the state directory grants SYSTEM and Administrators access. "
+                        "No credential was enrolled."
+                    )
+                else:
+                    message = "error: Windows could not secure worker state; check the state directory ACL. No credential was enrolled."
+                print(message, file=sys.stderr)
+            else:
+                print(
+                    "error: could not secure worker state; run 'vaultline-worker enroll ...' from PowerShell as Administrator or as root.",
+                    file=sys.stderr,
+                )
             return 1
 
     bootstrap_token = getpass.getpass("Bootstrap token: ")
     token_digest = digest_secret(bootstrap_token)
     pending = store.load_pending_enrollment()
     if pending is None:
-        pending = _new_pending_enrollment(store, token_digest)
-    elif pending.token_digest != token_digest:
+        try:
+            pending = _new_pending_enrollment(store, token_digest)
+        except FileExistsError:
+            # Another enroll process may have created state after our initial read.
+            pending = store.load_pending_enrollment()
+            if pending is None:
+                raise
+    if pending.token_digest != token_digest:
         print(
             "A pending enrollment already exists for a different bootstrap token. "
             "Re-run with the original token, or run 'enroll --reset-pending' if you intentionally want to discard the pending attempt.",
@@ -193,7 +210,7 @@ def _enroll(args: argparse.Namespace) -> int:
         )
     except Exception as exc:
         print(
-            "Enrollment did not complete. The pending attempt was kept; re-run enroll with the same bootstrap token to retry.",
+            "Enrollment did not complete. The pending attempt was saved; re-run enroll with the same bootstrap token to retry.",
             file=sys.stderr,
         )
         print(f"Enrollment error type: {exc.__class__.__name__}", file=sys.stderr)
@@ -393,6 +410,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return args.handler(args)
     except OSError as exc:
+        icacls_error_code = getattr(exc, "icacls_error_code", None)
+        if _is_windows() and icacls_error_code == 5:
+            message = (
+                "error: Windows denied access while securing worker credentials (icacls error 5); "
+                "verify the state directory grants SYSTEM and Administrators access. No credential was enrolled."
+            )
+            if getattr(exc, "pending_state_may_exist", False):
+                message += " Pending state may need reset with 'enroll --reset-pending'."
+            print(message, file=sys.stderr)
+            return 1
+        if _is_windows() and getattr(exc, "pending_state_may_exist", False):
+            print(
+                "error: Windows could not secure worker credentials; check the state directory ACL. "
+                "No credential was enrolled. Pending state may need reset with 'enroll --reset-pending'.",
+                file=sys.stderr,
+            )
+            return 1
         if isinstance(exc, PermissionError) or getattr(exc, "winerror", None) == 5 or getattr(exc, "errno", None) in (1, 13):
             print("error: worker state could not be saved; rerun from an elevated PowerShell (Run as administrator) or as root.", file=sys.stderr)
         else:

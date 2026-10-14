@@ -19,6 +19,65 @@ class _WindowsOSProxy:
 
 
 class WorkerEnrollmentCLITests(unittest.TestCase):
+    def test_pending_creation_race_reloads_existing_attempt_and_rejects_other_token(self):
+        from src.worker_agent import cli
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "credentials.json")
+            store = WorkerCredentialStore(path)
+            existing = ("attempt-racer123456", "r" * 48, digest_secret("a" * 32))
+            original_save = store.save_pending_enrollment
+            raced_pending = original_save(*existing)
+            store.delete_pending_enrollment()
+
+            def competing_create(*_args):
+                original_save(*existing)
+                raise FileExistsError(store.pending_path)
+
+            errors = io.StringIO()
+            with patch.dict(os.environ, {"WORKER_CREDENTIAL_FILE": path}, clear=True), \
+                    patch("src.worker_agent.cli.state_dir_is_managed", return_value=False), \
+                    patch("getpass.getpass", return_value="b" * 32), \
+                    patch("src.worker_agent.cli.WorkerCredentialStore.load_pending_enrollment", side_effect=[None, raced_pending]), \
+                    patch("src.worker_agent.cli.WorkerCredentialStore.save_pending_enrollment", side_effect=competing_create), \
+                    patch("src.worker_agent.cli.ControlPlaneClient") as client, redirect_stderr(errors):
+                code = cli.main(["enroll", "--control-plane-url", "https://example.invalid"])
+
+            self.assertEqual(code, 2)
+            self.assertIn("different bootstrap token", errors.getvalue())
+            client.assert_not_called()
+            saved = store.load_pending_enrollment()
+            self.assertEqual((saved.attempt_id, saved.durable_credential, saved.token_digest), existing)
+
+    def test_pending_acl_warning_includes_reset_hint_for_error_codes_5_and_1300(self):
+        from src.worker_agent import cli
+        from src.worker_agent.infrastructure.security.credential_store import WorkerStateACLPermissionError
+
+        for error_code in (5, 1300):
+            with self.subTest(error_code=error_code), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "credentials.json")
+                errors = io.StringIO()
+                token = "secret-token-that-must-not-leak"
+                failure = WorkerStateACLPermissionError(
+                    "private path and https://secret.invalid", icacls_error_code=error_code,
+                    pending_state_may_exist=True,
+                )
+                with patch.dict(os.environ, {"WORKER_CREDENTIAL_FILE": path}, clear=True), \
+                        patch("src.worker_agent.cli.state_dir_is_managed", return_value=False), \
+                        patch("getpass.getpass", return_value=token), \
+                        patch("src.worker_agent.cli.WorkerCredentialStore.save_pending_enrollment", side_effect=failure), \
+                        redirect_stderr(errors):
+                    code = cli.main(["enroll", "--control-plane-url", "https://control.invalid"])
+
+                rendered = errors.getvalue()
+                self.assertEqual(code, 1)
+                self.assertEqual(len(rendered.strip().splitlines()), 1)
+                self.assertIn("enroll --reset-pending", rendered)
+                self.assertNotIn(token, rendered)
+                self.assertNotIn(directory, rendered)
+                self.assertNotIn("https://", rendered)
+                self.assertEqual("icacls error 5" in rendered, error_code == 5)
+
     def test_managed_windows_enrollment_requires_admin_before_prompt(self):
         from src.worker_agent import cli
 
@@ -33,21 +92,52 @@ class WorkerEnrollmentCLITests(unittest.TestCase):
         prompt.assert_not_called()
         self.assertEqual(errors.getvalue().strip(), "error: open PowerShell as Administrator and rerun 'vaultline-worker enroll ...'")
 
-    def test_pending_state_permission_error_is_friendly(self):
+    def test_pending_state_acl_error_after_prompt_is_honest_and_does_not_leak_secrets(self):
         from src.worker_agent import cli
 
         errors = io.StringIO()
-        with patch.dict(os.environ, {"WORKER_CREDENTIAL_FILE": "credentials.json"}, clear=True), \
+        token = "bootstrap-secret-should-not-appear-123"
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {"WORKER_CREDENTIAL_FILE": os.path.join(directory, "credentials.json")}, clear=True), \
                 patch("src.worker_agent.cli.state_dir_is_managed", return_value=False), \
-                patch("getpass.getpass", return_value="t" * 32), \
-                patch("src.worker_agent.cli.WorkerCredentialStore.save_pending_enrollment", side_effect=PermissionError(5, "denied")), \
+                patch("getpass.getpass", return_value=token), \
+                patch("src.worker_agent.infrastructure.security.credential_store.os", _WindowsOSProxy()), \
+                patch("src.worker_agent.infrastructure.security.credential_store.subprocess.run", side_effect=[None, __import__("subprocess").CalledProcessError(5, "icacls")]), \
                 redirect_stderr(errors):
             code = cli.main(["enroll", "--control-plane-url", "https://example.invalid"])
 
         self.assertEqual(code, 1)
-        self.assertIn("Run as administrator", errors.getvalue())
-        self.assertNotIn("Traceback", errors.getvalue())
-        self.assertNotIn("https://", errors.getvalue())
+        rendered = errors.getvalue()
+        self.assertIn("Windows denied access while securing worker credentials", rendered)
+        self.assertIn("icacls error 5", rendered)
+        self.assertIn("No credential was enrolled", rendered)
+        self.assertNotIn("run as administrator", rendered.lower())
+        self.assertNotIn("Traceback", rendered)
+        self.assertNotIn(token, rendered)
+        self.assertNotIn("https://", rendered)
+        self.assertNotIn(directory, rendered)
+        self.assertFalse(WorkerCredentialStore(os.path.join(directory, "credentials.json")).pending_path.exists())
+
+    def test_pending_file_remains_retryable_if_it_was_completed_before_network_failure(self):
+        sent = []
+
+        class FailingClient:
+            def __init__(self, base_url, **kwargs):
+                self.store = kwargs["credential_store"]
+
+            def complete_worker_enrollment_v2(self, token, attempt_id, credential, labels=None):
+                sent.append((token, attempt_id, credential))
+                raise OSError("offline")
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = self.run_enroll(directory, client_factory=FailingClient)
+            store = WorkerCredentialStore(first[3])
+            self.assertEqual(first[0], 1)
+            self.assertIsNotNone(store.load_pending_enrollment())
+            second = self.run_enroll(directory, client_factory=FailingClient)
+            self.assertEqual(second[0], 1)
+            self.assertEqual(sent[0], sent[1])
+            self.assertIsNotNone(store.load_pending_enrollment())
 
     def run_enroll(self, directory, token="t" * 32, client_factory=None, argv=None):
         from src.worker_agent import cli

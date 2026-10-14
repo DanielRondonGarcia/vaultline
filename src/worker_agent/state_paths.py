@@ -110,7 +110,9 @@ def secure_state_dir(path: Path | str) -> None:
         try:
             subprocess.run(args, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as exc:
-            raise PermissionError(f"could not restrict permissions on {target} with icacls") from exc
+            error = PermissionError(f"could not restrict permissions on {target} with icacls")
+            error.icacls_error_code = getattr(exc, "winerror", None) or getattr(exc, "returncode", None)
+            raise error from exc
         return
     try:
         os.chmod(target, STATE_DIR_POSIX_MODE)
@@ -128,7 +130,7 @@ def _warn_owner_check_unavailable_once() -> None:
     if _owner_check_warned:
         return
     _owner_check_warned = True
-    logger.warning("Cannot verify the owner of the enrollment files (pywin32 unavailable); refusing to adopt them")
+    logger.warning("Cannot verify the owner of the enrollment files; refusing to adopt them")
 
 
 def _reset_owner_check_warning() -> None:
@@ -145,6 +147,36 @@ def _windows_file_owner(path: Path) -> str | None:
     return str(win32security.ConvertSidToStringSid(descriptor.GetSecurityDescriptorOwner()))
 
 
+def _windows_owner_is_local_administrator(owner_sid: str) -> bool | None:
+    """Return whether a Windows account owner belongs to local Administrators.
+
+    ``None`` means the account or membership could not be verified. Keep the
+    imports lazy because developer and POSIX installs do not require pywin32.
+    """
+
+    try:
+        import win32net
+        import win32netcon
+        import win32security
+
+        owner_account, owner_domain, _ = win32security.LookupAccountSid(
+            None, win32security.ConvertStringSidToSid(owner_sid)
+        )
+        group_sid = win32security.ConvertStringSidToSid(WINDOWS_ADMINISTRATORS_SID)
+        group_name, _group_domain, _ = win32security.LookupAccountSid(None, group_sid)
+        qualified_owner = f"{owner_domain}\\{owner_account}" if owner_domain else owner_account
+        # pywin32 exposes the level-0 NetUserGetLocalGroups result directly as
+        # group names; its wrapper takes (serverName, userName, flags), with
+        # level 0 implicit. LG_INCLUDE_INDIRECT includes nested membership.
+        groups = win32net.NetUserGetLocalGroups(
+            None, qualified_owner, win32netcon.LG_INCLUDE_INDIRECT
+        )
+        return any(str(name).casefold() == str(group_name).casefold() for name in groups)
+    except Exception as exc:
+        logger.error("Could not verify Windows enrollment file owner membership (%s)", exc.__class__.__name__)
+        return None
+
+
 def _posix_file_owner(path: Path) -> str:
     return f"uid:{os.stat(path).st_uid}"
 
@@ -154,15 +186,21 @@ def _default_owner_resolver() -> OwnerResolver:
 
 
 def _trusted_owners() -> frozenset[str]:
-    trusted = set(TRUSTED_WINDOWS_OWNER_SIDS)
-    trusted.add("uid:0")
-    uid = _current_uid()
-    if uid is not None:
-        trusted.add(f"uid:{uid}")
+    if _platform_is_windows():
+        trusted = set(TRUSTED_WINDOWS_OWNER_SIDS)
+    else:
+        trusted = {"uid:0"}
+        uid = _current_uid()
+        if uid is not None:
+            trusted.add(f"uid:{uid}")
     return frozenset(trusted)
 
 
-def enrollment_files_trusted(paths: Iterable[Path | str], owner_resolver: OwnerResolver | None = None) -> bool:
+def enrollment_files_trusted(
+    paths: Iterable[Path | str],
+    owner_resolver: OwnerResolver | None = None,
+    membership_resolver: Callable[[str], bool | None] | None = None,
+) -> bool:
     """Return True when every existing file in ``paths`` is owned by a trusted identity.
 
     Trusted owners are SYSTEM or Administrators on Windows and root or the
@@ -186,6 +224,19 @@ def enrollment_files_trusted(paths: Iterable[Path | str], owner_resolver: OwnerR
             _warn_owner_check_unavailable_once()
             return False
         if owner not in trusted:
+            if _platform_is_windows() and owner.startswith("S-"):
+                try:
+                    verify_membership = membership_resolver or _windows_owner_is_local_administrator
+                    is_administrator = verify_membership(owner)
+                except Exception as exc:
+                    logger.error("Could not verify Windows enrollment file owner membership (%s)", exc.__class__.__name__)
+                    _warn_owner_check_unavailable_once()
+                    return False
+                if is_administrator is None:
+                    _warn_owner_check_unavailable_once()
+                    return False
+                if is_administrator:
+                    continue
             return False
     return True
 

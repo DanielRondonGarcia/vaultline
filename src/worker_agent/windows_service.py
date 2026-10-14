@@ -317,11 +317,6 @@ def _restore_service_failure_restarts() -> None:
     )
 
 
-def _terminate_service_process() -> None:
-    """Exit only after SCM recovery has been suppressed for the forced-stop case."""
-    os._exit(0)
-
-
 # --- lifecycle --------------------------------------------------------------
 
 
@@ -415,14 +410,17 @@ def build_service_class() -> type:
             super().__init__(args)
             self.stop_event = win32event.CreateEvent(None, 0, 0, None)
             self.worker_done = threading.Event()
+            self.force_stop_event = threading.Event()
+            self.worker_thread = None
             self.stop_requested = False
 
         def SvcStop(self):
+            if self.stop_requested:
+                return
             self.stop_requested = True
             self.ReportServiceStatus(
                 win32service.SERVICE_STOP_PENDING,
                 waitHint=STOP_INITIAL_WAIT_HINT_MS,
-                checkPoint=1,
             )
             # The worker main loop checks this between iterations; a job in
             # flight finishes its current loop iteration before main() returns.
@@ -430,49 +428,38 @@ def build_service_class() -> type:
             win32event.SetEvent(self.stop_event)
 
             def report_progress():
-                checkpoint = 1
                 deadline = time.monotonic() + STOP_WAIT_SECONDS
-                forced_stop_warning_logged = False
                 while not self.worker_done.is_set():
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        if not forced_stop_warning_logged:
-                            servicemanager.LogErrorMsg(
-                                f"Warning: {DISPLAY_NAME} did not stop within {STOP_WAIT_SECONDS} seconds; "
-                                "the current worker operation may be interrupted."
-                            )
-                            forced_stop_warning_logged = True
+                        servicemanager.LogErrorMsg(
+                            f"Warning: {DISPLAY_NAME} did not stop within {STOP_WAIT_SECONDS} seconds; "
+                            "the current worker operation may be interrupted."
+                        )
                         try:
-                            # A process exit without SERVICE_STOPPED is an SCM
-                            # failure. Suppress recovery first so MSI removal or
-                            # upgrade cannot restart this old service instance.
+                            # Keep the forced-stop path from looking like an
+                            # ordinary worker failure to SCM. The host still
+                            # returns below even if this defensive update fails.
                             _suppress_service_failure_restarts()
-                        except Exception as exc:  # fail closed: never exit with restart actions enabled
+                        except Exception as exc:
                             servicemanager.LogErrorMsg(
                                 f"{DISPLAY_NAME} cannot safely force-stop because SCM recovery suppression failed "
-                                f"({exc.__class__.__name__}); continuing bounded-stop retries"
+                                f"({exc.__class__.__name__}); returning from the service host anyway"
                             )
-                            self.worker_done.wait(STOP_WATCHDOG_INTERVAL_SECONDS)
-                            if not self.worker_done.is_set():
-                                checkpoint += 1
-                                self.ReportServiceStatus(
-                                    win32service.SERVICE_STOP_PENDING,
-                                    waitHint=STOP_WAIT_HINT_MS,
-                                    checkPoint=checkpoint,
-                                )
-                            continue
-
-                        # The worker is still alive until this process exits;
-                        # do not report SERVICE_STOPPED from the watchdog.
-                        _terminate_service_process()
+                        finally:
+                            # SvcRun reports SERVICE_STOPPED after SvcDoRun
+                            # returns. The worker is daemonized so an
+                            # in-flight operation may be interrupted as the
+                            # service host exits, without reporting STOPPED
+                            # while this host is still running.
+                            self.force_stop_event.set()
+                        return
 
                     if self.worker_done.wait(min(STOP_WATCHDOG_INTERVAL_SECONDS, remaining)):
                         break
-                    checkpoint += 1
                     self.ReportServiceStatus(
                         win32service.SERVICE_STOP_PENDING,
                         waitHint=STOP_WAIT_HINT_MS,
-                        checkPoint=checkpoint,
                     )
 
             threading.Thread(target=report_progress, daemon=True, name="worker-stop-watchdog").start()
@@ -510,22 +497,34 @@ def build_service_class() -> type:
             os.environ["WORKER_RUN_ONCE"] = "false"
             os.environ["WORKER_SERVICE_MODE"] = "true"
             worker_main.reset_stop()
-            try:
-                worker_main.main()
-            except Exception as exc:  # noqa: BLE001 - the SCM host must not see a traceback
-                servicemanager.LogErrorMsg(
-                    f"{DISPLAY_NAME} stopped after an unhandled error ({exc.__class__.__name__}): {exc}"
-                )
-                if not self.stop_requested:
-                    self.ReportServiceStatus(
-                        win32service.SERVICE_STOPPED,
-                        win32ExitCode=getattr(win32service, "ERROR_SERVICE_SPECIFIC_ERROR", 1066),
-                        svcExitCode=1,
+
+            def run_worker():
+                try:
+                    worker_main.main()
+                except Exception as exc:  # noqa: BLE001 - the SCM host must not see a traceback
+                    servicemanager.LogErrorMsg(
+                        f"{DISPLAY_NAME} stopped after an unhandled error ({exc.__class__.__name__}): {exc}"
                     )
-            else:
-                servicemanager.LogInfoMsg(f"{DISPLAY_NAME} stopped")
-            finally:
-                self.worker_done.set()
+                    if not self.stop_requested:
+                        self.ReportServiceStatus(
+                            win32service.SERVICE_STOPPED,
+                            win32ExitCode=getattr(win32service, "ERROR_SERVICE_SPECIFIC_ERROR", 1066),
+                            svcExitCode=1,
+                        )
+                else:
+                    servicemanager.LogInfoMsg(f"{DISPLAY_NAME} stopped")
+                finally:
+                    self.worker_done.set()
+
+            # SvcRun reports SERVICE_STOPPED after SvcDoRun returns. Keeping
+            # the worker in a daemon thread lets the host return after the
+            # bounded forced-stop signal and lets the process interrupt any
+            # operation that exceeded the accepted grace period.
+            self.worker_thread = threading.Thread(target=run_worker, daemon=True, name="worker-main")
+            self.worker_thread.start()
+            while not self.worker_done.is_set():
+                if self.force_stop_event.wait(0.1):
+                    break
 
     return VaultlineWorkerService
 

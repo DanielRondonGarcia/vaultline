@@ -667,10 +667,20 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
             'aria-live="polite"',
             "targetRunCancel",
             "targetRunExecute",
-            "backup_mode: selectedMode",
-            "El modo seleccionado aplica solo a esta ejecucion",
+            'backup_mode: isNative ? "hot" : selectedMode',
+            "El modo seleccionado aplica solo a esta ejecución",
         ):
             self.assertIn(marker, self.source)
+
+    def test_manual_native_backup_hides_mode_choices_and_submits_hot(self):
+        modal = re.search(r"function openBackupRunModal\(targetId, triggerButton\) \{.*?\n    \}\n\n    function runBackupNow", self.source, re.S)
+        self.assertIsNotNone(modal)
+        source = modal.group(0)
+        self.assertIn('target.runtime_type === "native"', source)
+        self.assertIn("Los backups del sistema de archivos se ejecutan sin detener contenedores.", source)
+        self.assertIn('backup_mode: isNative ? "hot" : selectedMode', source)
+        self.assertIn("executeButton.focus()", source)
+        self.assertIn('role="alert" aria-live="polite"', source)
 
     def test_inactive_targets_keep_manual_backup_and_snapshot_restore_actions(self):
         for marker in (

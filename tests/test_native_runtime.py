@@ -1,4 +1,5 @@
 import os
+import pathlib
 import subprocess
 import sys
 import unittest
@@ -8,6 +9,135 @@ from src.worker_agent.infrastructure.adapters.native_runtime import NativeRuntim
 
 
 class NativeRuntimeAdapterTests(unittest.TestCase):
+    def test_rclone_file_secret_is_materialized_and_removed_after_process(self):
+        adapter = NativeRuntimeAdapter()
+        secret = "[remote]\ntype = s3\nsecret_access_key = hidden-value\n"
+        payload = {
+            "runtime_type": "native", "filesystem_paths": ["/srv/app"],
+            "command": ["restic", "snapshots", "--json"],
+            "environment": {"RCLONE_CONFIG": r"C:\\run\\secrets\\rclone.conf", "RCLONE_CONF_CONTENT": secret},
+            "resolved_files": [{"container_path": "/run/secrets/rclone.conf", "content": secret, "secret_name": "rclone.conf"}],
+        }
+        observed = {}
+
+        def fake_popen(command, **kwargs):
+            path = kwargs["env"]["RCLONE_CONFIG"]
+            observed["path"] = path
+            observed["content"] = pathlib.Path(path).read_text(encoding="utf-8")
+            observed["directory"] = str(pathlib.Path(path).parent)
+            self.assertNotIn("RCLONE_CONF_CONTENT", kwargs["env"])
+            process = Mock()
+            process.stdout.readline.side_effect = ["ok\n", ""]
+            process.stderr.readline.side_effect = [""]
+            process.wait.return_value = 0
+            process.returncode = 0
+            return process
+
+        with patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="/usr/bin/restic"), patch(
+            "src.worker_agent.infrastructure.adapters.native_runtime._platform_is_windows", return_value=False
+        ), patch(
+            "src.worker_agent.infrastructure.adapters.native_runtime.subprocess.Popen", side_effect=fake_popen
+        ):
+            result = adapter.run_runtime_job("unused", payload)
+        self.assertTrue(result["success"], result)
+        self.assertEqual(observed["content"], secret)
+        self.assertFalse(pathlib.Path(observed["directory"]).exists())
+
+    def test_string_file_secret_is_redacted_from_native_logs_and_callbacks(self):
+        adapter = NativeRuntimeAdapter()
+        secret = "[remote]\npassword = string-file-secret-value\n"
+        payload = {
+            "runtime_type": "native",
+            "filesystem_paths": ["/srv/app"],
+            "command": ["restic", "snapshots", "--json"],
+            "resolved_files": [
+                {"container_path": "/run/secrets/rclone.conf", "content": secret, "secret_name": "rclone.conf"}
+            ],
+        }
+        callbacks = []
+
+        def fake_popen(_command, **_kwargs):
+            process = Mock()
+            process.stdout.readline.side_effect = [f"failed to open {secret}\n", ""]
+            process.stderr.readline.side_effect = [""]
+            process.wait.return_value = 1
+            process.returncode = 1
+            return process
+
+        with patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="/usr/bin/restic"), patch(
+            "src.worker_agent.infrastructure.adapters.native_runtime._platform_is_windows", return_value=False
+        ), patch("src.worker_agent.infrastructure.adapters.native_runtime.subprocess.Popen", side_effect=fake_popen):
+            result = adapter.run_runtime_job("unused", payload, output_callback=callbacks.append)
+
+        rendered = "\n".join([result.get("logs", ""), result.get("stderr", ""), *callbacks])
+        self.assertFalse(result["success"])
+        self.assertNotIn(secret, rendered)
+        self.assertIn("<redacted>", rendered)
+
+    def test_resolved_file_materialization_failure_fails_closed_without_leaking_secret(self):
+        adapter = NativeRuntimeAdapter()
+        secret = "password=private-value"
+        payload = {"runtime_type": "native", "filesystem_paths": ["/srv/app"], "command": ["restic", "snapshots", "--json"],
+                   "resolved_files": [{"container_path": "/run/secrets/rclone.conf", "content": secret, "secret_name": "rclone"}]}
+        with patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="/usr/bin/restic"), patch(
+            "src.worker_agent.infrastructure.adapters.native_runtime._platform_is_windows", return_value=False
+        ), patch(
+            "src.worker_agent.infrastructure.adapters.native_runtime.os.chmod", side_effect=OSError("private-value")
+        ), patch("src.worker_agent.infrastructure.adapters.native_runtime.subprocess.Popen") as popen:
+            result = adapter.run_runtime_job("unused", payload)
+        self.assertFalse(result["success"])
+        self.assertNotIn(secret, result["error"])
+        self.assertNotIn("private-value", result["error"])
+        self.assertNotIn("rclone.conf", result["error"])
+        popen.assert_not_called()
+
+    def test_materialized_secret_directory_is_removed_after_process_failure(self):
+        adapter = NativeRuntimeAdapter()
+        payload = {"runtime_type": "native", "filesystem_paths": ["/srv/app"], "command": ["restic", "snapshots", "--json"],
+                   "resolved_files": [{"container_path": "/run/secrets/rclone.conf", "content": "private", "secret_name": "rclone"}]}
+        observed = {}
+        def fake_popen(command, **kwargs):
+            observed["directory"] = os.path.dirname(kwargs["env"]["RCLONE_CONFIG"])
+            process = Mock()
+            process.stdout.readline.side_effect = [""]
+            process.stderr.readline.side_effect = ["failure\n", ""]
+            process.wait.return_value = 2
+            process.returncode = 2
+            return process
+        with patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="/usr/bin/restic"), patch(
+            "src.worker_agent.infrastructure.adapters.native_runtime._platform_is_windows", return_value=False
+        ), patch("src.worker_agent.infrastructure.adapters.native_runtime.subprocess.Popen", side_effect=fake_popen):
+            result = adapter.run_runtime_job("unused", payload)
+        self.assertFalse(result["success"])
+        self.assertFalse(os.path.exists(observed["directory"]))
+
+    def test_windows_secret_acl_grants_only_invoker_system_and_administrators(self):
+        adapter = NativeRuntimeAdapter()
+        secret = "safe"
+        payload = {"runtime_type": "native", "filesystem_paths": ["/srv/app"], "command": ["restic", "snapshots", "--json"],
+                   "resolved_files": [{"container_path": "/run/secrets/x", "content": secret}]}
+        recorded = []
+        def fake_popen(command, **kwargs):
+            recorded.append(kwargs["env"]["RCLONE_CONFIG"] if "RCLONE_CONFIG" in kwargs["env"] else "")
+            process = Mock()
+            process.stdout.readline.side_effect = [""]
+            process.stderr.readline.side_effect = [""]
+            process.wait.return_value = 0
+            process.returncode = 0
+            return process
+        with patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="/usr/bin/restic"), patch(
+            "src.worker_agent.infrastructure.adapters.native_runtime._platform_is_windows", return_value=True
+        ), patch("src.worker_agent.infrastructure.adapters.native_runtime._current_windows_user_sid", return_value="S-1-5-21-1"), patch(
+            "src.worker_agent.infrastructure.adapters.native_runtime.subprocess.run"
+        ) as run, patch("src.worker_agent.infrastructure.adapters.native_runtime.subprocess.Popen", side_effect=fake_popen):
+            result = adapter.run_runtime_job("unused", payload)
+        self.assertTrue(result["success"])
+        for call in run.call_args_list:
+            args = call.args[0]
+            self.assertNotIn("/setowner", args)
+            grants = [args[i + 1] for i, token in enumerate(args[:-1]) if token == "/grant:r"]
+            self.assertEqual(grants, ["*S-1-5-21-1:F", "*S-1-5-18:F", "*S-1-5-32-544:F"])
+
     def test_backup_payload_uses_filesystem_paths_json_without_mount_rewrite(self):
         adapter = NativeRuntimeAdapter(python_executable="python-test")
         payload = {

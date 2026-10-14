@@ -231,7 +231,7 @@ def main():
         )
         result = service.execute_restore()
         try: _write_restore_result(result)
-        except Exception as exc: logger.error("Restore result unavailable: %s", _restore_safe(exc)); exit(1)
+        except Exception as exc: logger.error("Restore result unavailable: %s", _restore_safe(exc)); raise SystemExit(1)
 
         if result.permission_warnings:
             for warning in result.permission_warnings:
@@ -242,7 +242,7 @@ def main():
             logger.info(f"Restore completed successfully in {result.duration:.1f}s")
         else:
             logger.error(f"Restore failed: {result.error}")
-            exit(1)
+            raise SystemExit(1)
         sys.stderr.flush()
         return
 
@@ -290,7 +290,7 @@ def main():
     result = service.execute_backup()
 
     if not result.success:
-        exit(1)
+        raise SystemExit(1)
 
 if __name__ == "__main__":
     main()

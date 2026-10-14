@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,25 @@ from typing import Any, Callable, Dict, Iterable, List
 from src.worker_agent.application.policies.runtime_command_policy import RuntimeCommandPolicy
 from src.worker_agent.application.ports.runtime_port import RuntimePort
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
+
+MAX_RESOLVED_FILES = 32
+MAX_RESOLVED_FILE_BYTES = 1024 * 1024
+MAX_RESOLVED_FILES_BYTES = 4 * 1024 * 1024
+
+
+def _platform_is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _current_windows_user_sid() -> str:
+    result = subprocess.run(["whoami", "/user", "/fo", "csv", "/nh"], check=True, capture_output=True, text=True)
+    import csv
+    import io
+    rows = list(csv.reader(io.StringIO(result.stdout)))
+    sid = rows[0][-1].strip() if rows and rows[0] else ""
+    if not sid.startswith("S-"):
+        raise PermissionError("could not resolve current Windows account SID")
+    return sid
 
 
 class NativeRuntimeAdapter(RuntimePort):
@@ -54,7 +74,16 @@ class NativeRuntimeAdapter(RuntimePort):
 
     @classmethod
     def _payload_secrets(cls, payload: Dict[str, Any]) -> set[str]:
-        return DockerRuntimeAdapter._collect_secret_values(payload)
+        secrets = DockerRuntimeAdapter._collect_secret_values(payload)
+        for spec in payload.get("resolved_files") or []:
+            if isinstance(spec, dict) and isinstance(spec.get("content"), bytes):
+                try:
+                    value = spec["content"].decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                if value:
+                    secrets.add(value)
+        return secrets
 
     @classmethod
     def _redact(cls, value: Any, secrets: Iterable[str] = ()) -> str:
@@ -180,6 +209,83 @@ class NativeRuntimeAdapter(RuntimePort):
             return self._backup_engine_command(), environment
         self._require_executable(command[0])
         return command, environment
+
+    def _materialize_resolved_files(self, payload: Dict[str, Any], environment: dict[str, str]) -> str | None:
+        specs = payload.get("resolved_files") or []
+        if not isinstance(specs, list) or len(specs) > MAX_RESOLVED_FILES:
+            raise ValueError("native runtime file secrets are invalid")
+        total = 0
+        parsed = []
+        for spec in specs:
+            if not isinstance(spec, dict):
+                raise ValueError("native runtime file secrets are invalid")
+            path, content = spec.get("container_path"), spec.get("content")
+            if not isinstance(path, str) or not self._is_absolute_native_path(path) or "\x00" in path or any(p in {".", ".."} for p in self._native_path_parts(path)):
+                raise ValueError("native runtime file secrets are invalid")
+            if isinstance(content, str):
+                content = content.encode("utf-8")
+            if not isinstance(content, bytes) or len(content) > MAX_RESOLVED_FILE_BYTES:
+                raise ValueError("native runtime file secrets are invalid")
+            total += len(content)
+            if total > MAX_RESOLVED_FILES_BYTES:
+                raise ValueError("native runtime file secrets are invalid")
+            parsed.append((spec, path, content))
+        rclone_content = environment.get("RCLONE_CONF_CONTENT")
+        # Strip the content value even when it originated in the worker process environment.
+        environment.pop("RCLONE_CONF_CONTENT", None)
+        if not parsed and rclone_content is None:
+            return None
+        if rclone_content is not None and not any(
+            "rclone" in str(spec.get("secret_name", "")).casefold() or path.casefold().endswith("rclone.conf")
+            for spec, path, _ in parsed
+        ):
+            if not isinstance(rclone_content, str) or len(rclone_content.encode("utf-8")) > MAX_RESOLVED_FILE_BYTES:
+                raise ValueError("native runtime file secrets are invalid")
+            parsed.append(({"secret_name": "rclone.conf"}, "/run/secrets/rclone.conf", rclone_content.encode("utf-8")))
+        directory = tempfile.mkdtemp(prefix="worker-native-secrets-")
+        try:
+            if _platform_is_windows():
+                user_sid = _current_windows_user_sid()
+                for path in (directory,):
+                    subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", f"*{user_sid}:F", "/grant:r", "*S-1-5-18:F", "/grant:r", "*S-1-5-32-544:F"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            else:
+                os.chmod(directory, 0o700)
+            mappings = {}
+            rclone_path = None
+            for index, (spec, path, content) in enumerate(parsed, start=1):
+                local_path = os.path.join(directory, f"secret-{index:02d}.conf")
+                with open(local_path, "xb") as handle:
+                    handle.write(content)
+                if _platform_is_windows():
+                    subprocess.run(["icacls", local_path, "/inheritance:r", "/grant:r", f"*{user_sid}:F", "/grant:r", "*S-1-5-18:F", "/grant:r", "*S-1-5-32-544:F"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    os.chmod(local_path, 0o600)
+                canonical = self._canonical_secret_path(path)
+                mappings[canonical] = local_path
+                if "rclone" in str(spec.get("secret_name", "")).casefold() or path.casefold().endswith("rclone.conf"):
+                    rclone_path = local_path
+            for key, value in list(environment.items()):
+                if not isinstance(value, str):
+                    continue
+                try:
+                    mapped = mappings.get(self._canonical_secret_path(value))
+                except Exception:
+                    mapped = None
+                if mapped:
+                    environment[key] = mapped
+            if rclone_path:
+                environment["RCLONE_CONFIG"] = rclone_path
+            return directory
+        except Exception:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise PermissionError("native runtime could not securely materialize file secrets") from None
+
+    @classmethod
+    def _canonical_secret_path(cls, value: str) -> tuple[str, str]:
+        text = value.strip().replace("\\", "/")
+        if re.match(r"^[A-Za-z]:/", text):
+            text = text[2:]
+        return cls._canonical_native_path(text)
 
     def collect_inventory(self) -> Dict[str, Any]:
         return {
@@ -324,9 +430,11 @@ class NativeRuntimeAdapter(RuntimePort):
     def run_runtime_job(self, image: str, payload: Dict[str, Any], cancel_check: Callable[[], bool] | None = None, output_callback: Callable[[str], None] | None = None) -> Dict[str, Any]:
         secrets = self._payload_secrets(payload)
         result_dir = None
+        secret_dir = None
         restore_result_path = None
         try:
             command, environment = self._command_and_environment(payload)
+            secret_dir = self._materialize_resolved_files(payload, environment)
             if payload.get("_restore_result_transport") and self._is_restore_environment(environment):
                 result_dir = tempfile.mkdtemp(prefix="worker-native-restore-result-", dir=tempfile.gettempdir())
                 os.chmod(result_dir, 0o700)
@@ -349,14 +457,21 @@ class NativeRuntimeAdapter(RuntimePort):
         finally:
             if result_dir:
                 shutil.rmtree(result_dir, ignore_errors=True)
+            if secret_dir:
+                shutil.rmtree(secret_dir, ignore_errors=True)
 
     def run_runtime_job_binary(self, image: str, payload: Dict[str, Any], cancel_check: Callable[[], bool] | None = None) -> Dict[str, Any]:
         secrets = self._payload_secrets(payload)
+        secret_dir = None
         try:
             command, environment = self._command_and_environment(payload)
+            secret_dir = self._materialize_resolved_files(payload, environment)
             return self._run_process(command, environment, payload, cancel_check, None, binary=True)
         except Exception as exc:
             return self._failure(str(exc), secrets, binary=True)
+        finally:
+            if secret_dir:
+                shutil.rmtree(secret_dir, ignore_errors=True)
 
     def list_restic_snapshots(self, image: str, payload: Dict[str, Any], cancel_check: Callable[[], bool] | None = None, output_callback: Callable[[str], None] | None = None) -> Dict[str, Any]:
         summary = self.run_runtime_job(image, payload, cancel_check=cancel_check, output_callback=output_callback)

@@ -2319,17 +2319,18 @@ docker compose up -d
       const overlay = document.getElementById("modalOverlay");
       if (!overlay) return;
       backupRunPreviousFocus = triggerButton || document.activeElement;
+      const isNative = target.runtime_type === "native";
       const configuredMode = target.backup_mode === "cold" ? "cold" : "hot";
       overlay.innerHTML = `
         <div class="modal target-run-modal" role="dialog" aria-modal="true" aria-labelledby="targetRunTitle" aria-describedby="targetRunHelp">
           <div class="modal-header"><h3 id="targetRunTitle">Ejecutar backup</h3><button type="button" class="close" id="targetRunClose" aria-label="Cerrar ejecucion de backup">&times;</button></div>
           <div class="modal-body">
-            <div class="helper" id="targetRunHelp">Target: <strong>${escapeHtml(target.name)}</strong>. El modo seleccionado aplica solo a esta ejecucion y no cambia la configuracion del target.</div>
-            <fieldset class="backup-mode-options">
+            <div class="helper" id="targetRunHelp">Target: <strong>${escapeHtml(target.name)}</strong>. ${isNative ? "Los backups del sistema de archivos se ejecutan sin detener contenedores." : "El modo seleccionado aplica solo a esta ejecución y no cambia la configuración del target."}</div>
+            ${isNative ? "" : `<fieldset class="backup-mode-options">
               <legend>Selecciona el modo de ejecucion</legend>
               <label class="backup-mode-option"><input type="radio" name="targetBackupMode" value="hot" ${configuredMode === "hot" ? "checked" : ""} /><span><strong>Hot</strong><small>Ejecuta sin detener los contenedores.</small></span></label>
               <label class="backup-mode-option"><input type="radio" name="targetBackupMode" value="cold" ${configuredMode === "cold" ? "checked" : ""} /><span><strong>Cold</strong><small>Detiene y reinicia los contenedores durante el backup.</small></span></label>
-            </fieldset>
+            </fieldset>`}
             <div id="targetRunError" class="form-error" role="alert" aria-live="polite" hidden></div>
           </div>
           <div class="modal-footer"><button type="button" class="btn" id="targetRunCancel">Cancelar</button><button type="button" class="btn primary" id="targetRunExecute">Ejecutar backup</button></div>
@@ -2352,7 +2353,7 @@ docker compose up -d
       overlay.onclick = event => { if (event.target === overlay) close(); };
       overlay.onkeydown = event => { if (event.key === "Escape") close(); };
       executeButton.addEventListener("click", async () => {
-        const selectedMode = overlay.querySelector('input[name="targetBackupMode"]:checked')?.value;
+        const selectedMode = isNative ? "hot" : overlay.querySelector('input[name="targetBackupMode"]:checked')?.value;
         if (!["hot", "cold"].includes(selectedMode)) {
           errorElement.textContent = "Selecciona un modo valido: hot o cold.";
           errorElement.hidden = false;
@@ -2366,7 +2367,7 @@ docker compose up -d
         try {
           const job = await apiPost(`/api/v1/targets/${encodeURIComponent(targetId)}/backup`, {
             requested_by: "ui",
-            backup_mode: selectedMode,
+            backup_mode: isNative ? "hot" : selectedMode,
           });
           close();
           openLogPanel(job.id, targetId);
@@ -2380,7 +2381,7 @@ docker compose up -d
           executeButton.focus();
         }
       });
-      requestAnimationFrame(() => overlay.querySelector('input[name="targetBackupMode"]:checked')?.focus());
+      requestAnimationFrame(() => (isNative ? executeButton : overlay.querySelector('input[name="targetBackupMode"]:checked'))?.focus());
     }
 
     function runBackupNow(targetId, btn) {

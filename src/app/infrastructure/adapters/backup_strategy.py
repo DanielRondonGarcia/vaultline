@@ -424,6 +424,8 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,
         )
         stdout_lines: list[str] = []

@@ -70,6 +70,15 @@ class NativeFilesystemTargetTests(unittest.TestCase):
 
     def test_native_target_is_hot_only_for_create_update_and_dispatch(self):
         service = self.make_service()
+        service.worker_repository.save(
+            WorkerRecord(
+                name="legacy-worker",
+                host_name="legacy-host",
+                id="worker-legacy",
+                status="online",
+                last_seen_at=utcnow(),
+            )
+        )
 
         with self.assertRaisesRegex(ValueError, "native filesystem targets support only hot backup mode"):
             service.register_target(
@@ -80,9 +89,10 @@ class NativeFilesystemTargetTests(unittest.TestCase):
                 filesystem_paths=["/srv/app"],
             )
 
-        docker_cold = service.register_target("docker-cold", "worker-native", backup_mode="cold")
+        docker_cold = service.register_target("docker-cold", "worker-legacy", backup_mode="cold")
         converted = service.update_target(
             docker_cold.id,
+            worker_id="worker-native",
             runtime_type="native",
             filesystem_paths=["/srv/app"],
         )
@@ -93,6 +103,32 @@ class NativeFilesystemTargetTests(unittest.TestCase):
             service.update_target(converted.id, backup_mode="cold")
         with self.assertRaisesRegex(ValueError, "native filesystem targets support only hot backup mode"):
             service.dispatch_backup_for_target(converted.id, backup_mode="cold")
+
+    def test_worker_runtime_labels_are_authoritative_for_docker_and_native(self):
+        service = self.make_service()
+
+        with self.assertRaisesRegex(ValueError, "does not advertise docker capability"):
+            service.register_target("native-docker", "worker-native", runtime_type="docker")
+
+        native = service.register_target(
+            "native-valid",
+            "worker-native",
+            runtime_type="native",
+            filesystem_paths=["/srv/app"],
+        )
+        with self.assertRaisesRegex(ValueError, "does not advertise docker capability"):
+            service.update_target(native.id, runtime_type="docker")
+
+        legacy = WorkerRecord(
+            name="legacy-worker",
+            host_name="legacy-host",
+            id="worker-legacy",
+            status="online",
+            last_seen_at=utcnow(),
+        )
+        service.worker_repository.save(legacy)
+        docker = service.register_target("legacy-docker", "worker-legacy", runtime_type="docker")
+        self.assertEqual(docker.runtime_type, "docker")
 
     def test_native_dispatch_preserves_windows_and_space_paths_without_backup_rewrite(self):
         service = self.make_service()
@@ -188,9 +224,11 @@ class NativeFilesystemTargetTests(unittest.TestCase):
         with open("src/control_plane/ui/index.html", "r", encoding="utf-8") as handle:
             html = handle.read()
 
-        self.assertIn('<option value="kubernetes" ${target.runtime_type === "kubernetes" ? "selected" : ""}>Kubernetes</option>', html)
-        self.assertIn('namespace: target.runtime_type === "kubernetes" ? target.namespace : undefined', html)
-        self.assertIn('pvc_names: target.runtime_type === "kubernetes" ? (target.pvc_names || []) : undefined', html)
+        self.assertIn('EDIT_TARGET_RUNTIME_DEFINITIONS', html)
+        self.assertIn('targetRuntimeOptions(currentWorker, initialEditRuntime, true, true)', html)
+        self.assertIn('const preserve = preserveUnsupported && selectedDefinition && !supported.includes(selected);', html)
+        self.assertIn('namespace: editRuntimeType === "kubernetes" ? target.namespace : null', html)
+        self.assertIn('pvc_names: editRuntimeType === "kubernetes" ? (target.pvc_names || []) : []', html)
 
 
 if __name__ == "__main__":

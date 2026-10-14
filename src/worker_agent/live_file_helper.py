@@ -40,10 +40,22 @@ def _directory_stat(path):
     return metadata
 
 
+def is_live_link(path):
+    try:
+        metadata = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return stat_module.S_ISLNK(metadata.st_mode) or getattr(metadata, "st_reparse_tag", None) == getattr(
+        stat_module, "IO_REPARSE_TAG_MOUNT_POINT", -1
+    )
+
+
 def virtual_parts(path):
     if path in ("", "/"):
         return []
-    if not isinstance(path, str) or not path.startswith("/") or "\\" in path or "\x00" in path:
+    if (not isinstance(path, str) or not path.startswith("/") or "\\" in path or len(path) > 4096
+            or any(ord(character) < 32 for character in path)
+            or (os.name == "nt" and ":" in path)):
         raise ValueError("live path must be virtual and POSIX-style")
     parts = path.split("/")[1:]
     if any(not part or part in (".", "..") for part in parts):
@@ -53,12 +65,12 @@ def virtual_parts(path):
 
 def confined_path(root, path):
     raw_root = os.fspath(root)
-    if os.path.islink(raw_root):
+    if is_live_link(raw_root):
         raise ValueError("live target root cannot be a link")
     current = root_path = os.path.realpath(raw_root)
     for part in virtual_parts(path):
         current = os.path.join(current, part)
-        if os.path.islink(current):
+        if is_live_link(current):
             raise ValueError("live links are not allowed")
     candidate = os.path.realpath(current)
     if os.path.commonpath((root_path, candidate)) != root_path:
@@ -66,10 +78,56 @@ def confined_path(root, path):
     return candidate
 
 
+def _windows_final_path(fd):
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    get_path = ctypes.WinDLL("kernel32", use_last_error=True).GetFinalPathNameByHandleW
+    get_path.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    get_path.restype = wintypes.DWORD
+    handle = msvcrt.get_osfhandle(fd)
+    size = 512
+    while size <= 32768:
+        buffer = ctypes.create_unicode_buffer(size)
+        # FILE_NAME_NORMALIZED | VOLUME_NAME_DOS resolves the opened handle, not its input path.
+        length = get_path(handle, buffer, size, 0)
+        if not length:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if length < size:
+            return buffer.value
+        size = length + 1
+    raise ValueError("live opened path exceeds the permitted bound")
+
+
+def _windows_path_key(path):
+    path = os.fspath(path).replace("/", "\\")
+    if path[:8].upper() == "\\\\?\\UNC\\":
+        path = "\\\\" + path[8:]
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    return os.path.normcase(os.path.normpath(path))
+
+
 def open_confined(root, path, flags=os.O_RDONLY):
     parts = virtual_parts(path)
+    flags |= getattr(os, "O_BINARY", 0)
     nofollow, directory = getattr(os, "O_NOFOLLOW", 0), getattr(os, "O_DIRECTORY", 0)
+    # The runtime already pins a canonical root. Never resolve it again after opening.
+    allowed_root = _windows_path_key(root) if os.name == "nt" else None
     try:
+        if os.name == "nt":
+            # Windows has no dir_fd guarantee: validate the handle returned by the
+            # path open before returning it to a caller that can read bytes.
+            fd = os.open(confined_path(root, path), flags | nofollow)
+            try:
+                actual_path = _windows_path_key(_windows_final_path(fd))
+                if os.path.commonpath((allowed_root, actual_path)) != allowed_root:
+                    raise ValueError("live opened file escapes target root")
+                return fd
+            except Exception:
+                os.close(fd)
+                raise
         if os.open in getattr(os, "supports_dir_fd", ()):
             fd = os.open(os.fspath(root), os.O_RDONLY | directory | nofollow)
             try:
@@ -103,7 +161,7 @@ def list_entries(root, path="/", limit=100, cursor=None):
     try:
         with os.scandir(directory) as scan:
             for scanned, entry in enumerate(
-                entry for entry in sorted(scan, key=lambda item: item.name) if entry.name > after and not entry.is_symlink()
+                entry for entry in sorted(scan, key=lambda item: item.name) if entry.name > after and not is_live_link(os.path.join(directory, entry.name))
             ):
                 if scanned >= limit + 1:
                     break
@@ -130,7 +188,7 @@ def list_entries(root, path="/", limit=100, cursor=None):
 
 def watch_snapshot(root, max_entries=MAX_WATCH_ENTRIES):
     raw_root = os.fspath(root)
-    if os.path.islink(raw_root) or os.path.realpath(raw_root) != raw_root:
+    if is_live_link(raw_root) or os.path.realpath(raw_root) != raw_root:
         raise ValueError("live watcher root is unavailable")
     _directory_stat(raw_root)
     entries, pending, scanned = {}, [("", raw_root)], 0
@@ -142,7 +200,7 @@ def watch_snapshot(root, max_entries=MAX_WATCH_ENTRIES):
                     if scanned >= max_entries:
                         return entries, False
                     scanned += 1
-                    if entry.is_symlink():
+                    if is_live_link(entry.path):
                         continue
                     try:
                         is_dir = entry.is_dir(follow_symlinks=False)
@@ -152,7 +210,7 @@ def watch_snapshot(root, max_entries=MAX_WATCH_ENTRIES):
                         continue
                     if not is_dir and not is_file:
                         continue
-                    path = "/" + "/".join(part for part in (relative, entry.name) if part)
+                    path = "/" + "/".join(part for part in (relative.strip("/"), entry.name) if part)
                     entries[path] = (
                         "dir" if is_dir else "file",
                         None if is_dir else stat.st_size,

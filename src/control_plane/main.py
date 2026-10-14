@@ -1533,9 +1533,18 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
         target = self._control_plane_service().target_repository.get(target_id)
         if target is None: raise LiveSessionError("live access unavailable")
         runtime_volumes = target.runtime_volumes or {}
+        selected = target.volume_targets or []
+        if target.runtime_type == "native":
+            paths = target.filesystem_paths
+            if (not isinstance(paths, list) or not 0 < len(paths) <= LIVE_MOUNT_SOURCES_LIMIT
+                    or any(not isinstance(source, str) or not source or len(source) > 4096 or "\x00" in source for source in paths)
+                    or len(set(paths)) != len(paths)):
+                raise LiveOperationalError(reason="source_unavailable")
+            # Only derive virtual labels here; host filesystem access belongs to the worker.
+            runtime_volumes = {source: {"bind": "/" + source.replace("\\", "/").strip("/")} for source in paths}
+            selected = []
         if not isinstance(runtime_volumes, dict) or not runtime_volumes:
             raise LiveOperationalError(reason="source_unavailable")
-        selected = target.volume_targets or []
         if not isinstance(selected, list):
             raise LiveOperationalError(reason="source_unavailable")
         if (

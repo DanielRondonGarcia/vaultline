@@ -1455,9 +1455,141 @@ docker compose up -d
     let targetsTableState = { sortKey: "name", sortDir: "asc", page: 1, pageSize: 25, filters: { name: "", worker: "", compose: "", mode: "", retention: "", cron: "" } };
     let liveBrowserState = null;
 
+    const TARGET_RUNTIME_DEFINITIONS = [
+      { value: "docker", label: "Docker / Compose" },
+      { value: "native", label: "Filesystem (worker nativo)" },
+    ];
+    const EDIT_TARGET_RUNTIME_DEFINITIONS = [
+      ...TARGET_RUNTIME_DEFINITIONS,
+      { value: "kubernetes", label: "Kubernetes" },
+    ];
+    const RUNTIME_CAPABILITY_LABEL_KEYS = [
+      "runtime_type",
+      "runtime_kind",
+      "runtime",
+      "capability",
+      "capabilities",
+      "supported_runtimes",
+    ];
+
+    function normalizeRuntimeCapability(value) {
+      const normalized = String(value).trim().toLowerCase();
+      return normalized === "k8s" ? "kubernetes" : normalized;
+    }
+
+    function runtimeCapabilityValues(value) {
+      if (Array.isArray(value)) {
+        return value.map(item => {
+          const serialized = typeof item === "string" ? item : JSON.stringify(item);
+          return normalizeRuntimeCapability(serialized == null ? String(item) : serialized);
+        });
+      }
+      if (value && typeof value === "object") {
+        return Object.entries(value)
+          .filter(([, enabled]) => {
+            if (!enabled) return false;
+            if (Array.isArray(enabled)) return enabled.length > 0;
+            if (typeof enabled === "object") return Object.keys(enabled).length > 0;
+            return true;
+          })
+          .map(([key]) => normalizeRuntimeCapability(key));
+      }
+      if (typeof value !== "string") return [];
+      const raw = value.trim();
+      if (!raw) return [];
+      try {
+        const decoded = JSON.parse(raw);
+        if (decoded !== raw) return runtimeCapabilityValues(decoded);
+      } catch (_) {}
+      return raw.split(/[\s,]+/)
+        .map(item => item.trim().replace(/^[\[\]'\"]+|[\[\]'\"]+$/g, ""))
+        .filter(Boolean)
+        .map(normalizeRuntimeCapability);
+    }
+
+    function workerRuntimeCapabilities(worker) {
+      const labels = worker && worker.labels && typeof worker.labels === "object" && !Array.isArray(worker.labels)
+        ? worker.labels
+        : {};
+      const advertised = new Set();
+      let hasRuntimeLabels = false;
+      RUNTIME_CAPABILITY_LABEL_KEYS.forEach(key => {
+        if (Object.prototype.hasOwnProperty.call(labels, key)) hasRuntimeLabels = true;
+        runtimeCapabilityValues(labels[key]).forEach(value => advertised.add(value));
+      });
+      if (Object.prototype.hasOwnProperty.call(labels, "kubernetes")) {
+        hasRuntimeLabels = true;
+        if (["1", "true", "yes", "on"].includes(String(labels.kubernetes).trim().toLowerCase())) advertised.add("kubernetes");
+      }
+      return { advertised, hasRuntimeLabels };
+    }
+
+    function supportedTargetRuntimeTypes(worker, includeKubernetes = false) {
+      const definitions = includeKubernetes ? EDIT_TARGET_RUNTIME_DEFINITIONS : TARGET_RUNTIME_DEFINITIONS;
+      if (!worker) return definitions.map(definition => definition.value);
+      const capabilities = workerRuntimeCapabilities(worker);
+      if (!capabilities.hasRuntimeLabels) return ["docker"];
+      return definitions.filter(definition => capabilities.advertised.has(definition.value)).map(definition => definition.value);
+    }
+
+    function targetRuntimeDefinition(runtimeType, includeKubernetes = false) {
+      const definitions = includeKubernetes ? EDIT_TARGET_RUNTIME_DEFINITIONS : TARGET_RUNTIME_DEFINITIONS;
+      return definitions.find(definition => definition.value === runtimeType) || null;
+    }
+
+    function targetRuntimeDefault(worker, includeKubernetes = false) {
+      const supported = supportedTargetRuntimeTypes(worker, includeKubernetes);
+      return supported.includes("docker") ? "docker" : (supported[0] || "");
+    }
+
+    function targetRuntimeOptions(worker, selectedRuntime, includeKubernetes = false, preserveUnsupported = false) {
+      const supported = supportedTargetRuntimeTypes(worker, includeKubernetes);
+      const selected = String(selectedRuntime || "").toLowerCase();
+      const selectedDefinition = targetRuntimeDefinition(selected, includeKubernetes);
+      const preserve = preserveUnsupported && selectedDefinition && !supported.includes(selected);
+      const optionTypes = preserve ? [selected, ...supported] : supported;
+      return optionTypes.map(runtimeType => {
+        const definition = targetRuntimeDefinition(runtimeType, includeKubernetes);
+        const unsupported = !supported.includes(runtimeType);
+        return `<option value="${runtimeType}"${runtimeType === selected ? " selected" : ""}${unsupported ? " disabled" : ""}>${definition.label}</option>`;
+      }).join("");
+    }
+
+    function applyTargetRuntimeOptions(select, worker, includeKubernetes = false, preserveUnsupported = false) {
+      const current = String(select.value || "").toLowerCase();
+      const supported = supportedTargetRuntimeTypes(worker, includeKubernetes);
+      const currentDefinition = targetRuntimeDefinition(current, includeKubernetes);
+      const keepCurrent = currentDefinition && (supported.includes(current) || preserveUnsupported);
+      const nextRuntime = keepCurrent ? current : targetRuntimeDefault(worker, includeKubernetes);
+      if (supported.length || (preserveUnsupported && currentDefinition)) {
+        select.innerHTML = targetRuntimeOptions(worker, nextRuntime, includeKubernetes, preserveUnsupported);
+      } else {
+        select.innerHTML = '<option value="">-- El worker no ofrece un runtime compatible --</option>';
+      }
+      select.value = nextRuntime;
+      select.disabled = !supported.length;
+      return {
+        runtimeType: select.value || "",
+        supported,
+        compatible: supported.includes(select.value),
+      };
+    }
+
+    function targetRuntimeCompatibilityMessage(worker, runtimeType, supported) {
+      if (!worker || supported.includes(runtimeType)) return "";
+      const runtime = targetRuntimeDefinition(runtimeType, true);
+      const supportedLabels = supported
+        .map(value => targetRuntimeDefinition(value, true)?.label)
+        .filter(Boolean)
+        .join(", ");
+      return `El worker seleccionado no anuncia ${runtime ? runtime.label : runtimeType}. El runtime guardado no se convertirá automáticamente; selecciona una opción compatible${supportedLabels ? ` (${supportedLabels})` : ""} antes de guardar.`;
+    }
+
     function renderTargets(content) {
       const canManageTargets = state.currentRole === "admin";
       const eligibleWorkers = (state.workers || []).filter(w => w.status === "online");
+      const initialCreateWorker = eligibleWorkers[0] || null;
+      const initialCreateRuntime = targetRuntimeDefault(initialCreateWorker);
       const workerOptions = eligibleWorkers.length
         ? eligibleWorkers.map(w => `<option value="${escapeHtml(w.id)}">${escapeHtml(w.name)}</option>`).join("")
         : '<option value="">-- No hay workers online --</option>';
@@ -1472,7 +1604,7 @@ docker compose up -d
              <div class="form-grid">
                <div class="field"><label for="targetName">Nombre</label><input id="targetName" required /></div>
                 <div class="field"><label for="targetWorkerId">Worker</label><select id="targetWorkerId" ${eligibleWorkers.length ? "" : "disabled"}>${workerOptions}</select></div>
-                <div class="field"><label for="targetRuntimeType">Runtime</label><select id="targetRuntimeType"><option value="docker">Docker / Compose</option><option value="native">Filesystem (worker nativo)</option></select></div>
+                 <div class="field"><label for="targetRuntimeType">Runtime</label><select id="targetRuntimeType">${targetRuntimeOptions(initialCreateWorker, initialCreateRuntime)}</select><div id="targetRuntimeWarning" class="form-error" role="alert" style="display:none;"></div></div>
                 <div class="field" data-runtime-section="docker"><label for="targetComposeProject">Compose project</label><select id="targetComposeProject" ${eligibleWorkers.length ? "" : "disabled"}><option value="">-- Seleccionar worker --</option></select></div>
                 <div class="field" data-target-docker-only="mode"><label for="targetBackupMode">Modo</label><select id="targetBackupMode"><option value="hot">hot</option><option value="cold">cold</option></select></div>
                 <div class="field"><label for="targetBackupStrategy">Estrategia</label><select id="targetBackupStrategy"><option value="restic">restic</option><option value="tar">tar</option></select></div>
@@ -4875,6 +5007,7 @@ docker compose up -d
       const currentWorkerStatus = target.worker_status || (currentWorker && currentWorker.status) || "missing";
       const currentWorkerEligible = currentWorkerStatus === "online";
       const currentWorkerStatusLabel = { disabled: "Revocado", missing: "Eliminado", offline: "Offline", pending: "Pendiente" }[currentWorkerStatus] || currentWorkerStatus;
+      const initialEditRuntime = target.runtime_type || "docker";
       const currentWorkerOption = currentWorkerEligible || !currentWorkerId
         ? ""
         : `<option value="${escapeHtml(currentWorkerId)}" selected disabled>${escapeHtml(currentWorker ? currentWorker.name : currentWorkerId)} — no elegible (${escapeHtml(currentWorkerStatusLabel)})</option>`;
@@ -4901,7 +5034,7 @@ docker compose up -d
                    <div class="form-grid">
                 <div class="field"><label for="etName">Nombre</label><input id="etName" value="${escapeHtml(target.name)}" required /></div>
                 <div class="field"><label for="etWorkerId">Worker</label><select id="etWorkerId" ${eligibleWorkers.length || currentWorkerEligible ? "" : "disabled"}>${workerOptions || '<option value="">-- No hay workers online --</option>'}</select>${workerWarning}<div class="helper">Cambiar el worker solo reasigna el target; no copia volumenes ni inventario entre workers.</div></div>
-                 <div class="field"><label for="etRuntimeType">Runtime</label><select id="etRuntimeType"><option value="docker" ${(!target.runtime_type || target.runtime_type === "docker") ? "selected" : ""}>Docker / Compose</option><option value="kubernetes" ${target.runtime_type === "kubernetes" ? "selected" : ""}>Kubernetes</option><option value="native" ${target.runtime_type === "native" ? "selected" : ""}>Filesystem (worker nativo)</option></select></div>
+                  <div class="field"><label for="etRuntimeType">Runtime</label><select id="etRuntimeType">${targetRuntimeOptions(currentWorker, initialEditRuntime, true, true)}</select><div id="etRuntimeWarning" class="form-error" role="alert" style="display:none;"></div></div>
                  <div class="field" data-target-docker-only="mode"><label for="etBackupMode">Modo</label><select id="etBackupMode"><option value="hot" ${target.backup_mode === "hot" ? "selected" : ""}>hot</option><option value="cold" ${target.backup_mode === "cold" ? "selected" : ""}>cold</option></select></div>
                  <div class="field"><label for="etBackupStrategy">Estrategia</label><select id="etBackupStrategy"><option value="restic" ${target.backup_strategy === "restic" ? "selected" : ""}>restic</option><option value="tar" ${target.backup_strategy === "tar" ? "selected" : ""}>tar</option></select></div>
                  <div class="field"><label for="etStorageProfileId">Storage profile</label><select id="etStorageProfileId"><option value="">-- Ninguno --</option>${storageOptions}</select></div>
@@ -4949,29 +5082,37 @@ docker compose up -d
       document.getElementById("modalClose").addEventListener("click", closeTargetModal);
       document.getElementById("etCancel").addEventListener("click", closeTargetModal);
       overlay.addEventListener("click", (e) => { if (e.target === overlay) closeTargetModal(); });
-      const editWorkerSelect = document.getElementById("etWorkerId");
-      const editRuntimeSelect = document.getElementById("etRuntimeType");
-      const editSubmit = document.getElementById("etSubmit");
-      const editError = document.getElementById("etError");
+       const editWorkerSelect = document.getElementById("etWorkerId");
+       const editRuntimeSelect = document.getElementById("etRuntimeType");
+       const editSubmit = document.getElementById("etSubmit");
+       const editError = document.getElementById("etError");
+       const editRuntimeWarning = document.getElementById("etRuntimeWarning");
        let editEstimateUpdate = () => {};
        const editFilesystemPaths = bindFilesystemPathEditor("et", target.filesystem_paths || [], () => editEstimateUpdate());
        editEstimateUpdate = bindFilesystemSizeEstimate("et", editFilesystemPaths, editWorkerSelect);
       const editVolumeState = { stacks: {}, expanded: {} };
       let editVolumeSelectionReady = false;
-      let editVolumeRequestId = 0;
-      const editVolumeStatus = document.getElementById("editTargetVolumeStatus");
-      const editVolumeList = document.getElementById("editTargetVolumeList");
-      const setEditVolumeStatus = (message, warning = false) => {
-        if (!editVolumeStatus) return;
+       let editVolumeRequestId = 0;
+       const editVolumeStatus = document.getElementById("editTargetVolumeStatus");
+       const editVolumeList = document.getElementById("editTargetVolumeList");
+       const setEditVolumeStatus = (message, warning = false) => {
+         if (!editVolumeStatus) return;
         editVolumeStatus.textContent = message;
         editVolumeStatus.className = warning ? "helper volume-inline-warning-text" : "helper";
-      };
-      const loadEditVolumeSelection = async () => {
-        if (editRuntimeSelect && editRuntimeSelect.value === "native") return;
-        const requestId = ++editVolumeRequestId;
-        editVolumeSelectionReady = false;
-        const workerId = editWorkerSelect && editWorkerSelect.value;
-        const composeProject = target.compose_project;
+       };
+       const loadEditVolumeSelection = async () => {
+         const requestId = ++editVolumeRequestId;
+         const workerId = editWorkerSelect && editWorkerSelect.value;
+         const runtimeType = editRuntimeSelect && editRuntimeSelect.value;
+         editVolumeSelectionReady = false;
+         if (runtimeType === "native") {
+           editVolumeState.stacks = {};
+           editVolumeState.expanded = {};
+           if (editVolumeList) editVolumeList.innerHTML = '<div class="helper">La selección Docker está oculta para targets nativos.</div>';
+           setEditVolumeStatus("El runtime nativo no usa proyectos ni volúmenes Docker.");
+           return;
+         }
+         const composeProject = target.compose_project;
         editVolumeState.stacks = {};
         editVolumeState.expanded = {};
         if (editVolumeList) editVolumeList.innerHTML = '<div class="helper">Cargando volúmenes disponibles…</div>';
@@ -4983,9 +5124,14 @@ docker compose up -d
           setEditVolumeStatus("Este target no tiene un Compose project; no hay volúmenes seleccionables desde el inventario.", true);
           if (editVolumeList) editVolumeList.innerHTML = '<div class="helper">No hay un Compose project configurado para este target.</div>';
           return;
-        }
-        const snapshot = await fetchWorkerInventory(workerId);
-        if (requestId !== editVolumeRequestId || !document.getElementById("editTargetVolumeList")) return;
+         }
+         const snapshot = await fetchWorkerInventory(workerId);
+         if (
+           requestId !== editVolumeRequestId
+           || (editWorkerSelect && editWorkerSelect.value !== workerId)
+           || (editRuntimeSelect && editRuntimeSelect.value !== runtimeType)
+           || !document.getElementById("editTargetVolumeList")
+         ) return;
         if (!snapshot || !snapshot.inventory) {
           setEditVolumeStatus("No se pudo cargar el inventario del worker. La selección actual se conservará si guardas otros cambios.", true);
           if (editVolumeList) editVolumeList.innerHTML = '<div class="helper">Inventario no disponible.</div>';
@@ -5020,44 +5166,62 @@ docker compose up -d
             : "El inventario no ofrece fuentes estables para editar esta selección; se conservarán los volúmenes actuales.",
           !editVolumeSelectionReady,
         );
-      };
-      const updateEditWorkerEligibility = () => {
-        const selectedWorker = (state.workers || []).find(w => String(w.id) === String(editWorkerSelect && editWorkerSelect.value));
-        const eligible = Boolean(selectedWorker && selectedWorker.status === "online");
-        if (editSubmit) editSubmit.disabled = !eligible;
-        if (editError && !eligible) {
-          editError.textContent = "Selecciona un worker online para guardar este target.";
-          editError.style.display = "block";
+       };
+       const updateEditWorkerEligibility = () => {
+         const selectedWorker = (state.workers || []).find(w => String(w.id) === String(editWorkerSelect && editWorkerSelect.value));
+         const eligible = Boolean(selectedWorker && selectedWorker.status === "online");
+         const runtimeSupported = !editRuntimeSelect || supportedTargetRuntimeTypes(selectedWorker, true).includes(editRuntimeSelect.value);
+         if (editSubmit) editSubmit.disabled = !eligible || !runtimeSupported;
+         if (editError && !eligible) {
+           editError.textContent = "Selecciona un worker online para guardar este target.";
+           editError.style.display = "block";
         } else if (editError && editError.textContent === "Selecciona un worker online para guardar este target.") {
           editError.textContent = "";
-          editError.style.display = "none";
-        }
-      };
-      if (editWorkerSelect) editWorkerSelect.addEventListener("change", () => {
-        updateEditWorkerEligibility();
-        void loadEditVolumeSelection();
-      });
-      if (editRuntimeSelect) editRuntimeSelect.addEventListener("change", () => {
-        setRuntimeSections(editRuntimeSelect.value, overlay);
-        updateTargetBackupModeForRuntime(editRuntimeSelect.value, "etBackupMode");
-        void loadEditVolumeSelection();
-      });
-      updateEditWorkerEligibility();
-      setRuntimeSections(editRuntimeSelect ? editRuntimeSelect.value : (target.runtime_type || "docker"), overlay);
-      updateTargetBackupModeForRuntime(editRuntimeSelect ? editRuntimeSelect.value : (target.runtime_type || "docker"), "etBackupMode");
-      void loadEditVolumeSelection();
-      document.getElementById("editTargetForm").addEventListener("submit", async (e) => {
-        e.preventDefault();
-        try {
-          await withBtnLoading(e.submitter, async () => {
-            const targetUpdate = {
-              name: document.getElementById("etName").value.trim(),
-              worker_id: document.getElementById("etWorkerId").value,
-              runtime_type: document.getElementById("etRuntimeType").value,
-              filesystem_paths: document.getElementById("etRuntimeType").value === "native" ? editFilesystemPaths.getPaths() : [],
-              namespace: target.runtime_type === "kubernetes" ? target.namespace : undefined,
-              pvc_names: target.runtime_type === "kubernetes" ? (target.pvc_names || []) : undefined,
-              backup_mode: document.getElementById("etRuntimeType").value === "native" ? "hot" : document.getElementById("etBackupMode").value,
+           editError.style.display = "none";
+         }
+       };
+       const updateEditRuntimeOptions = () => {
+         const selectedWorker = (state.workers || []).find(w => String(w.id) === String(editWorkerSelect && editWorkerSelect.value));
+         const applied = applyTargetRuntimeOptions(editRuntimeSelect, selectedWorker, true, true);
+         const warning = targetRuntimeCompatibilityMessage(selectedWorker, applied.runtimeType, applied.supported);
+         if (editRuntimeWarning) {
+           editRuntimeWarning.textContent = warning;
+           editRuntimeWarning.style.display = warning ? "block" : "none";
+         }
+         updateEditWorkerEligibility();
+         setRuntimeSections(applied.runtimeType, overlay);
+         updateTargetBackupModeForRuntime(applied.runtimeType, "etBackupMode");
+       };
+       if (editWorkerSelect) editWorkerSelect.addEventListener("change", () => {
+         updateEditRuntimeOptions();
+         void loadEditVolumeSelection();
+       });
+       if (editRuntimeSelect) editRuntimeSelect.addEventListener("change", () => {
+         setRuntimeSections(editRuntimeSelect.value, overlay);
+         updateTargetBackupModeForRuntime(editRuntimeSelect.value, "etBackupMode");
+         updateEditWorkerEligibility();
+         void loadEditVolumeSelection();
+       });
+       updateEditRuntimeOptions();
+       void loadEditVolumeSelection();
+       document.getElementById("editTargetForm").addEventListener("submit", async (e) => {
+         e.preventDefault();
+         const selectedWorker = (state.workers || []).find(w => String(w.id) === String(editWorkerSelect && editWorkerSelect.value));
+         if (!supportedTargetRuntimeTypes(selectedWorker, true).includes(editRuntimeSelect.value)) {
+           updateEditRuntimeOptions();
+           return;
+         }
+         try {
+           await withBtnLoading(e.submitter, async () => {
+             const editRuntimeType = document.getElementById("etRuntimeType").value;
+             const targetUpdate = {
+               name: document.getElementById("etName").value.trim(),
+               worker_id: document.getElementById("etWorkerId").value,
+               runtime_type: editRuntimeType,
+               filesystem_paths: editRuntimeType === "native" ? editFilesystemPaths.getPaths() : [],
+               namespace: editRuntimeType === "kubernetes" ? target.namespace : null,
+               pvc_names: editRuntimeType === "kubernetes" ? (target.pvc_names || []) : [],
+               backup_mode: editRuntimeType === "native" ? "hot" : document.getElementById("etBackupMode").value,
               backup_strategy: document.getElementById("etBackupStrategy").value,
                runtime_command: emptyToNull(document.getElementById("etRuntimeCommand").value),
                runtime_environment: parseJsonField("etRuntimeEnvironment", "runtime environment"),
@@ -5974,21 +6138,42 @@ docker compose up -d
       });
       const workerSelect = document.getElementById("targetWorkerId");
       const runtimeSelect = document.getElementById("targetRuntimeType");
-      const projectSelect = document.getElementById("targetComposeProject");
-      const summary = document.getElementById("targetProjectSummary");
-      const ctCronInput = document.getElementById("targetCronExpression");
-      if (ctCronInput) {
-        ctCronInput.addEventListener("input", () => updateCronPreview("targetCronExpression", "targetCronPreview", null, true));
-        updateCronPreview("targetCronExpression", "targetCronPreview", null, true);
-      }
-      async function refreshProjects() {
-        if (runtimeSelect && runtimeSelect.value === "native") return;
-        const workerId = workerSelect.value;
-        projectSelect.innerHTML = `<option value="">-- Seleccionar compose project --</option>`;
-        renderVolumeCheckboxes(null);
-        if (!workerId) { summary.textContent = "Selecciona un worker para ver sus compose projects y volumenes detectados."; return; }
-        const snapshot = await fetchWorkerInventory(workerId);
-        if (!snapshot || !snapshot.inventory) { summary.textContent = "Sin inventario reportado por el worker todavia."; return; }
+       const projectSelect = document.getElementById("targetComposeProject");
+       const summary = document.getElementById("targetProjectSummary");
+       const ctCronInput = document.getElementById("targetCronExpression");
+       let projectRefreshGeneration = 0;
+       if (ctCronInput) {
+         ctCronInput.addEventListener("input", () => updateCronPreview("targetCronExpression", "targetCronPreview", null, true));
+         updateCronPreview("targetCronExpression", "targetCronPreview", null, true);
+       }
+       function clearDockerSelection() {
+         projectRefreshGeneration += 1;
+         projectSelect.innerHTML = '<option value="">-- Seleccionar compose project --</option>';
+         projectSelect.value = "";
+         volumeSelectionState = { stacks: {}, expanded: {} };
+         renderVolumeCheckboxes(null);
+         summary.textContent = "La selección Docker está oculta para targets nativos.";
+       }
+       async function refreshProjects() {
+         if (runtimeSelect && runtimeSelect.value === "native") {
+           clearDockerSelection();
+           return;
+         }
+          const request = {
+            generation: ++projectRefreshGeneration,
+            workerId: workerSelect.value,
+            runtimeType: runtimeSelect ? runtimeSelect.value : "docker",
+          };
+          projectSelect.innerHTML = `<option value="">-- Seleccionar compose project --</option>`;
+          renderVolumeCheckboxes(null);
+         if (!request.workerId) { summary.textContent = "Selecciona un worker para ver sus compose projects y volumenes detectados."; return; }
+         const snapshot = await fetchWorkerInventory(request.workerId);
+         if (
+           request.generation !== projectRefreshGeneration
+           || workerSelect.value !== request.workerId
+           || (runtimeSelect && runtimeSelect.value !== request.runtimeType)
+         ) return;
+         if (!snapshot || !snapshot.inventory) { summary.textContent = "Sin inventario reportado por el worker todavia."; return; }
         if (!snapshot.inventory.docker_available) { summary.textContent = "El worker reporta que no tiene acceso al daemon de Docker."; return; }
         const projects = snapshot.inventory.compose_project_details || [];
         if (!projects.length) { summary.textContent = "Docker disponible, pero no se detectaron compose projects en este worker."; return; }
@@ -6000,27 +6185,39 @@ docker compose up -d
       function renderProjectSummary(project) {
        if (!project) { summary.textContent = "Selecciona un compose project."; return; }
        const vols = getProjectVolumeCandidates(project).map(candidate => candidate.name || candidate.source || candidate.bind).join(", ") || "sin volumenes";
-       const containers = (project.containers || []).map(c => escapeHtml(c.name)).join(", ") || "sin contenedores";
-       summary.innerHTML = `Proyecto <strong>${escapeHtml(project.name)}</strong> | Volumenes: ${escapeHtml(vols)} | Contenedores: ${containers}`;
-      }
-      if (runtimeSelect) {
-        runtimeSelect.addEventListener("change", () => {
-          setRuntimeSections(runtimeSelect.value, form);
-          updateTargetBackupModeForRuntime(runtimeSelect.value, "targetBackupMode");
-          if (runtimeSelect.value === "docker") void refreshProjects();
-        });
-        setRuntimeSections(runtimeSelect.value, form);
-        updateTargetBackupModeForRuntime(runtimeSelect.value, "targetBackupMode");
-      }
-      workerSelect.addEventListener("change", refreshProjects);
+        const containers = (project.containers || []).map(c => escapeHtml(c.name)).join(", ") || "sin contenedores";
+        summary.innerHTML = `Proyecto <strong>${escapeHtml(project.name)}</strong> | Volumenes: ${escapeHtml(vols)} | Contenedores: ${containers}`;
+       }
+       function updateCreateRuntimeOptions() {
+         const selectedWorker = (state.workers || []).find(w => String(w.id) === String(workerSelect && workerSelect.value));
+         const applied = applyTargetRuntimeOptions(runtimeSelect, selectedWorker, false, false);
+         const warning = selectedWorker && !applied.supported.length
+           ? "El worker seleccionado no anuncia Docker ni filesystem; no se puede crear un target con este worker."
+           : "";
+         const runtimeWarning = document.getElementById("targetRuntimeWarning");
+         if (runtimeWarning) {
+           runtimeWarning.textContent = warning;
+           runtimeWarning.style.display = warning ? "block" : "none";
+         }
+         const submitBtn = document.getElementById("createTargetSubmitBtn");
+         if (submitBtn) submitBtn.disabled = !selectedWorker || !applied.compatible;
+         setRuntimeSections(applied.runtimeType, form);
+         updateTargetBackupModeForRuntime(applied.runtimeType, "targetBackupMode");
+         if (applied.runtimeType === "native") clearDockerSelection();
+         else void refreshProjects();
+       }
+       if (runtimeSelect) {
+         runtimeSelect.addEventListener("change", updateCreateRuntimeOptions);
+       }
+       workerSelect.addEventListener("change", updateCreateRuntimeOptions);
       projectSelect.addEventListener("change", () => {
         const projects = getWorkerComposeProjects(workerSelect.value);
         const selected = projects.find(p => p.name === projectSelect.value);
         renderProjectSummary(selected);
         renderVolumeCheckboxes(selected);
       });
-      refreshProjects();
-    }
+       updateCreateRuntimeOptions();
+     }
 
     let jobsTableState = { sortKey: "started_at", sortDir: "desc", page: 1, pageSize: 25, filters: { id: "", target: "", command: "", status: "", origin: "", started: "", finished: "" } };
     let jobsPollTimer = null;

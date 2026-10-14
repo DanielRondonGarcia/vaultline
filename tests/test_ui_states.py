@@ -150,6 +150,203 @@ class SnapshotExplorerUiStateTests(unittest.TestCase):
         self.assertIn("no elegible", edit_source)
         self.assertIn("Error guardando target", edit_source)
 
+    def test_target_runtime_options_follow_worker_capabilities(self):
+        helpers = re.search(
+            r"(    const TARGET_RUNTIME_DEFINITIONS = .*?)\n\n    function renderTargets",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(helpers)
+        for marker in (
+            "runtimeCapabilityValues",
+            "workerRuntimeCapabilities",
+            "supportedTargetRuntimeTypes",
+            "applyTargetRuntimeOptions",
+            "preserveUnsupported",
+            "clearDockerSelection",
+            "updateCreateRuntimeOptions",
+        ):
+            self.assertIn(marker, helpers.group(1) + self.source)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = helpers.group(1) + r'''
+const select = () => ({ value: "docker", innerHTML: "", disabled: false });
+const native = select();
+const docker = select();
+const legacy = select();
+        const multiple = select();
+        const objectNative = select();
+        const flatString = select();
+        const nestedList = select();
+        const nestedObject = select();
+        const nativeResult = applyTargetRuntimeOptions(native, { labels: { runtime_type: "native" } });
+        const dockerResult = applyTargetRuntimeOptions(docker, { labels: { runtime_kind: "docker" } });
+        const legacyResult = applyTargetRuntimeOptions(legacy, { labels: { zone: "legacy" } });
+        const multipleResult = applyTargetRuntimeOptions(multiple, { labels: { capabilities: '["docker","native"]' } });
+        const objectNativeResult = applyTargetRuntimeOptions(objectNative, { labels: { capabilities: '{"NATIVE": true}' } });
+        const flatStringResult = applyTargetRuntimeOptions(flatString, { labels: { capabilities: "docker native" } });
+        const nestedListResult = applyTargetRuntimeOptions(nestedList, { labels: { capabilities: "[[\"native\"]]" } });
+        const nestedObjectResult = applyTargetRuntimeOptions(nestedObject, { labels: { capabilities: "[{\"NATIVE\": true}]" } });
+        const kubernetesCapabilities = workerRuntimeCapabilities({ labels: { capabilities: '{"k8s": true}' } });
+        process.stdout.write(JSON.stringify({
+  native: [nativeResult.runtimeType, native.innerHTML, native.disabled],
+  docker: [dockerResult.runtimeType, docker.innerHTML, docker.disabled],
+  legacy: [legacyResult.runtimeType, legacy.innerHTML, legacy.disabled],
+          multiple: [multipleResult.runtimeType, multiple.innerHTML, multiple.disabled],
+          objectNative: [objectNativeResult.runtimeType, objectNative.innerHTML, objectNative.disabled],
+          flatString: [flatStringResult.runtimeType, flatString.innerHTML, flatString.disabled],
+          nestedList: [nestedListResult.runtimeType, nestedList.innerHTML, nestedList.disabled, nestedListResult.supported],
+          nestedObject: [nestedObjectResult.runtimeType, nestedObject.innerHTML, nestedObject.disabled, nestedObjectResult.supported],
+          kubernetes: Array.from(kubernetesCapabilities.advertised),
+        }));
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["native"][0], "native")
+        self.assertNotIn("Docker / Compose", output["native"][1])
+        self.assertIn("Filesystem (worker nativo)", output["native"][1])
+        self.assertEqual(output["docker"][0], "docker")
+        self.assertNotIn("Filesystem (worker nativo)", output["docker"][1])
+        self.assertEqual(output["legacy"][0], "docker")
+        self.assertNotIn("Filesystem (worker nativo)", output["legacy"][1])
+        self.assertEqual(output["multiple"][0], "docker")
+        self.assertIn("Docker / Compose", output["multiple"][1])
+        self.assertIn("Filesystem (worker nativo)", output["multiple"][1])
+        self.assertEqual(output["objectNative"][0], "native")
+        self.assertNotIn("Docker / Compose", output["objectNative"][1])
+        self.assertIn("Filesystem (worker nativo)", output["objectNative"][1])
+        self.assertEqual(output["flatString"][0], "docker")
+        self.assertIn("Docker / Compose", output["flatString"][1])
+        self.assertIn("Filesystem (worker nativo)", output["flatString"][1])
+        for nested in ("nestedList", "nestedObject"):
+            self.assertEqual(output[nested][0], "")
+            self.assertTrue(output[nested][2])
+            self.assertNotIn("Filesystem (worker nativo)", output[nested][1])
+            self.assertEqual(output[nested][3], [])
+        self.assertEqual(output["kubernetes"], ["kubernetes"])
+
+    def test_stale_target_inventory_cannot_restore_docker_state_after_native_switch(self):
+        clear = re.search(
+            r"(function clearDockerSelection\(\) \{.*?\n\s+\})(?=\n\s+async function refreshProjects)",
+            self.source,
+            re.S,
+        )
+        refresh = re.search(
+            r"(async function refreshProjects\(\) \{.*?\n\s+\})(?=\n\s+function renderProjectSummary)",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(clear)
+        self.assertIsNotNone(refresh)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = f'''
+let projectRefreshGeneration = 0;
+let volumeSelectionState = {{ stacks: {{}}, expanded: {{}} }};
+const runtimeSelect = {{ value: "docker" }};
+const workerSelect = {{ value: "worker-docker" }};
+const projectSelect = {{ innerHTML: "", value: "" }};
+const summary = {{ textContent: "", innerHTML: "" }};
+const volumeRenders = [];
+const renderVolumeCheckboxes = project => volumeRenders.push(project);
+const renderProjectSummary = project => {{ summary.textContent = project.name; }};
+const escapeHtml = value => value;
+let resolveInventory;
+const fetchWorkerInventory = () => new Promise(resolve => {{ resolveInventory = resolve; }});
+{clear.group(1)}
+{refresh.group(1)}
+(async () => {{
+  const staleRequest = refreshProjects();
+  runtimeSelect.value = "native";
+  clearDockerSelection();
+  resolveInventory({{ inventory: {{ docker_available: true, compose_project_details: [{{ name: "stale-docker" }}] }} }});
+  await staleRequest;
+  process.stdout.write(JSON.stringify({{
+    project: projectSelect.innerHTML,
+    summary: summary.textContent,
+    volumes: volumeRenders.map(project => project ? project.name : null),
+  }}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["project"], '<option value="">-- Seleccionar compose project --</option>')
+        self.assertIn("oculta", output["summary"])
+        self.assertIn("nativos.", output["summary"])
+        self.assertNotIn("stale-docker", output["summary"])
+        self.assertEqual(output["volumes"], [None, None])
+
+    def test_stale_edit_inventory_cannot_restore_docker_state_after_native_switch(self):
+        edit_loader = re.search(
+            r"(const loadEditVolumeSelection = async \(\) => \{.*?\n\s+\};)\n\s+const updateEditWorkerEligibility",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(edit_loader)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = f'''
+let editVolumeRequestId = 0;
+let editVolumeSelectionReady = false;
+const editVolumeState = {{ stacks: {{}}, expanded: {{}} }};
+const editRuntimeSelect = {{ value: "docker" }};
+const editWorkerSelect = {{ value: "worker-old" }};
+const editVolumeStatus = {{ textContent: "", className: "" }};
+const editVolumeList = {{ innerHTML: "" }};
+const editTargetVolumeList = {{ dataset: {{}} }};
+const document = {{ getElementById: id => id === "editTargetVolumeList" ? editTargetVolumeList : null }};
+const target = {{ compose_project: "stale-docker", volume_targets: [] }};
+const renderCalls = [];
+const renderVolumeCheckboxes = project => renderCalls.push(project);
+const getTargetVolumeSelectionKeys = () => new Set();
+const getProjectVolumeCandidates = project => project.volume_candidates || [];
+const getWorkerComposeProjects = () => [{{ name: "stale-docker", volume_candidates: [{{ source: "stale-source" }}] }}];
+const setEditVolumeStatus = (message, warning = false) => {{ editVolumeStatus.textContent = message; editVolumeStatus.className = warning ? "warning" : "helper"; }};
+let resolveInventory;
+const fetchWorkerInventory = () => new Promise(resolve => {{ resolveInventory = resolve; }});
+{edit_loader.group(1)}
+(async () => {{
+  const staleRequest = loadEditVolumeSelection();
+  editWorkerSelect.value = "worker-new";
+  editRuntimeSelect.value = "native";
+  const nativeRequest = loadEditVolumeSelection();
+  resolveInventory({{ inventory: {{ docker_available: true, compose_project_details: [{{ name: "stale-docker" }}] }} }});
+  await Promise.all([staleRequest, nativeRequest]);
+  process.stdout.write(JSON.stringify({{
+    ready: editVolumeSelectionReady,
+    status: editVolumeStatus.textContent,
+    list: editVolumeList.innerHTML,
+    renderCalls: renderCalls.length,
+    requestId: editVolumeRequestId,
+  }}));
+}})().catch(error => {{ console.error(error); process.exit(1); }});
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertFalse(output["ready"])
+        self.assertIn("runtime nativo", output["status"])
+        self.assertIn("oculta", output["list"])
+        self.assertEqual(output["renderCalls"], 0)
+        self.assertEqual(output["requestId"], 2)
+
     def test_target_path_storage_is_hidden_for_native_and_preserved_on_edit(self):
         targets = re.search(r"function renderTargets\(content\) \{.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(targets)

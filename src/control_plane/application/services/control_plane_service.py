@@ -400,10 +400,9 @@ class ControlPlaneService:
 
     @classmethod
     def _worker_supports_runtime(cls, worker: WorkerRecord, runtime_type: str) -> bool:
-        if runtime_type == "docker":
-            return True
         labels = worker.labels if isinstance(worker.labels, dict) else {}
         advertised: List[str] = []
+        has_runtime_labels = False
         for key in (
             "runtime_type",
             "runtime_kind",
@@ -412,9 +411,15 @@ class ControlPlaneService:
             "capabilities",
             "supported_runtimes",
         ):
+            if key in labels:
+                has_runtime_labels = True
             advertised.extend(cls._capability_values(labels.get(key)))
-        if str(labels.get("kubernetes", "")).strip().lower() in {"1", "true", "yes", "on"}:
-            advertised.append("kubernetes")
+        if "kubernetes" in labels:
+            has_runtime_labels = True
+            if str(labels.get("kubernetes", "")).strip().lower() in {"1", "true", "yes", "on"}:
+                advertised.append("kubernetes")
+        if not has_runtime_labels:
+            return runtime_type == "docker"
         return runtime_type in advertised
 
     @staticmethod
@@ -467,6 +472,11 @@ class ControlPlaneService:
         restore_defaults: Any = None,
         filesystem_paths: Any = None,
     ) -> tuple[Optional[str], List[str]]:
+        worker = self._require_eligible_worker(worker_id)
+        if not self._worker_supports_runtime(worker, runtime_type):
+            runtime_label = "Kubernetes" if runtime_type == "kubernetes" else runtime_type
+            raise ValueError(f"worker '{worker_id}' does not advertise {runtime_label} capability")
+
         if runtime_type == "docker":
             if namespace not in (None, "") or pvc_names not in (None, []):
                 raise ValueError("namespace and pvc_names are only supported for Kubernetes targets")
@@ -481,9 +491,6 @@ class ControlPlaneService:
                 raise ValueError("native filesystem targets must not specify compose_project")
             if volume_targets:
                 raise ValueError("native filesystem targets must use filesystem_paths instead of volume_targets")
-            worker = self._require_eligible_worker(worker_id)
-            if not self._worker_supports_runtime(worker, runtime_type):
-                raise ValueError(f"worker '{worker_id}' does not advertise native capability")
             return None, []
 
         self._reject_kubernetes_credentials(runtime_environment)
@@ -496,10 +503,6 @@ class ControlPlaneService:
         if volume_targets:
             raise ValueError("Kubernetes targets must use pvc_names instead of volume_targets")
 
-        worker = self._require_eligible_worker(worker_id)
-        if not self._worker_supports_runtime(worker, runtime_type):
-            runtime_label = "Kubernetes" if runtime_type == "kubernetes" else runtime_type
-            raise ValueError(f"worker '{worker_id}' does not advertise {runtime_label} capability")
         snapshot = self.inventory_repository.get_by_worker(worker_id)
         inventory = snapshot.inventory if snapshot is not None else None
         inventory_runtime = inventory.get("runtime") if isinstance(inventory, dict) else None
@@ -3659,7 +3662,7 @@ class ControlPlaneService:
         warnings: List[str] = []
 
         runtime_type = self._normalize_runtime_type(getattr(target, "runtime_type", None))
-        if runtime_type in {"kubernetes", "native"}:
+        if runtime_type in {"docker", "kubernetes", "native"}:
             try:
                 self._validate_target_runtime(
                     worker_id=target.worker_id,
@@ -3999,6 +4002,8 @@ class ControlPlaneService:
                 "compose_project": target.compose_project,
                 "volume_targets": list(target.volume_targets or []),
                 "runtime_volumes": dict(target.runtime_volumes or {}),
+                "runtime_type": target.runtime_type,
+                "filesystem_paths": list(target.filesystem_paths or []),
                 "runtime_image": target.runtime_image,
                 "runtime_network_mode": target.runtime_network_mode,
                 "updated_at": target.updated_at.isoformat() if target.updated_at else None,

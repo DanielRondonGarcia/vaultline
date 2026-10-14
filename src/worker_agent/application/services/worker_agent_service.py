@@ -423,6 +423,8 @@ class WorkerAgentService:
     def _resolve_live_source(self, source: Any, folder: str = "") -> Any:
         if not isinstance(source, str) or not source or len(source) > 4096 or "\x00" in source: raise ValueError("live mount source is invalid")
         if not isinstance(folder, str) or (folder and not LIVE_MOUNT_FOLDER_PATTERN.fullmatch(folder)): raise ValueError("live mount folder is invalid")
+        if isinstance(self.runtime, NativeRuntimeAdapter):
+            return LiveFileSource("local", source, None, "", folder=folder)
         helper_image = getattr(self.config, "live_helper_image", "docker-volume-backup-worker-local:dev")
         if os.path.isabs(source):
             normalized_source = source.rstrip("/") or "/"

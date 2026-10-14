@@ -14,9 +14,11 @@ from src.worker_agent.live_file_helper import (
     PROTECTED_VOLUME_EXIT_CODE,
     ProtectedVolumeError,
     confined_path,
+    is_live_link,
     open_confined,
     sign_request,
     verify_request,
+    virtual_parts,
 )
 
 
@@ -67,10 +69,32 @@ class LiveFileSource:
     folder: str = ""
 
     def __post_init__(self):
-        if self.kind not in {"bind", "volume"} or not isinstance(self.source, str) or not self.source:
+        if self.kind not in {"local", "bind", "volume"} or not isinstance(self.source, str) or not self.source:
             raise ValueError("live source is invalid")
         if len(self.source) > 4096 or "\x00" in self.source:
             raise ValueError("live source is invalid")
+        if self.kind == "local":
+            drive, tail = os.path.splitdrive(self.source)
+            parts = self.source.replace("\\", "/").split("/")
+            if (not os.path.isabs(self.source) or any(part in {".", ".."} for part in parts)
+                    or any(ord(character) < 32 for character in self.source)
+                    or self.source.replace("\\", "/").startswith(("//?/", "//./"))
+                    or (os.name == "nt" and (not drive or ":" in tail))):
+                raise ValueError("live native source syntax is invalid")
+            normalized = self.source.replace("\\", "/").rstrip("/") or "/"
+            if (normalized in {"/", "/proc", "/sys", "/dev", "/var/lib/docker", "/var/lib/docker/volumes"}
+                    or normalized.startswith(("/proc/", "/sys/", "/dev/", "/var/lib/docker/"))
+                    or normalized.endswith((".sock", ".socket")) or not tail.strip("/\\")):
+                raise ValueError("live native source is unsafe")
+            if is_live_link(self.source):
+                raise ValueError("live target root cannot be a link")
+            try:
+                metadata = os.stat(self.source, follow_symlinks=False)
+            except FileNotFoundError:
+                raise ValueError("live native source is unavailable") from None
+            if not stat_module.S_ISDIR(metadata.st_mode):
+                raise ValueError("live native source must be a directory")
+            object.__setattr__(self, "source", os.path.realpath(self.source))
         if self.kind == "bind" and not os.path.isabs(self.source):
             raise ValueError("live bind source must be absolute")
         if self.kind == "bind":
@@ -83,7 +107,7 @@ class LiveFileSource:
                 raise ValueError("live bind source is unsafe")
         if self.kind == "volume" and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,254}", self.source):
             raise ValueError("live volume source is invalid")
-        if self.client is None or not isinstance(self.image, str) or not self.image or len(self.image) > 512:
+        if self.kind != "local" and (self.client is None or not isinstance(self.image, str) or not self.image or len(self.image) > 512):
             raise ValueError("live helper configuration is invalid")
         if not isinstance(self.folder, str) or (self.folder and not LIVE_MOUNT_FOLDER_PATTERN.fullmatch(self.folder)):
             raise ValueError("live mount folder is invalid")
@@ -166,7 +190,7 @@ class LiveFileRuntime:
         if self.sources is None:
             self.source = None
             raw_root = os.fspath(target_root)
-            if not os.path.isabs(raw_root) or os.path.islink(raw_root) or not os.path.isdir(raw_root):
+            if not os.path.isabs(raw_root) or is_live_link(raw_root) or not os.path.isdir(raw_root):
                 raise ValueError("live target root must be an existing server-derived directory")
             self.root = os.path.realpath(raw_root)
         else:
@@ -178,6 +202,8 @@ class LiveFileRuntime:
                 raise ValueError("live mount sources are ambiguous")
             self.source = self.sources[0] if len(self.sources) == 1 else None
             self.root = self.sources[0].source
+            if any(source.kind == "local" for source in self.sources) and not all(source.kind == "local" for source in self.sources):
+                raise ValueError("live local and Docker sources cannot be mixed")
         if not isinstance(hmac_secret, (str, bytes)) or len(hmac_secret) < 32:
             raise ValueError("live helper secret is too short")
         if not isinstance(watch_interval, (int, float)) or watch_interval <= 0:
@@ -193,8 +219,19 @@ class LiveFileRuntime:
         self.created_at = self.last_activity = self.clock()
         self._cancel = threading.Event()
         self._helper_container = None
-        if self.sources is not None:
+        if self.sources is not None and self.sources[0].kind != "local":
             self._helper_container = _LiveHelperContainer(self.sources, self._helper_run_kwargs())
+
+    def _local_target(self, path):
+        parts = virtual_parts(path)
+        if self.sources is None:
+            return self.root, path
+        for source in self.sources:
+            if not source.folder:
+                return source.source, path
+            if parts and parts[0] == source.folder:
+                return source.source, "/" + "/".join(parts[1:])
+        raise ValueError("live mount path is unavailable")
 
     def _helper_command(self, operation, *arguments):
         return [
@@ -330,7 +367,7 @@ class LiveFileRuntime:
         limit = min(int(limit), self.MAX_ENTRIES)
         if limit <= 0:
             raise ValueError("live entry limit must be positive")
-        if self.sources is not None:
+        if self._helper_container is not None:
             result = self._helper_json(
                 "list",
                 "--path",
@@ -347,15 +384,23 @@ class LiveFileRuntime:
             self.last_activity = self.clock()
             return {"entries": entries, "next_cursor": next_cursor}
 
+        if self.sources is not None and all(source.folder for source in self.sources) and not virtual_parts(path):
+            entries = [
+                {"name": source.folder, "path": f"/{source.folder}", "type": "dir", "size": None, "mtime_ns": None}
+                for source in sorted(self.sources, key=lambda source: source.folder) if source.folder > (cursor or "")
+            ][:limit]
+            self.last_activity = self.clock()
+            return {"entries": entries, "next_cursor": entries[-1]["name"] if len(entries) == limit else None}
         try:
-            directory = confined_path(self.root, path)
+            root, local_path = self._local_target(path)
+            directory = confined_path(root, local_path)
             metadata = os.stat(directory, follow_symlinks=False)
             if not stat_module.S_ISDIR(metadata.st_mode):
                 raise LiveRuntimeError("live path is not a directory", reason="invalid_request", status=400)
             entries, after = [], cursor or ""
             with os.scandir(directory) as scan:
                 for scanned, entry in enumerate(
-                    entry for entry in sorted(scan, key=lambda item: item.name) if entry.name > after and not entry.is_symlink()
+                    entry for entry in sorted(scan, key=lambda item: item.name) if entry.name > after and not is_live_link(os.path.join(directory, entry.name))
                 ):
                     if scanned >= limit + 1:
                         break
@@ -386,7 +431,7 @@ class LiveFileRuntime:
         limit = min(self.max_file_bytes, max_bytes if max_bytes is not None else self.max_file_bytes)
         if limit < 0:
             raise LiveRuntimeError("live file size bound is invalid", reason="invalid_request", status=400)
-        if self.sources is not None:
+        if self._helper_container is not None:
             raw = self._helper_exec(
                 "read",
                 "--path",
@@ -406,7 +451,8 @@ class LiveFileRuntime:
             return
 
         try:
-            fd = open_confined(self.root, path)
+            root, local_path = self._local_target(path)
+            fd = open_confined(root, local_path)
         except OSError as exc:
             _raise_live_access_denied(exc)
             raise
@@ -434,23 +480,25 @@ class LiveFileRuntime:
     def _assert_watch_root(self):
         if self._cancel.is_set():
             raise LiveRuntimeError("live watcher root is unavailable", reason="source_unavailable")
-        if self.sources is not None:
+        if self.sources is not None and self.sources[0].kind != "local":
             if self._helper_container is None or self._helper_container.closed:
                 raise LiveRuntimeError("live watcher root is unavailable", reason="source_unavailable")
             return
-        if os.path.realpath(self.root) != self.root:
-            raise LiveRuntimeError("live watcher root is unavailable", reason="source_unavailable")
-        try:
-            metadata = os.stat(self.root, follow_symlinks=False)
-        except OSError as exc:
-            _raise_live_access_denied(exc)
-            raise
-        if not stat_module.S_ISDIR(metadata.st_mode):
-            raise LiveRuntimeError("live watcher root is unavailable", reason="source_unavailable")
+        roots = [source.source for source in self.sources] if self.sources is not None else [self.root]
+        for root in roots:
+            if is_live_link(root) or os.path.realpath(root) != root:
+                raise LiveRuntimeError("live watcher root is unavailable", reason="source_unavailable")
+            try:
+                metadata = os.stat(root, follow_symlinks=False)
+            except OSError as exc:
+                _raise_live_access_denied(exc)
+                raise
+            if not stat_module.S_ISDIR(metadata.st_mode):
+                raise LiveRuntimeError("live watcher root is unavailable", reason="source_unavailable")
 
     def _watch_snapshot(self):
         self._assert_watch_root()
-        if self.sources is not None:
+        if self._helper_container is not None:
             payload = self._helper_json("snapshot", "--max-entries", self.max_watch_entries)
             raw_entries, complete = payload.get("entries"), payload.get("complete")
             if not isinstance(raw_entries, dict) or not isinstance(complete, bool):
@@ -468,10 +516,21 @@ class LiveFileRuntime:
                 entries[path] = (value[0], value[1], value[2])
             return entries, complete
 
-        entries, pending, scanned = {}, [("", self.root)], 0
+        entries = {}
+        pending = [("", self.root)] if self.sources is None else [
+            (f"/{source.folder}" if source.folder else "", source.source) for source in reversed(self.sources)
+        ]
+        for source in self.sources or ():
+            if source.folder:
+                if len(entries) >= self.max_watch_entries:
+                    return entries, False
+                entries[f"/{source.folder}"] = ("dir", None, None)
+        scanned = len(entries)
         while pending:
             relative, directory = pending.pop()
             try:
+                root, local_path = self._local_target(relative or "/")
+                directory = confined_path(root, local_path)
                 with os.scandir(directory) as scan:
                     for entry in scan:
                         if self._cancel.is_set():
@@ -479,7 +538,7 @@ class LiveFileRuntime:
                         if scanned >= self.max_watch_entries:
                             return entries, False
                         scanned += 1
-                        if entry.is_symlink():
+                        if is_live_link(entry.path):
                             continue
                         try:
                             is_dir = entry.is_dir(follow_symlinks=False)
@@ -489,7 +548,7 @@ class LiveFileRuntime:
                             continue
                         if not is_dir and not is_file:
                             continue
-                        path = "/" + "/".join(part for part in (relative, entry.name) if part)
+                        path = "/" + "/".join(part for part in (relative.strip("/"), entry.name) if part)
                         entries[path] = (
                             "dir" if is_dir else "file",
                             None if is_dir else stat.st_size,
@@ -498,7 +557,7 @@ class LiveFileRuntime:
                         if is_dir:
                             pending.append((path, entry.path))
             except OSError as exc:
-                if not relative:
+                if not relative or (self.sources is not None and directory in {source.source for source in self.sources}):
                     _raise_live_access_denied(exc)
                     raise LiveRuntimeError("live watcher root is unavailable", reason="source_unavailable") from exc
         return entries, True

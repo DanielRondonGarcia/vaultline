@@ -206,6 +206,7 @@ class NativeRuntimeAdapter(RuntimePort):
         RuntimeCommandPolicy.validate_snapshot_scope(payload, command)
         command = RuntimeCommandPolicy.apply_lock_policy(command, self.no_lock)
         if command == ["/root/backup.sh"]:
+            environment["PYTHONIOENCODING"] = "utf-8"
             return self._backup_engine_command(), environment
         self._require_executable(command[0])
         return command, environment
@@ -320,6 +321,8 @@ class NativeRuntimeAdapter(RuntimePort):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=not binary,
+            encoding=None if binary else "utf-8",
+            errors=None if binary else "replace",
             bufsize=1 if not binary else -1,
         )
         stdout_parts: list[Any] = []

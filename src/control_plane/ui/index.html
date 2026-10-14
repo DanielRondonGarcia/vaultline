@@ -122,6 +122,8 @@
     .target-stats-note { margin-top: 14px; color: var(--muted-foreground); font-size: 11px; line-height: 1.5; }
     .target-stats-skeleton { display: grid; gap: 8px; }
     .target-stats-skeleton div { height: 42px; border-radius: var(--radius); background: linear-gradient(90deg, var(--card) 25%, var(--muted) 50%, var(--card) 75%); background-size: 200% 100%; animation: snapshot-skeleton 1.2s ease-in-out infinite; }
+    .filesystem-path-value { flex: 1; }
+    .filesystem-path-list li .filesystem-path-size { flex: 0 0 auto; color: var(--muted-foreground); text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
     .snapshot-search-row { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
     .snapshot-search-field { position: relative; flex: 1; min-width: 180px; }
     .snapshot-search-field input { width: 100%; box-sizing: border-box; padding: 9px 38px 9px 11px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--background); color: var(--foreground); }
@@ -1487,13 +1489,12 @@ docker compose up -d
               <div class="field full filesystem-path-editor" data-runtime-section="native" data-path-editor="create" style="display:none;">
                 <label for="targetFilesystemPathInput">Rutas del worker</label>
                 <div class="helper">Agrega rutas absolutas que existan en el worker seleccionado. No hay navegación remota desde el Control Plane. Ejemplos: Linux <code>/home/alice/Documents</code>; Windows <code>C:\\Users\\Alice</code> o <code>\\\\server\\share\\folder</code>.</div>
-                <div class="filesystem-path-entry"><input id="targetFilesystemPathInput" aria-describedby="targetFilesystemPathError targetFilesystemPathCount" placeholder="/srv/data" /><button type="button" class="btn secondary sm" data-path-add="target">Agregar ruta</button></div>
+                 <div class="filesystem-path-entry"><input id="targetFilesystemPathInput" aria-describedby="targetFilesystemPathError targetFilesystemPathCount" name="target_filesystem_path" autocomplete="off" placeholder="/srv/data…" /><button type="button" class="btn secondary sm" data-path-add="target">Agregar ruta</button></div>
                 <div id="targetFilesystemPathError" class="form-error" role="alert" style="display:none;"></div>
                  <ul id="targetFilesystemPathList" class="filesystem-path-list"></ul>
                  <div id="targetFilesystemPathCount" class="helper" aria-live="polite">0 rutas agregadas</div>
-                 <button type="button" class="btn secondary sm" id="targetEstimateSize" disabled>Calcular tamaño bruto</button>
-                 <div id="targetEstimateStatus" class="helper" role="status" aria-live="polite"></div>
-                 <div class="helper">Suma tamaños lógicos de archivos; no estima deduplicación, compresión ni el tamaño final del repositorio. No se leen contenidos ni se crea un backup.</div>
+                  <div id="targetEstimateStatus" class="helper" role="status" aria-live="polite">El tamaño se calcula automáticamente al agregar cada ruta.</div>
+                  <div class="helper">Suma tamaños lógicos de archivos; no estima deduplicación, compresión ni el tamaño final del repositorio. No se leen contenidos ni se crea un backup.</div>
              </div>
              <div id="targetProjectSummary" class="helper" data-runtime-section="docker">Selecciona un worker para ver sus compose projects y volumenes detectados.</div>
              <details class="sub-section">
@@ -4922,8 +4923,7 @@ docker compose up -d
                   <div id="etFilesystemPathError" class="form-error" role="alert" style="display:none;"></div>
                    <ul id="etFilesystemPathList" class="filesystem-path-list"></ul>
                    <div id="etFilesystemPathCount" class="helper" aria-live="polite">0 rutas agregadas</div>
-                   <button type="button" class="btn secondary sm" id="etEstimateSize" disabled>Calcular tamaño bruto</button>
-                   <div id="etEstimateStatus" class="helper" role="status" aria-live="polite"></div>
+                    <div id="etEstimateStatus" class="helper" role="status" aria-live="polite">El tamaño se calcula automáticamente al agregar cada ruta.</div>
                    <div class="helper">Suma tamaños lógicos de archivos; no estima deduplicación, compresión ni el tamaño final del repositorio. No se leen contenidos ni se crea un backup.</div>
                  </section>
                </div>
@@ -5804,14 +5804,30 @@ docker compose up -d
         paths.forEach((path, index) => {
           const item = document.createElement("li");
           const text = document.createElement("span");
+          text.className = "filesystem-path-value";
           text.textContent = path;
+          const size = document.createElement("span");
+          size.className = "filesystem-path-size";
+          size.dataset.pathSize = "";
+          size.setAttribute("aria-live", "polite");
+          size.textContent = "Pendiente";
           const remove = document.createElement("button");
           remove.type = "button";
           remove.className = "btn ghost sm";
           remove.textContent = "Quitar";
           remove.setAttribute("aria-label", `Quitar ruta ${path}`);
-           remove.addEventListener("click", () => { paths.splice(index, 1); render(); onChange(); });
-          item.append(text, remove);
+          remove.dataset.pathRemove = "";
+          remove.addEventListener("click", () => {
+            paths.splice(index, 1);
+            render();
+            if (paths.length) {
+              list.querySelectorAll("[data-path-remove]")[Math.min(index, paths.length - 1)].focus();
+            } else {
+              input.focus();
+            }
+            onChange();
+          });
+          item.append(text, size, remove);
           list.append(item);
         });
         count.textContent = `${paths.length} ${paths.length === 1 ? "ruta agregada" : "rutas agregadas"}`;
@@ -5839,67 +5855,54 @@ docker compose up -d
     }
 
     function bindFilesystemSizeEstimate(prefix, pathEditor, workerSelect) {
-      const button = document.getElementById(`${prefix}EstimateSize`);
       const status = document.getElementById(`${prefix}EstimateStatus`);
       let generation = 0;
-      let running = false;
-      const update = () => {
-        generation += 1;
-        running = false;
-        if (!running && button) button.disabled = !workerSelect.value || !pathEditor.getPaths().length;
-        if (status && !running) status.textContent = "";
-      };
-      workerSelect.addEventListener("change", update);
-      button.addEventListener("click", async () => {
-        if (running) return;
+      const update = async () => {
         const requestGeneration = ++generation;
         const paths = pathEditor.getPaths();
-        const workerId = workerSelect.value;
-        if (!workerId || !paths.length) return;
-        running = true;
-        button.disabled = true;
-        status.textContent = "Analizando rutas…";
+        if (!paths.length) {
+          if (status) status.textContent = "";
+          return;
+        }
+        const rows = Array.from(document.querySelectorAll(`#${prefix}FilesystemPathList [data-path-size]`));
+        rows.forEach(row => { row.textContent = workerSelect.value ? "Calculando…" : "Worker no disponible"; });
+        if (!workerSelect.value) {
+          if (status) status.textContent = "Selecciona un worker online para calcular el tamaño.";
+          return;
+        }
+        if (status) status.textContent = "Analizando rutas…";
         try {
-          const submitted = await apiPost("/api/v1/filesystem-size-estimates", { worker_id: workerId, filesystem_paths: paths });
+          const submitted = await apiPost("/api/v1/filesystem-size-estimates", { worker_id: workerSelect.value, filesystem_paths: paths });
           const deadline = Date.now() + 90000;
-          let completed = false;
+          let response;
           while (Date.now() < deadline) {
             await new Promise(resolve => setTimeout(resolve, 1000));
-            const response = await apiGet(`/api/v1/filesystem-size-estimates/${encodeURIComponent(submitted.operation_id)}`);
+            response = await apiGet(`/api/v1/filesystem-size-estimates/${encodeURIComponent(submitted.operation_id)}`);
             if (requestGeneration !== generation) return;
-            if (response.status === "expired") throw new Error("La solicitud venció; vuelve a intentarlo.");
-            if (response.status !== "complete") continue;
-            const result = response.result || {};
-            if (result.status && result.status !== 200) {
-              const failure = new Error("El worker rechazó la solicitud; verifica que sea un worker nativo online.");
-              failure.status = result.status;
-              throw failure;
-            }
-            const bytes = new Intl.NumberFormat("es-CO").format(Number(result.logical_bytes || 0));
-            const details = `${bytes} bytes (${formatJobBytes(result.logical_bytes) || "0 B"}) · ${result.file_count || 0} archivos · ${result.directory_count || 0} directorios · ${result.symlinks_skipped || 0} enlaces simbólicos omitidos`;
-            status.textContent = result.complete ? details : `${details}. Resultado parcial: algunas rutas son inaccesibles o se alcanzó el límite de análisis.`;
-            completed = true;
-            break;
+            if (response.status === "expired") throw new Error("La solicitud venció.");
+            if (response.status === "complete") break;
           }
-          if (!completed && requestGeneration === generation) throw new Error("El análisis superó el tiempo de espera. Comprueba que el worker siga online y vuelve a intentarlo.");
+          if (requestGeneration !== generation) return;
+          if (!response || response.status !== "complete") throw new Error("El análisis superó el tiempo de espera.");
+          const result = response.result || {};
+          if (result.status && result.status !== 200) throw new Error("El worker rechazó la solicitud.");
+          const roots = Array.isArray(result.roots) ? result.roots : [];
+          rows.forEach((row, index) => {
+            const root = roots[index];
+            row.textContent = root && root.status === "complete"
+              ? `${new Intl.NumberFormat("es-CO").format(root.logical_bytes || 0)} bytes`
+              : "No disponible";
+          });
+          const bytes = new Intl.NumberFormat("es-CO").format(Number(result.logical_bytes || 0));
+          const details = `${bytes} bytes (${formatJobBytes(result.logical_bytes) || "0 B"}) · ${result.file_count || 0} archivos · ${result.directory_count || 0} directorios · ${result.symlinks_skipped || 0} enlaces simbólicos omitidos`;
+          if (status) status.textContent = result.complete ? details : `${details}. Resultado parcial: algunas rutas son inaccesibles o se alcanzó el límite de análisis.`;
         } catch (error) {
-          if (requestGeneration === generation) {
-            const message = error.status === 403
-              ? "El usuario del worker no tiene permisos para leer algunas rutas."
-              : error.status === 409
-                ? "El worker está offline o no admite el runtime nativo."
-                : error.status === 404
-                  ? "La solicitud venció; vuelve a intentarlo."
-                  : `No se pudo calcular el tamaño: ${error.message}`;
-            status.textContent = message;
-          }
-        } finally {
-          if (requestGeneration === generation) {
-            running = false;
-            button.disabled = !workerSelect.value || !pathEditor.getPaths().length;
-          }
+          if (requestGeneration !== generation) return;
+          rows.forEach(row => { row.textContent = "No disponible"; });
+          if (status) status.textContent = `No se pudo calcular el tamaño: ${error.message}`;
         }
-      });
+      };
+      workerSelect.addEventListener("change", update);
       update();
       return update;
     }

@@ -2,7 +2,7 @@ import os
 import unittest
 from unittest.mock import patch
 
-from src.worker_agent.main import _resolve_live_helper_image
+from src.worker_agent.main import _resolve_live_helper_image, _resolve_worker_version
 
 
 class LiveHelperImageResolutionTests(unittest.TestCase):
@@ -43,6 +43,18 @@ class LiveHelperImageResolutionTests(unittest.TestCase):
             with self.subTest(version=version):
                 with patch.dict(os.environ, {"APP_VERSION": version}, clear=True):
                     self.assertEqual(_resolve_live_helper_image(), "docker-volume-backup-worker-local:dev")
+
+
+class WorkerVersionResolutionTests(unittest.TestCase):
+    def test_packaged_build_version_is_used_when_environment_is_generic(self):
+        with patch.dict(os.environ, {"WORKER_VERSION": "dev", "APP_VERSION": "latest"}, clear=True), patch(
+            "src.worker_agent.main.BUILD_VERSION", "3.5.3"
+        ):
+            self.assertEqual(_resolve_worker_version(), "3.5.3")
+
+    def test_explicit_worker_version_precedes_app_version(self):
+        with patch.dict(os.environ, {"WORKER_VERSION": "3.5.4", "APP_VERSION": "3.5.3"}, clear=True):
+            self.assertEqual(_resolve_worker_version(), "3.5.4")
 
 
 if __name__ == "__main__":

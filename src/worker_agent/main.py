@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 
 from src.worker_agent.application.services.worker_agent_service import WorkerAgentService
+from src.worker_agent._build_info import VERSION as BUILD_VERSION
 from src.worker_agent.domain.models import WorkerAgentConfig
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
 from src.worker_agent.infrastructure.adapters.kubernetes_runtime import KubernetesRuntimeAdapter
@@ -241,6 +242,18 @@ def _resolve_live_helper_image() -> str:
     return "docker-volume-backup-worker-local:dev"
 
 
+def _resolve_worker_version() -> str:
+    worker_version = (os.environ.get("WORKER_VERSION") or "").strip()
+    app_version = (os.environ.get("APP_VERSION") or "").strip()
+    if worker_version and worker_version not in ("ghcr", "docker", "dev", "latest"):
+        return worker_version
+    if app_version and app_version not in ("dev", "latest"):
+        return app_version
+    if BUILD_VERSION and BUILD_VERSION not in ("dev", "latest"):
+        return BUILD_VERSION
+    return worker_version or app_version or BUILD_VERSION or "dev"
+
+
 def _bounded_interval(name: str, default: float, minimum: float, maximum: float) -> float:
     raw = os.environ.get(name, str(default))
     try:
@@ -368,15 +381,6 @@ def start_live_lane(service: WorkerAgentService, interval: float):
 
 
 def build_service() -> WorkerAgentService:
-    def _resolve_version():
-        wv = (os.environ.get("WORKER_VERSION") or "").strip()
-        av = (os.environ.get("APP_VERSION") or "").strip()
-        if wv and wv not in ("ghcr", "docker", "dev", "latest"):
-            return wv
-        if av and av not in ("dev", "latest"):
-            return av
-        return wv or av or "dev"
-
     credential_file = resolve_credential_file()
     recovery_file = os.environ.get("WORKER_JOB_RECOVERY_FILE") or str(
         credential_file.with_name("worker_job_recovery.json")
@@ -393,7 +397,7 @@ def build_service() -> WorkerAgentService:
         or "http://127.0.0.1:8080",
         name=os.environ.get("WORKER_NAME") or enrollment_config.get("worker_name") or socket.gethostname(),
         host_name=os.environ.get("WORKER_HOST_NAME", socket.gethostname()),
-        version=_resolve_version(),
+        version=_resolve_worker_version(),
         worker_id=os.environ.get("WORKER_ID") or (stored.worker_id if stored else None),
         labels=_labels_from_env(),
         backup_runtime_image=os.environ.get(

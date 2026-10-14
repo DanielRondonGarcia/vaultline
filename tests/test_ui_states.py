@@ -188,6 +188,72 @@ class SnapshotExplorerUiStateTests(unittest.TestCase):
         self.assertNotIn('id="targetFilesystemPaths"', self.source)
         self.assertNotIn('id="etFilesystemPaths"', self.source)
 
+    def test_removing_filesystem_path_restores_focus_to_adjacent_control(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+
+        editor = re.search(
+            r"function validateFilesystemPath\(path\) \{.*?\n    function bindFilesystemSizeEstimate",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(editor)
+        script = editor.group(0).split("    function bindFilesystemSizeEstimate", 1)[0]
+        script += r'''
+class Element {
+  constructor(tag) { this.tag = tag; this.dataset = {}; this.children = []; this.listeners = {}; this.style = {}; this.value = ""; }
+  setAttribute(name, value) { this[name] = value; }
+  addEventListener(name, callback) { this.listeners[name] = callback; }
+  append(...children) { this.children.push(...children); }
+  replaceChildren(...children) { this.children = children; }
+  focus() { focused = this; }
+  querySelectorAll(selector) { return selector === "[data-path-remove]" ? this.children.flatMap(row => row.children.filter(child => child.dataset.pathRemove !== undefined)) : []; }
+}
+let focused;
+const elements = new Map();
+const addButton = new Element("button");
+global.document = {
+  getElementById(id) { if (!elements.has(id)) elements.set(id, new Element(id)); return elements.get(id); },
+  createElement(tag) { return new Element(tag); },
+  querySelector() { return addButton; },
+};
+const run = (initialPaths, removeIndex) => {
+  elements.clear();
+  const editor = bindFilesystemPathEditor("target", initialPaths);
+  const list = document.getElementById("targetFilesystemPathList");
+  list.children[removeIndex].children.find(child => child.dataset.pathRemove !== undefined).listeners.click();
+  const paths = editor.getPaths();
+  const expectedFocus = paths.length
+    ? list.children[Math.min(removeIndex, paths.length - 1)].children.find(child => child.dataset.pathRemove !== undefined)
+    : document.getElementById("targetFilesystemPathInput");
+  if (focused !== expectedFocus) throw new Error(`wrong focus after removing row ${removeIndex}`);
+  return paths;
+};
+const results = {
+  first: run(["/one", "/two", "/three"], 0),
+  middle: run(["/one", "/two", "/three"], 1),
+  last: run(["/one", "/two", "/three"], 2),
+  only: run(["/one"], 0),
+};
+process.stdout.write(JSON.stringify(results));
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                "first": ["/two", "/three"],
+                "middle": ["/one", "/three"],
+                "last": ["/one", "/two"],
+                "only": [],
+            },
+        )
+
     def test_target_volume_selector_uses_source_candidates_and_sends_source_identity(self):
         for marker in (
             "Array.isArray(project.volume_candidates)",

@@ -7,6 +7,7 @@ import ctypes
 import getpass
 import json
 import os
+import signal
 import secrets
 import shutil
 import socket
@@ -78,13 +79,24 @@ def _self_check(_args: argparse.Namespace) -> int:
 def _daemon(args: argparse.Namespace) -> int:
     os.environ["WORKER_RUNTIME"] = "native"
     os.environ["WORKER_RUN_ONCE"] = "true" if args.once else "false"
+    previous_handlers = {}
+
+    def request_worker_stop(_signum, _frame):
+        worker_main.request_stop()
+
     try:
+        worker_main.reset_stop()
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, request_worker_stop)
         worker_main.main()
     except RuntimeError as exc:
         if str(exc) == "worker is not enrolled":
             print("error: worker is not enrolled; run 'vaultline-worker enroll --control-plane-url <url>'", file=sys.stderr)
             return 3
         raise
+    finally:
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
     return 0
 
 

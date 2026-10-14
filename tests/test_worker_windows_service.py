@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from logging.handlers import RotatingFileHandler
@@ -51,9 +52,15 @@ def build_fake_pywin32():
     win32service.SERVICE_DEMAND_START = 3
     win32service.SC_MANAGER_CONNECT = 1
     win32service.SERVICE_QUERY_CONFIG = 1
+    win32service.SERVICE_CHANGE_CONFIG = 2
+    win32service.SERVICE_START = 16
+    win32service.SERVICE_CONFIG_FAILURE_ACTIONS = 2
+    win32service.SC_ACTION_NONE = 0
+    win32service.SC_ACTION_RESTART = 1
     win32service.OpenSCManager = Mock(return_value="hscm")
     win32service.OpenService = Mock(return_value="hs")
     win32service.CloseServiceHandle = Mock()
+    win32service.ChangeServiceConfig2 = Mock()
     # (serviceType, startType, errorControl, binaryPath, ...)
     win32service.QueryServiceConfig = Mock(return_value=(16, 2, 1, '"C:\\x.exe" service run'))
 
@@ -355,7 +362,101 @@ class ServiceClassTests(RootLoggerIsolationMixin, FakePywin32TestCase):
         self.assertEqual(details, {"waitHint": 120000, "checkPoint": 1})
         thread.assert_called_once()
         self.assertTrue(thread.call_args.kwargs["daemon"])
-        self.assertEqual(windows_service.STOP_WAIT_SECONDS, 180)
+        self.assertEqual(windows_service.STOP_WAIT_SECONDS, 120)
+
+    def test_stop_completes_gracefully_without_disabling_recovery_or_forcing_exit(self):
+        from src.worker_agent import windows_service
+
+        service = windows_service.build_service_class()(["VaultlineWorker"])
+        service.worker_done.set()
+        real_thread = threading.Thread
+        threads = []
+
+        def start_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+
+        with patch("src.worker_agent.windows_service.threading.Thread", side_effect=start_thread), patch(
+            "src.worker_agent.windows_service._suppress_service_failure_restarts"
+        ) as suppress, patch("src.worker_agent.windows_service._terminate_service_process") as force_exit:
+            service.SvcStop()
+            threads[0].join(timeout=1)
+
+        self.assertFalse(threads[0].is_alive())
+        suppress.assert_not_called()
+        force_exit.assert_not_called()
+        self.assertEqual(service.reported_statuses, [3])
+
+    def test_stop_timeout_suppresses_recovery_before_forced_process_exit(self):
+        from src.worker_agent import windows_service
+
+        service = windows_service.build_service_class()(["VaultlineWorker"])
+        real_thread = threading.Thread
+        threads = []
+        ordering = []
+
+        def start_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+
+        def force_exit():
+            ordering.append(("exit", 0))
+            service.worker_done.set()
+
+        with patch("src.worker_agent.windows_service.STOP_WAIT_SECONDS", 0.02), patch(
+            "src.worker_agent.windows_service.STOP_WATCHDOG_INTERVAL_SECONDS", 0.005
+        ), patch("src.worker_agent.windows_service.threading.Thread", side_effect=start_thread), patch(
+            "src.worker_agent.windows_service._suppress_service_failure_restarts",
+            side_effect=lambda: ordering.append("suppress-recovery"),
+        ), patch(
+            "src.worker_agent.windows_service._terminate_service_process",
+            side_effect=force_exit,
+        ):
+            service.SvcStop()
+            threads[0].join(timeout=1)
+
+        self.assertFalse(threads[0].is_alive())
+        self.assertEqual(ordering, ["suppress-recovery", ("exit", 0)])
+        self.assertNotIn(1, service.reported_statuses, "the watchdog must not report STOPPED while alive")
+        warning = self.fakes["servicemanager"].LogErrorMsg.call_args.args[0]
+        self.assertIn("may be interrupted", warning)
+
+    def test_service_start_restores_msi_recovery_policy_before_worker_main(self):
+        from src.worker_agent import windows_service
+
+        calls = []
+        with patch("src.worker_agent.windows_service._restore_service_failure_restarts", side_effect=lambda: calls.append("recovery")), patch(
+            "src.worker_agent.main.reset_stop"
+        ), patch("src.worker_agent.main.main", side_effect=lambda: calls.append("main")):
+            windows_service.build_service_class()(["VaultlineWorker"]).SvcDoRun()
+
+        self.assertEqual(calls, ["recovery", "main"])
+
+    def test_recovery_suppression_and_restoration_use_scm_failure_actions_api(self):
+        from src.worker_agent import windows_service
+
+        win32service = self.fakes["win32service"]
+        windows_service._suppress_service_failure_restarts()
+        win32service.OpenService.assert_called_with(
+            "hscm",
+            "VaultlineWorker",
+            win32service.SERVICE_CHANGE_CONFIG | win32service.SERVICE_START,
+        )
+        suppressed = win32service.ChangeServiceConfig2.call_args.args[2]
+        self.assertEqual(suppressed["Actions"], ((win32service.SC_ACTION_NONE, 0),))
+        self.assertEqual(suppressed["ResetPeriod"], 0)
+
+        windows_service._restore_service_failure_restarts()
+        restored = win32service.ChangeServiceConfig2.call_args.args[2]
+        self.assertEqual(
+            restored["Actions"],
+            ((win32service.SC_ACTION_RESTART, 10000),) * 3,
+        )
+        self.assertEqual(restored["ResetPeriod"], 86400)
+        self.assertEqual(win32service.ChangeServiceConfig2.call_count, 2)
+        self.assertEqual(win32service.CloseServiceHandle.call_count, 4)
 
     def test_svc_stop_requests_worker_stop_and_signals_event(self):
         from src.worker_agent import windows_service
@@ -505,7 +606,7 @@ class LifecycleTests(FakePywin32TestCase):
 
         self.win32serviceutil.WaitForServiceStatus.assert_called_once_with("VaultlineWorker", 1, windows_service.STOP_WAIT_SECONDS)
         self.assertEqual(result["state"], "stopped")
-        self.assertEqual(windows_service.STOP_WAIT_SECONDS, 180)
+        self.assertEqual(windows_service.STOP_WAIT_SECONDS, 120)
 
     def test_stop_timeout_surfaces_as_service_error(self):
         from src.worker_agent import windows_service

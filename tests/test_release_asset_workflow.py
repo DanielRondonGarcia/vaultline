@@ -104,13 +104,16 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         # msi build must consume the portable exe from its staged location.
         self.assertLess(job.index("wix build"), job.index("Move-Item -Path dist\\vaultline-worker.exe"))
 
-    def test_windows_msi_smoke_installs_checks_service_and_uninstalls_silently(self):
+    def test_windows_msi_smoke_upgrades_lower_version_checks_service_and_uninstalls(self):
         job = self.windows_job()
         smoke = re.search(r"(?ms)- name: Smoke MSI.*?(?=^      - name: |\Z)", job)
         self.assertIsNotNone(smoke, "an MSI smoke step is required")
         smoke = smoke.group(0)
         self.assertRegex(smoke, r"msiexec.*'/i'.*'/qn'.*'/norestart'")
         self.assertRegex(smoke, r"msiexec.*'/x'.*'/qn'.*'/norestart'")
+        self.assertIn("lower-version", smoke)
+        self.assertIn("$LowerMsi", smoke)
+        self.assertIn("$upgrade = Start-Process msiexec", smoke)
         self.assertIn("'/l*v'", smoke)
         self.assertIn("ExitCode", smoke)
         self.assertIn("Get-Service", smoke)

@@ -126,6 +126,28 @@ class WorkerNativeCLITests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         worker_main.assert_called_once_with()
 
+    def test_daemon_bridges_termination_signals_and_restores_handlers(self):
+        import signal
+        from src.worker_agent import cli
+
+        original_term = signal.getsignal(signal.SIGTERM)
+        original_int = signal.getsignal(signal.SIGINT)
+        observed = []
+
+        def run_worker():
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+            observed.append("stop-requested")
+
+        with patch("src.worker_agent.main.main", side_effect=run_worker), patch(
+            "src.worker_agent.main.request_stop"
+        ) as request_stop:
+            self.assertEqual(cli.main(["daemon"]), 0)
+
+        request_stop.assert_called_once_with()
+        self.assertEqual(observed, ["stop-requested"])
+        self.assertIs(signal.getsignal(signal.SIGTERM), original_term)
+        self.assertIs(signal.getsignal(signal.SIGINT), original_int)
+
     def test_daemon_once_unenrolled_prints_actionable_error_and_exits_three(self):
         from src.worker_agent import cli
 

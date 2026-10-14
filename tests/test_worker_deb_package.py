@@ -94,24 +94,30 @@ class WorkerDebPackageTests(unittest.TestCase):
             self.assertRegex(line, r"\|\|\s*true\s*$", f"not tolerant: {line.strip()}")
         self.assertIn("exit 0", postinst)
 
-    def test_prerm_stops_and_disables_unit_tolerantly_on_remove(self):
+    def test_prerm_stops_before_remove_and_upgrade_without_disabling_upgrade(self):
         prerm = self.read_text(PRERM)
 
         self.assertTrue(prerm.startswith("#!/bin/sh"))
         self.assertIn("set -e", prerm)
-        remove = re.search(r"(?ms)^\s*remove\)\n(.*?)^\s*;;", prerm)
-        self.assertIsNotNone(remove, "prerm must handle the remove action")
-        body = remove.group(1)
+        lifecycle = re.search(r"(?ms)^\s*remove\|upgrade\)\n(.*?)^\s*;;", prerm)
+        self.assertIsNotNone(lifecycle, "prerm must stop the unit on remove and upgrade")
+        body = lifecycle.group(1)
         self.assertIn("/run/systemd/system", body)
-        self.assertRegex(body, r"systemctl stop " + re.escape(UNIT_NAME) + r"\s*\|\|\s*true")
+        self.assertRegex(body, r"(?m)systemctl stop " + re.escape(UNIT_NAME) + r"\s*$")
         self.assertRegex(body, r"systemctl disable " + re.escape(UNIT_NAME) + r"\s*\|\|\s*true")
         self.assertLess(body.index("systemctl stop"), body.index("systemctl disable"))
+        self.assertIn('[ "$1" = remove ]', body)
+        self.assertNotIn("systemctl stop docker-volume-backup-worker.service || true", body)
         self.assertNotIn("/var/lib/docker-volume-backup", prerm, "state (credentials) must survive removal")
         self.assertNotIn("rm ", prerm)
         self.assertNotIn("deluser", prerm)
         self.assertIn("exit 0", prerm)
         self.assertNotIn("WORKER_ENROLLMENT_TOKEN", prerm)
         self.assertNotIn("WORKER_SECRET", prerm)
+
+    def test_unit_bounds_systemd_shutdown(self):
+        service = self.read_text(SERVICE)
+        self.assertIn("TimeoutStopSec=120s", service)
 
     def test_package_contains_only_non_secret_environment_example(self):
         example = self.read_text(ENV_EXAMPLE)

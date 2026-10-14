@@ -46,7 +46,9 @@
       Compressed="yes"
       Language="1033">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of Vaultline Worker is already installed." />
+    <!-- Remove the old product during execute so its ServiceControl stop/remove
+         runs before the shared install path is replaced by the new executable. -->
+    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer version of Vaultline Worker is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Feature Id="WorkerFeature" Title="Vaultline Worker" Level="1">

@@ -16,6 +16,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, TypeVar
@@ -28,10 +29,13 @@ DISPLAY_NAME = "Vaultline Worker"
 DESCRIPTION = "Vaultline native backup worker (enroll with: vaultline-worker enroll --control-plane-url <url>)"
 
 START_WAIT_SECONDS = 30
-STOP_WAIT_SECONDS = 180
+STOP_WAIT_SECONDS = 120
 STOP_INITIAL_WAIT_HINT_MS = 120000
 STOP_WAIT_HINT_MS = 30000
 STOP_WATCHDOG_INTERVAL_SECONDS = 10
+SERVICE_RECOVERY_RESET_SECONDS = 24 * 60 * 60
+SERVICE_RECOVERY_RESTART_DELAY_MS = 10000
+SERVICE_RECOVERY_RESTART_COUNT = 3
 
 # A service process has no console: sys.stderr is None and the StreamHandler
 # installed by logging.basicConfig in worker_agent.main drops every record.
@@ -265,6 +269,59 @@ def _scm_query_start_type() -> int:
         win32service.CloseServiceHandle(manager)
 
 
+def _set_service_failure_actions(actions: tuple[tuple[int, int], ...], reset_period: int) -> None:
+    """Set this service's SCM failure actions through the supported pywin32 API."""
+    import win32service
+
+    manager = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+    try:
+        service = win32service.OpenService(
+            manager,
+            SERVICE_NAME,
+            win32service.SERVICE_CHANGE_CONFIG | win32service.SERVICE_START,
+        )
+        try:
+            win32service.ChangeServiceConfig2(
+                service,
+                win32service.SERVICE_CONFIG_FAILURE_ACTIONS,
+                {
+                    "ResetPeriod": reset_period,
+                    "RebootMsg": None,
+                    "Command": None,
+                    "Actions": actions,
+                },
+            )
+        finally:
+            win32service.CloseServiceHandle(service)
+    finally:
+        win32service.CloseServiceHandle(manager)
+
+
+def _suppress_service_failure_restarts() -> None:
+    """Replace restart actions with one explicit no-action entry before forced exit."""
+    import win32service
+
+    _set_service_failure_actions(((win32service.SC_ACTION_NONE, 0),), 0)
+
+
+def _restore_service_failure_restarts() -> None:
+    """Restore the three-restart policy configured by the MSI on service start."""
+    import win32service
+
+    _set_service_failure_actions(
+        tuple(
+            (win32service.SC_ACTION_RESTART, SERVICE_RECOVERY_RESTART_DELAY_MS)
+            for _ in range(SERVICE_RECOVERY_RESTART_COUNT)
+        ),
+        SERVICE_RECOVERY_RESET_SECONDS,
+    )
+
+
+def _terminate_service_process() -> None:
+    """Exit only after SCM recovery has been suppressed for the forced-stop case."""
+    os._exit(0)
+
+
 # --- lifecycle --------------------------------------------------------------
 
 
@@ -374,7 +431,43 @@ def build_service_class() -> type:
 
             def report_progress():
                 checkpoint = 1
-                while not self.worker_done.wait(STOP_WATCHDOG_INTERVAL_SECONDS):
+                deadline = time.monotonic() + STOP_WAIT_SECONDS
+                forced_stop_warning_logged = False
+                while not self.worker_done.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        if not forced_stop_warning_logged:
+                            servicemanager.LogErrorMsg(
+                                f"Warning: {DISPLAY_NAME} did not stop within {STOP_WAIT_SECONDS} seconds; "
+                                "the current worker operation may be interrupted."
+                            )
+                            forced_stop_warning_logged = True
+                        try:
+                            # A process exit without SERVICE_STOPPED is an SCM
+                            # failure. Suppress recovery first so MSI removal or
+                            # upgrade cannot restart this old service instance.
+                            _suppress_service_failure_restarts()
+                        except Exception as exc:  # fail closed: never exit with restart actions enabled
+                            servicemanager.LogErrorMsg(
+                                f"{DISPLAY_NAME} cannot safely force-stop because SCM recovery suppression failed "
+                                f"({exc.__class__.__name__}); continuing bounded-stop retries"
+                            )
+                            self.worker_done.wait(STOP_WATCHDOG_INTERVAL_SECONDS)
+                            if not self.worker_done.is_set():
+                                checkpoint += 1
+                                self.ReportServiceStatus(
+                                    win32service.SERVICE_STOP_PENDING,
+                                    waitHint=STOP_WAIT_HINT_MS,
+                                    checkPoint=checkpoint,
+                                )
+                            continue
+
+                        # The worker is still alive until this process exits;
+                        # do not report SERVICE_STOPPED from the watchdog.
+                        _terminate_service_process()
+
+                    if self.worker_done.wait(min(STOP_WATCHDOG_INTERVAL_SECONDS, remaining)):
+                        break
                     checkpoint += 1
                     self.ReportServiceStatus(
                         win32service.SERVICE_STOP_PENDING,
@@ -386,6 +479,21 @@ def build_service_class() -> type:
 
         def SvcDoRun(self):
             servicemanager.LogInfoMsg(f"{DISPLAY_NAME} starting")
+            try:
+                # MSI also configures these actions. Reapply them on every start
+                # so a prior forced manual stop does not leave recovery disabled.
+                _restore_service_failure_restarts()
+            except Exception as exc:  # fail closed rather than silently run without recovery
+                servicemanager.LogErrorMsg(
+                    f"{DISPLAY_NAME} could not restore SCM recovery actions "
+                    f"({exc.__class__.__name__}); refusing to start"
+                )
+                self.ReportServiceStatus(
+                    win32service.SERVICE_STOPPED,
+                    win32ExitCode=getattr(win32service, "ERROR_SERVICE_SPECIFIC_ERROR", 1066),
+                    svcExitCode=1,
+                )
+                return
             self.ReportServiceStatus(win32service.SERVICE_RUNNING)
             # Logging must never take the service down; without the file the
             # worker still runs and the Event Log records where it should have gone.

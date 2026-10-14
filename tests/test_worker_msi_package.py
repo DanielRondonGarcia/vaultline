@@ -50,6 +50,7 @@ class WorkerMsiPackageTests(unittest.TestCase):
         upgrades = list(self.find_all("MajorUpgrade"))
         self.assertEqual(len(upgrades), 1)
         self.assertTrue(upgrades[0].get("DowngradeErrorMessage"))
+        self.assertEqual(upgrades[0].get("Schedule"), "afterInstallInitialize")
 
         media = list(self.find_all("MediaTemplate"))
         self.assertEqual(len(media), 1)

@@ -216,12 +216,28 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "wix build exited with $LASTEXITCODE" }
           if (-not (Test-Path "dist\release\vaultline-worker_${Version}_windows-amd64.msi")) { throw "missing Windows MSI asset" }
 
+      - name: Build lower-version MSI for upgrade smoke
+        shell: pwsh
+        run: |
+          $Version = [version]"${{ needs.prepare.outputs.new_version }}"
+          if ($Version.Build -gt 0) { $LowerVersion = "$($Version.Major).$($Version.Minor).$($Version.Build - 1)" }
+          elseif ($Version.Minor -gt 0) { $LowerVersion = "$($Version.Major).$($Version.Minor - 1).999" }
+          elseif ($Version.Major -gt 0) { $LowerVersion = "$($Version.Major - 1).999.999" }
+          else { throw "Cannot derive a lower MSI version from $Version" }
+          wix build -arch x64 -ext WixToolset.Util.wixext -d Version=$LowerVersion -d WorkerExe=dist\vaultline-worker.exe -o "dist\release\vaultline-worker_${LowerVersion}_windows-amd64.msi" packaging\windows\vaultline-worker.wxs
+          if ($LASTEXITCODE -ne 0) { throw "lower-version wix build exited with $LASTEXITCODE" }
+
       - name: Smoke MSI install, service and uninstall
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $Version = "${{ needs.prepare.outputs.new_version }}"
           $Msi = (Resolve-Path "dist\release\vaultline-worker_${Version}_windows-amd64.msi").Path
+          $LowerVersion = [version]$Version
+          if ($LowerVersion.Build -gt 0) { $LowerVersion = [version]"$($LowerVersion.Major).$($LowerVersion.Minor).$($LowerVersion.Build - 1)" }
+          elseif ($LowerVersion.Minor -gt 0) { $LowerVersion = [version]"$($LowerVersion.Major).$($LowerVersion.Minor - 1).999" }
+          else { $LowerVersion = [version]"$($LowerVersion.Major - 1).999.999" }
+          $LowerMsi = (Resolve-Path "dist\release\vaultline-worker_${LowerVersion}_windows-amd64.msi").Path
           $InstalledExe = "C:\Program Files\Vaultline\vaultline-worker.exe"
           $WorkerLog = "C:\ProgramData\Vaultline\worker\logs\worker.log"
 
@@ -229,10 +245,12 @@ jobs:
             if (Test-Path $Path) { Write-Host "---- $Path (tail) ----"; Get-Content $Path -Tail 80 | ForEach-Object { Write-Host $_ } }
           }
 
-          # Silent per-machine install; the ServiceControl element starts the service.
-          $install = Start-Process msiexec -ArgumentList '/i',"`"$Msi`"",'/qn','/norestart','/l*v','msi-install.log' -Wait -PassThru
-          if ($install.ExitCode -ne 0) { Show-LogTail 'msi-install.log'; throw "msiexec /i exited with $($install.ExitCode)" }
-          if (-not (Test-Path $InstalledExe)) { Show-LogTail 'msi-install.log'; throw "installed executable missing at $InstalledExe" }
+          # Install an older product first, then exercise the actual major-upgrade path.
+          $installOld = Start-Process msiexec -ArgumentList '/i',"`"$LowerMsi`"",'/qn','/norestart','/l*v','msi-install-old.log' -Wait -PassThru
+          if ($installOld.ExitCode -ne 0) { Show-LogTail 'msi-install-old.log'; throw "lower-version msiexec /i exited with $($installOld.ExitCode)" }
+          $upgrade = Start-Process msiexec -ArgumentList '/i',"`"$Msi`"",'/qn','/norestart','/l*v','msi-upgrade.log' -Wait -PassThru
+          if ($upgrade.ExitCode -ne 0) { Show-LogTail 'msi-upgrade.log'; throw "major-upgrade msiexec /i exited with $($upgrade.ExitCode)" }
+          if (-not (Test-Path $InstalledExe)) { Show-LogTail 'msi-upgrade.log'; throw "installed executable missing at $InstalledExe" }
 
           # The service must reach Running on its own (auto-start, LocalSystem).
           $deadline = (Get-Date).AddSeconds(30)
@@ -241,8 +259,8 @@ jobs:
             if ($service -and $service.Status -eq 'Running') { break }
             Start-Sleep -Seconds 2
           } while ((Get-Date) -lt $deadline)
-          if (-not $service) { Show-LogTail 'msi-install.log'; throw "service VaultlineWorker was not registered" }
-          if ($service.Status -ne 'Running') { Show-LogTail $WorkerLog; throw "service VaultlineWorker is $($service.Status), expected Running" }
+          if (-not $service) { Show-LogTail 'msi-upgrade.log'; throw "service VaultlineWorker was not registered after upgrade" }
+          if ($service.Status -ne 'Running') { Show-LogTail $WorkerLog; throw "service VaultlineWorker is $($service.Status), expected Running after upgrade" }
           Write-Host "VaultlineWorker: $($service.Status) (start type $($service.StartType))"
 
           & $InstalledExe service status
@@ -266,7 +284,7 @@ jobs:
           if ($null -ne (Get-Service VaultlineWorker -ErrorAction SilentlyContinue)) { throw "service VaultlineWorker still registered after uninstall" }
           if (Test-Path $InstalledExe) { throw "installed executable still present after uninstall" }
           if (-not (Test-Path "C:\ProgramData\Vaultline\worker")) { throw "state directory must survive uninstall" }
-          Write-Host "MSI smoke passed: install, running service, idle log, uninstall"
+          Write-Host "MSI smoke passed: lower-version install, major upgrade, running service, idle log, uninstall"
 
       - name: Name Windows executable
         shell: pwsh

@@ -13,6 +13,7 @@ EnvironmentFile=-/etc/docker-volume-backup/worker.env
 ExecStart=/usr/bin/vaultline-worker daemon
 Restart=on-failure
 RestartSec=10s
+TimeoutStopSec=120s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full

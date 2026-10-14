@@ -2486,7 +2486,10 @@ class ControlPlaneService:
             raise ValueError("native restore destination traversal is not allowed")
         for source in source_paths or []:
             if isinstance(source, str) and cls._native_path_is_within(value, source):
-                raise ValueError("native restore destination must not overwrite a configured source path")
+                _, target_norm = cls._canonical_native_path(value)
+                _, source_norm = cls._canonical_native_path(source)
+                if target_norm != source_norm:
+                    raise ValueError("native restore destination must not overwrite a configured source path")
         return value
 
     def _build_restore_payload(

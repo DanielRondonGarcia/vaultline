@@ -1668,6 +1668,12 @@ docker compose up -d
       return source === "target" ? "Cron del target" : source === "global" ? "Cron global" : "Solo manual";
     }
 
+    function targetModeValue(target) {
+      return String(target && target.runtime_type || "docker").toLowerCase() === "native"
+        ? ""
+        : String(target && target.backup_mode || "");
+    }
+
     function renderTargetCronLabel(target) {
       const expression = targetCronExpression(target);
       const timeZone = target.scheduler_timezone || state.schedulerTimezone || "";
@@ -1696,7 +1702,7 @@ docker compose up -d
         if (f.name && !(t.name || "").toLowerCase().includes(f.name.toLowerCase())) return false;
         if (f.worker && !wName.toLowerCase().includes(f.worker.toLowerCase())) return false;
         if (f.compose && !(t.compose_project || "").toLowerCase().includes(f.compose.toLowerCase())) return false;
-        if (f.mode && !(t.backup_mode || "").toLowerCase().includes(f.mode.toLowerCase())) return false;
+        if (f.mode && !targetModeValue(t).toLowerCase().includes(f.mode.toLowerCase())) return false;
         if (f.retention && !rName.toLowerCase().includes(f.retention.toLowerCase())) return false;
         if (f.cron && !cron.toLowerCase().includes(f.cron.toLowerCase())) return false;
         return true;
@@ -1715,7 +1721,7 @@ docker compose up -d
           va = a.worker_name || (wa ? wa.name : (a.worker_id || "")); vb = b.worker_name || (wb ? wb.name : (b.worker_id || ""));
         }
         else if (key === "compose") { va = a.compose_project || ""; vb = b.compose_project || ""; }
-        else if (key === "mode") { va = a.backup_mode || ""; vb = b.backup_mode || ""; }
+        else if (key === "mode") { va = targetModeValue(a); vb = targetModeValue(b); }
         else if (key === "retention") {
           const ra = state.retentionPolicies.find(r => r.id === a.retention_policy_id);
           const rb = state.retentionPolicies.find(r => r.id === b.retention_policy_id);
@@ -1879,11 +1885,12 @@ docker compose up -d
           : schedulingDisabled
             ? "Target inactivo: cron deshabilitado; acciones manuales disponibles"
             : "";
+        const modeValue = targetModeValue(t);
         const targetRow = `<tr class="${executionBlocked ? "target-execution-blocked" : ""}" title="${escapeHtml(targetRowTitle)}">
            <td data-label="Nombre">${escapeHtml(t.name)}</td>
            <td data-label="Worker"><div class="target-worker-name">${escapeHtml(workerName)}</div>${fmtTargetWorkerState({ ...t, worker_status: workerStatus, blocked_reason: blockedReason })}</td>
            <td data-label="Compose project" class="mono target-compose-cell">${escapeHtml(t.compose_project || "—")}</td>
-           <td data-label="Modo">${escapeHtml(t.backup_mode)}</td>
+            <td data-label="Modo">${escapeHtml(modeValue || "—")}</td>
            <td data-label="Vol&uacute;menes" class="vol-targets-cell">${renderVolumeTargetsCell(t)}</td>
            <td data-label="Retenci&oacute;n">${escapeHtml(retention ? retention.name : "—")}</td>
            <td data-label="Cron" class="target-cron-cell">${cronLabel}</td>
@@ -4689,8 +4696,13 @@ docker compose up -d
       const overlay = state.overlay;
       const isNativeTarget = String(state.target.runtime_type || "docker").toLowerCase() === "native";
       const nativeRestoreDestination = isNativeTarget
-        ? `<fieldset class="restore-snapshot-group"><legend>Destino en el host</legend><div class="field"><label for="rsRestoreTargetPath">Ruta destino</label><input id="rsRestoreTargetPath" name="restore_target_path" autocomplete="off" spellcheck="false" translate="no" placeholder="/restore/app o C:\\Restore\\app" required /><div class="helper">Obligatorio para targets nativos. No se restaura sobre las rutas origen ni se remapea a /backup.</div></div></fieldset>`
+        ? `<fieldset class="restore-snapshot-group"><legend>Destino en el host</legend><div class="field"><label for="rsRestoreTargetPath">Ruta destino</label><input id="rsRestoreTargetPath" name="restore_target_path" autocomplete="off" spellcheck="false" translate="no" placeholder="/restore/app o C:\\Restore\\app" required /><div class="helper">Obligatorio para targets nativos. Puede coincidir con una ruta origen; el reemplazo exige confirmación explícita y la opción de reemplazar archivos existentes.</div></div></fieldset>`
         : "";
+      const restoreServiceControls = isNativeTarget ? "" : `
+               <fieldset class="restore-snapshot-group">
+                 <legend>Servicios durante la restauración</legend>
+                 <div class="field"><label for="rsMode">Qué hacer con los servicios</label><select id="rsMode" name="restore_mode" autocomplete="off"><option value="hot" selected>Mantener servicios activos</option><option value="cold">Detener servicios antes de restaurar</option></select><div class="helper">Puedes detener los servicios asociados para evitar escrituras durante la restauración, o mantenerlos activos si el entorno lo permite.</div></div>
+               </fieldset>`;
       const volumeCandidates = getRestoreOwnershipVolumeCandidates(state.target);
       const ownershipEditorId = volumeCandidates.length ? "rsOwnershipManual" : "rsOwnershipAdvanced";
       const mappingEditor = volumeCandidates.length
@@ -4732,10 +4744,7 @@ docker compose up -d
                 <legend>Archivos existentes</legend>
                 <div class="field"><label for="rsOverwrite">Durante la restauración</label><select id="rsOverwrite" name="restore_overwrite" autocomplete="off"><option value="false">Conservar archivos existentes</option><option value="true">Reemplazar archivos existentes</option></select><div class="helper">Reemplazar puede eliminar cambios hechos después del snapshot.</div></div>
               </fieldset>
-              <fieldset class="restore-snapshot-group">
-                <legend>Servicios durante la restauración</legend>
-                <div class="field"><label for="rsMode">Qué hacer con los servicios</label><select id="rsMode" name="restore_mode" autocomplete="off" ${isNativeTarget ? "disabled" : ""}><option value="hot" ${isNativeTarget ? "selected" : ""}>Mantener servicios activos</option><option value="cold">Detener servicios antes de restaurar</option></select><div class="helper">${isNativeTarget ? "Los restores nativos no detienen contenedores ni usan Kubernetes." : "Puedes detener los servicios asociados para evitar escrituras durante la restauración, o mantenerlos activos si el entorno lo permite."}</div></div>
-              </fieldset>
+              ${restoreServiceControls}
               <fieldset class="restore-snapshot-group restore-ownership-group">
                 <legend>Permisos de archivos</legend>
                 <label class="restore-choice" for="rsOwnershipPreserve"><input id="rsOwnershipPreserve" name="restore_ownership_mode" type="radio" value="preserve" checked aria-controls="${ownershipEditorId}" /><span><strong>Conservar permisos del backup</strong><small>Opción recomendada. Conserva los permisos disponibles cuando el formato y el sistema lo permiten; no copia automáticamente identidades del backup.</small></span></label>
@@ -4886,7 +4895,7 @@ docker compose up -d
          }
         policy.confirmation = "confirmed";
         const forceOverwrite = document.getElementById("rsOverwrite").value === "true";
-        const stopContainers = !isNativeTarget && document.getElementById("rsMode").value === "cold";
+         const stopContainers = !isNativeTarget && document.getElementById("rsMode")?.value === "cold";
         const restoreTargetPath = document.getElementById("rsRestoreTargetPath")?.value.trim();
         if (isNativeTarget && !restoreTargetPath) {
           setOwnershipStatus("blocked", "Escribe una ruta destino del host para restaurar este target nativo.");

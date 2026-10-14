@@ -60,6 +60,31 @@ class RestoreMetadataTests(unittest.TestCase):
         self.assertFalse(failed.success)
         self.assertEqual(failed.category, "restic_metadata_inspection_failed")
 
+    def test_adapter_decodes_metadata_as_utf8_with_replacement(self):
+        raw_output = (
+            (line(path="/data/ni\u00f1o") + "\n").encode("utf-8")
+            + line(path="/data/bad").encode("utf-8")
+            + b"\x81\n"
+        )
+        captured = {}
+
+        def runner(command, **kwargs):
+            captured.update(kwargs)
+            if kwargs.get("encoding") is None:
+                raw_output.decode("cp1252")
+            return SimpleNamespace(
+                returncode=0,
+                stdout=raw_output.decode(kwargs["encoding"], errors=kwargs["errors"]),
+                stderr="",
+            )
+
+        result = ResticMetadataInspectorAdapter(runner=runner).inspect("snap-1")
+
+        self.assertTrue(result.success)
+        self.assertEqual([item.path for item in result.files], ["/data/ni\u00f1o", "/data/bad\ufffd"])
+        self.assertEqual(captured["encoding"], "utf-8")
+        self.assertEqual(captured["errors"], "replace")
+
     def test_unconfirmed_mapping_fails_before_restic(self):
         runner = Mock()
         result = ResticMetadataInspectorAdapter(runner=runner).inspect(

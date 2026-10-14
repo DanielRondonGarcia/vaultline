@@ -100,7 +100,7 @@ class NativeRestoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit host restore destination"):
             service.dispatch_restore_for_target("native-target", restore_source="abcdef12")
 
-    def test_native_restore_accepts_windows_destination_and_rejects_source_overwrite_or_traversal(self):
+    def test_native_restore_allows_exact_source_path_and_rejects_invalid_or_nested_destination(self):
         service = self.make_service()
 
         job = service.dispatch_restore_for_target(
@@ -115,7 +115,18 @@ class NativeRestoreTests(unittest.TestCase):
         self.assertEqual(job.payload["environment"]["RESTORE_TARGET_PATH"], r"C:\\Restore\\native-target")
         self.assertEqual(job.payload["environment"]["RESTORE_FORCE_OVERWRITE"], "true")
 
-        for destination in ("relative/path", "../escape", "/srv/app", r"C:\\Data\\App\\child"):
+        for destination in ("/srv/app", r"c:\\data\\app"):
+            with self.subTest(destination=destination):
+                job = service.dispatch_restore_for_target(
+                    "native-target",
+                    restore_source="abcdef12",
+                    restore_target_path=destination,
+                    dry_run=False,
+                    force_overwrite=True,
+                )
+                self.assertEqual(job.payload["environment"]["RESTORE_TARGET_PATH"], destination)
+
+        for destination in ("relative/path", "../escape", "bad\x00path", r"C:\\Data\\App\\child"):
             with self.subTest(destination=destination), self.assertRaises(ValueError):
                 service.dispatch_restore_for_target(
                     "native-target",
@@ -125,7 +136,7 @@ class NativeRestoreTests(unittest.TestCase):
                     force_overwrite=True,
                 )
 
-    def test_native_restore_rejects_windows_source_overlap_case_insensitively(self):
+    def test_native_restore_rejects_windows_source_descendants_case_insensitively(self):
         service = self.make_service()
 
         for destination in (r"c:\\data\\app\\child", r"\\\\SERVER\\Share\\App\\child"):
@@ -154,7 +165,7 @@ class NativeRestoreTests(unittest.TestCase):
 
         self.assertEqual(job.payload["environment"]["RESTORE_TARGET_PATH"], "/srv/app/child")
 
-    def test_native_runtime_rejects_windows_source_overlap_case_insensitively(self):
+    def test_native_runtime_rejects_windows_source_descendants_case_insensitively(self):
         adapter = NativeRuntimeAdapter(python_executable=sys.executable)
         for source, destination in (
             (r"C:\\Data\\App", r"c:\\data\\app\\child"),
@@ -173,6 +184,16 @@ class NativeRestoreTests(unittest.TestCase):
                 self.assertFalse(result["success"])
                 self.assertIn("must not overwrite", result["error"])
                 popen.assert_not_called()
+
+    def test_native_runtime_allows_exact_source_path(self):
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable)
+
+        self.assertIsNone(
+            adapter._validate_native_restore_destination(
+                r"c:\\data\\app",
+                [r"C:\\Data\\App"],
+            )
+        )
 
     def test_native_runtime_keeps_linux_source_overlap_case_sensitive(self):
         adapter = NativeRuntimeAdapter(python_executable=sys.executable)

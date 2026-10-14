@@ -148,7 +148,7 @@ class NativeRuntimeAdapter(RuntimePort):
         target_flavor, target = cls._canonical_native_path(value)
         for source in source_paths:
             source_flavor, source_norm = cls._canonical_native_path(source)
-            if target_flavor == source_flavor and (target == source_norm or target.startswith(source_norm.rstrip("/") + "/")):
+            if target_flavor == source_flavor and target != source_norm and target.startswith(source_norm.rstrip("/") + "/"):
                 raise ValueError("native restore destination must not overwrite a configured source path")
 
     def _require_executable(self, executable: str) -> None:

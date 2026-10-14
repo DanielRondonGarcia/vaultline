@@ -29,7 +29,15 @@ class ResticMetadataInspectorAdapter(ResticMetadataInspectorPort):
             repository, password = _value(config, "restic_repository", "repository"), _value(config, "restic_password", "password")
             if repository is not None: env["RESTIC_REPOSITORY"] = str(repository)
             if password is not None: env["RESTIC_PASSWORD"] = str(password)
-            result = self.runner(["restic", "ls", "--long", snapshot], env=env, capture_output=True, text=True, check=False)
+            result = self.runner(
+                ["restic", "ls", "--long", snapshot],
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
             if getattr(result, "returncode", 1) != 0:
                 return ResticMetadataEvidence(snapshot=snapshot, category="restic_metadata_inspection_failed", detail="restic ls --long failed")
             return parse_restic_ls_long(result.stdout, snapshot=snapshot, creator=_value(config, "snapshot_creator", "creator"), policy=selected, max_output_bytes=self.max_output_bytes)

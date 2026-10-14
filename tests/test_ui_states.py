@@ -706,6 +706,33 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
         for marker in ("renderTargetLogDetailRow(t)", "positionTargetDropdown(trigger, menu)", "overflow-y: auto"):
             self.assertIn(marker, self.source if marker != "overflow-y: auto" else self.css)
 
+    def test_native_targets_do_not_display_or_match_a_backup_mode(self):
+        helper = re.search(r"function targetModeValue\(target\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(helper)
+        self.assertIn('return String(target && target.runtime_type || "docker").toLowerCase() === "native"', helper.group(0))
+        self.assertIn('targetModeValue(t).toLowerCase().includes(f.mode.toLowerCase())', self.source)
+        self.assertIn('const modeValue = targetModeValue(t);', self.source)
+        self.assertIn('${escapeHtml(modeValue || "—")}', self.source)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        result = subprocess.run(
+            [
+                "node",
+                "--input-type=commonjs",
+                "--eval",
+                helper.group(0)
+                + '\nprocess.stdout.write(JSON.stringify(['
+                  'targetModeValue({runtime_type:"native",backup_mode:"hot"}),'
+                  'targetModeValue({runtime_type:"docker",backup_mode:"hot"}),'
+                  'targetModeValue({backup_mode:"cold"})]));',
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ["", "hot", "cold"])
+
     def test_target_action_cell_keeps_table_layout_and_non_target_tables_keep_flex_actions(self):
         self.assertIsNone(re.search(r"(?m)^\.action-cell\s*\{\s*display:\s*flex;", self.css))
         self.assertIn(".targets-table td.action-cell { display: table-cell;", self.css)
@@ -1865,6 +1892,8 @@ class WorkerUiStateTests(unittest.TestCase):
         self.assertIn('spec.stable_key || spec.volume_key || ""', self.source)
         for marker in (
             'getRestoreOwnershipVolumeCandidates(state.target)',
+            'const restoreServiceControls = isNativeTarget ? "" : `',
+            '${restoreServiceControls}',
             'name="restore_overwrite"',
             'name="restore_mode"',
             'Conservar archivos existentes',
@@ -1893,6 +1922,7 @@ class WorkerUiStateTests(unittest.TestCase):
             'restore_ownership: policy',
             'policy.confirmation = "confirmed"',
             'force_overwrite: forceOverwrite',
+            'const stopContainers = !isNativeTarget && document.getElementById("rsMode")?.value === "cold";',
             'stop_containers: stopContainers',
             'if (policy.mode === "map" && values.length === 1) request.chown = values[0];',
             'Los volúmenes restaurados se detectaron automáticamente.',
@@ -1909,6 +1939,11 @@ class WorkerUiStateTests(unittest.TestCase):
             self.assertIn(marker, restore_source)
         self.assertIn('data-restore-mapping', restore_source)
         self.assertNotIn('class="restore-mapping-key"', restore_source)
+        self.assertNotIn('Los restores nativos no detienen contenedores ni usan Kubernetes.', restore_source)
+        self.assertNotIn('name="restore_mode" autocomplete="off" disabled', restore_source)
+        service_controls = re.search(r'const restoreServiceControls = isNativeTarget \? "" : `(.*?)`;', restore_source, re.S)
+        self.assertIsNotNone(service_controls)
+        self.assertIn('legend>Servicios durante la restauración</legend>', service_controls.group(1))
         manual = re.search(r'<div id="rsOwnershipManual".*?</div>`\n        :', restore_source, re.S)
         self.assertIsNotNone(manual)
         self.assertNotIn('<code', manual.group(0))

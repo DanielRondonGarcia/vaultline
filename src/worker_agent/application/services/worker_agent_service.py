@@ -14,6 +14,8 @@ from urllib.error import HTTPError
 from src.control_plane.domain.models import JobStatus
 from src.worker_agent.domain.models import WorkerAgentConfig, WorkerJobExecutionResult
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
+from src.worker_agent.infrastructure.adapters.native_runtime import NativeRuntimeAdapter
+from src.worker_agent.infrastructure.filesystem_size_estimator import estimate_filesystem_size_bounded
 from src.worker_agent.application.ports.runtime_port import RuntimePort
 from src.worker_agent.infrastructure.adapters.live_file_runtime import LiveAccessDeniedError, LiveFileRuntime, LiveFileSource, LiveRuntimeError
 from src.worker_agent.infrastructure.adapters.redis_cache import RedisSnapshotCache
@@ -470,6 +472,16 @@ class WorkerAgentService:
         operation = command.get("operation") if isinstance(command, dict) else None
         target_id = command.get("target_id") if isinstance(command, dict) else None
         try:
+            if isinstance(command, dict) and operation == "filesystem.size_estimate":
+                paths = command.get("filesystem_paths")
+                if (not isinstance(operation_id, str) or not operation_id or command.get("worker_id") != worker_id
+                        or not isinstance(self.runtime, NativeRuntimeAdapter) or not isinstance(paths, list)
+                        or not 0 < len(paths) <= 64
+                        or any(not isinstance(path, str) or len(path) > 4096 or not NativeRuntimeAdapter._is_absolute_native_path(path) for path in paths)):
+                    raise _LiveRequestFailure("invalid_request")
+                estimate = estimate_filesystem_size_bounded(paths)
+                self.control_plane_client.send_live_response(worker_id, operation_id, {"status": 200, **estimate})
+                return
             if (
                 not isinstance(command, dict)
                 or not isinstance(operation_id, str)

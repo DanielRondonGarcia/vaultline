@@ -190,7 +190,17 @@ class WorkerEnrollmentCLITests(unittest.TestCase):
                 code = cli.main(["enroll"])
 
             self.assertEqual(code, 0)
-            self.assertIn("Enrollment completed", output.getvalue())
+            self.assertEqual(
+                output.getvalue(),
+                "SUCCESS: Worker enrolled.\n"
+                "  Worker ID: worker-cli\n"
+                "  Control Plane settings: saved\n"
+                "  Credential: stored securely\n"
+                "\n"
+                "If installed as a service, it will pick up enrollment within the next poll "
+                "(default up to 30 seconds).\n"
+                "Check status: vaultline-worker service status\n",
+            )
             client_class.assert_called_once()
             self.assertEqual(calls[0][0], "bootstrap-token-value-1234567890")
             self.assertEqual(calls[0][3].attempt_id, calls[0][1])
@@ -261,6 +271,10 @@ class WorkerEnrollmentCLITests(unittest.TestCase):
             self.assertFalse(store.pending_path.exists())
             self.assertNotIn(token, snapshots[0])
             self.assertNotIn(token, out + err)
+            self.assertIn("SUCCESS: Worker enrolled.", out)
+            self.assertIn("Worker ID: worker-clean", out)
+            self.assertNotIn("http://control-plane.invalid", out)
+            self.assertNotIn("credentials.json", out)
             self.assertEqual(store.load().worker_id, "worker-clean")
 
     def test_reset_pending_is_explicit_and_does_not_prompt(self):

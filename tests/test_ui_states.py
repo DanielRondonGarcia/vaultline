@@ -150,17 +150,18 @@ class SnapshotExplorerUiStateTests(unittest.TestCase):
         self.assertIn("no elegible", edit_source)
         self.assertIn("Error guardando target", edit_source)
 
-    def test_target_path_storage_control_loads_edit_value_and_is_sent_on_create_and_update(self):
+    def test_target_path_storage_is_hidden_for_native_and_preserved_on_edit(self):
         targets = re.search(r"function renderTargets\(content\) \{.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(targets)
         targets_source = targets.group(0)
         for marker in (
+            'data-target-docker-only="true"',
             'id="targetPathStorage"',
             "Ruta remota del target (opcional)",
         ):
             self.assertIn(marker, targets_source)
         self.assertIn(
-            'path_storage: emptyToNull(document.getElementById("targetPathStorage").value)',
+            'path_storage: runtimeType === "native" ? null : emptyToNull(document.getElementById("targetPathStorage").value)',
             self.source,
         )
         edit = re.search(r"function openEditTargetModal\(target\) \{.*?\n    \}", self.source, re.S)
@@ -169,9 +170,23 @@ class SnapshotExplorerUiStateTests(unittest.TestCase):
         for marker in (
             'id="etPathStorage"',
             'value="${escapeHtml(target.path_storage || "")}"',
-            'path_storage: emptyToNull(document.getElementById("etPathStorage").value)',
+            'if (targetUpdate.runtime_type !== "native") targetUpdate.path_storage = emptyToNull(document.getElementById("etPathStorage").value)',
         ):
             self.assertIn(marker, edit_source)
+
+    def test_native_target_form_hides_mode_and_uses_accessible_path_editor(self):
+        self.assertIn('data-target-docker-only="mode"', self.source)
+        self.assertIn('data-target-docker-only="true"', self.source)
+        self.assertIn('data-path-editor="create"', self.source)
+        self.assertIn('data-path-editor="edit"', self.source)
+        self.assertIn('aria-live="polite"', self.source)
+        self.assertIn('remove.setAttribute("aria-label", `Quitar ruta ${path}`)', self.source)
+        self.assertIn('Agregar ruta', self.source)
+        self.assertIn('validateFilesystemPath', self.source)
+        self.assertIn('backup_mode: runtimeType === "native" ? "hot"', self.source)
+        self.assertIn('setRuntimeSections(editRuntimeSelect.value, overlay)', self.source)
+        self.assertNotIn('id="targetFilesystemPaths"', self.source)
+        self.assertNotIn('id="etFilesystemPaths"', self.source)
 
     def test_target_volume_selector_uses_source_candidates_and_sends_source_identity(self):
         for marker in (

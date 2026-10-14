@@ -26,6 +26,40 @@
 .btn.sm { height: 30px; padding: 0 calc(var(--spacing) * 3); font-size: 12px; }
 .btn.full { width: 100%; }
 
+.filesystem-path-entry {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: end;
+  gap: calc(var(--spacing) * 2);
+  margin-top: calc(var(--spacing) * 2);
+}
+.filesystem-path-list {
+  display: grid;
+  gap: calc(var(--spacing) * 2);
+  margin: calc(var(--spacing) * 3) 0 0;
+  padding: 0;
+  list-style: none;
+}
+.filesystem-path-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: calc(var(--spacing) * 3);
+  min-width: 0;
+  padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+.filesystem-path-list li span { min-width: 0; overflow-wrap: anywhere; font-family: var(--font-mono); }
+.filesystem-path-editor input:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+
+@media (max-width: 600px) {
+  .filesystem-path-entry { grid-template-columns: minmax(0, 1fr); }
+  .filesystem-path-entry .btn { width: 100%; }
+  .filesystem-path-list li { align-items: flex-start; }
+}
+
 .card {
   display: flex;
   flex-direction: column;

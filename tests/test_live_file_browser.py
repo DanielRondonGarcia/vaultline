@@ -296,13 +296,13 @@ class LiveMountDescriptorTests(unittest.TestCase):
 
 class _HarnessAuth:
     def parse_session_token(self, token):
-        if token in {"browser-a", "browser-b"}:
-            return {"username": token, "role": "viewer"}
+        if token in {"browser-a", "browser-b", "browser-admin"}:
+            return {"username": token, "role": "admin" if token == "browser-admin" else "viewer"}
         return None
 
     @staticmethod
     def can_access(role, required_role):
-        return role == "viewer" and required_role == "viewer"
+        return (role == "viewer" and required_role == "viewer") or role == "admin"
 
 
 class _MemoryCredentialStore:
@@ -557,6 +557,18 @@ class _LiveHttpHarness:
         status, headers, body = self.request(path, token)
         return status, headers, json.loads(body.decode("utf-8"))
 
+    def post_json(self, path, payload, token="browser-admin"):
+        headers = {"Cookie": f"cp_session={token}", "Content-Type": "application/json"}
+        request = Request(self.base_url + path, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+        try:
+            with urlopen(request, timeout=3) as response:
+                return response.status, json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            try:
+                return error.code, json.loads(error.read().decode("utf-8"))
+            finally:
+                error.close()
+
     def live_url(self, operation, query=""):
         return f"/api/v1/targets/{quote(self.target.id, safe='')}/live/{operation}{query}"
 
@@ -588,6 +600,37 @@ class _LiveHttpHarness:
 
 
 class LiveTargetAcceptanceTests(unittest.TestCase):
+    def test_filesystem_size_estimate_is_admin_only_ephemeral_and_secret_free(self):
+        harness = _LiveHttpHarness()
+        try:
+            worker = harness.service.worker_repository.get("worker-a")
+            worker.labels = {"runtime_type": "native"}
+            harness.service.worker_repository.save(worker)
+            harness.worker.stop()
+            status, unauthenticated = harness.post_json("/api/v1/filesystem-size-estimates", {
+                "worker_id": "worker-a", "filesystem_paths": [harness.root],
+            }, token="browser-a")
+            self.assertEqual((status, unauthenticated.get("error")), (403, "forbidden"))
+
+            status, submitted = harness.post_json("/api/v1/filesystem-size-estimates", {
+                "worker_id": "worker-a", "filesystem_paths": [harness.root],
+            })
+            self.assertEqual(status, 202)
+            operation_id = submitted["operation_id"]
+            request = harness.lane.poll("worker-a")[0]
+            self.assertEqual(request["operation"], "filesystem.size_estimate")
+            self.assertEqual(set(request) - {"operation_id"}, {"operation", "worker_id", "filesystem_paths"})
+            self.assertNotIn("storage_profile", request)
+            pending_status, _, pending = harness.json_request(f"/api/v1/filesystem-size-estimates/{operation_id}", "browser-admin")
+            self.assertEqual((pending_status, pending), (200, {"status": "pending"}))
+            harness.lane.respond("worker-a", operation_id, {"status": 200, "complete": True, "logical_bytes": 17, "file_count": 3, "directory_count": 1, "symlinks_skipped": 0})
+            complete_status, _, complete = harness.json_request(f"/api/v1/filesystem-size-estimates/{operation_id}", "browser-admin")
+            self.assertEqual((complete_status, complete["status"], complete["result"]["logical_bytes"]), (200, "complete", 17))
+            self.assertEqual(harness.service.job_repository.list(), [])
+            self.assertEqual(len(harness.service.target_repository.list()), 1)
+        finally:
+            harness.close()
+
     def test_service_enforces_shared_cursors_quotas_cancellation_invalidation_and_resync(self):
         service = LiveFileService(
             cursor_secret="c" * 32,

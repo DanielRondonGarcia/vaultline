@@ -1470,12 +1470,12 @@ docker compose up -d
              <div class="form-grid">
                <div class="field"><label for="targetName">Nombre</label><input id="targetName" required /></div>
                 <div class="field"><label for="targetWorkerId">Worker</label><select id="targetWorkerId" ${eligibleWorkers.length ? "" : "disabled"}>${workerOptions}</select></div>
-                <div class="field"><label for="targetRuntimeType">Runtime</label><select id="targetRuntimeType"><option value="docker">Docker / Compose</option><option value="native">Native filesystem worker</option></select><div class="helper">Native targets use explicit local paths reported to the assigned worker.</div></div>
+                <div class="field"><label for="targetRuntimeType">Runtime</label><select id="targetRuntimeType"><option value="docker">Docker / Compose</option><option value="native">Filesystem (worker nativo)</option></select></div>
                 <div class="field" data-runtime-section="docker"><label for="targetComposeProject">Compose project</label><select id="targetComposeProject" ${eligibleWorkers.length ? "" : "disabled"}><option value="">-- Seleccionar worker --</option></select></div>
-               <div class="field"><label for="targetBackupMode">Modo</label><select id="targetBackupMode"><option value="hot">hot</option><option value="cold">cold</option></select></div>
+                <div class="field" data-target-docker-only="mode"><label for="targetBackupMode">Modo</label><select id="targetBackupMode"><option value="hot">hot</option><option value="cold">cold</option></select></div>
                 <div class="field"><label for="targetBackupStrategy">Estrategia</label><select id="targetBackupStrategy"><option value="restic">restic</option><option value="tar">tar</option></select></div>
                 <div class="field"><label for="targetStorageProfileId">Storage profile</label><select id="targetStorageProfileId">${storageOptions}</select></div>
-                <div class="field"><label for="targetPathStorage">Ruta remota del target (opcional)</label><input id="targetPathStorage" placeholder="clientes/mi-target" /><div class="helper">Subruta POSIX relativa del repositorio restic. Si se configura, reemplaza el sufijo automatico del target; no aplica a tar ni a RCLONE_REMOTE.</div></div>
+                <div class="field" data-target-docker-only="true"><label for="targetPathStorage">Ruta remota del target (opcional)</label><input id="targetPathStorage" placeholder="clientes/mi-target" /><div class="helper">Subruta POSIX relativa del repositorio restic. Si se configura, reemplaza el sufijo automatico del target; no aplica a tar ni a RCLONE_REMOTE.</div></div>
                 <div class="field"><label for="targetRetentionPolicyId">Retencion</label><select id="targetRetentionPolicyId">${retentionOptions}</select></div>
                <div class="field"><label for="targetCronExpression">Cron (opcional)</label><input id="targetCronExpression" placeholder="0 3 * * * (diario 3am)" /><div class="helper">Expresion cron de 5 campos. Vacio = usa el cron global; si tampoco existe, solo manual. Ej: <code>0 3 * * *</code> (diario 3am), <code>0 */6 * * *</code> (cada 6h).</div><div id="targetCronPreview" class="cron-preview"></div></div>
                ${hasDefaultPassword ? "" : `<div class="field"><label for="targetResticPasswordSecret">Password restic (secret) *</label><select id="targetResticPasswordSecret"><option value="">-- Seleccionar --</option>${passwordSecretOptions}</select><div class="helper">Obligatorio: no hay password default en Settings.</div></div>`}
@@ -1484,10 +1484,16 @@ docker compose up -d
                <label>Volumenes a backupear</label>
                <div id="targetVolumeList" class="volume-list"><div class="helper">Selecciona un compose project para ver los volumenes disponibles.</div></div>
              </div>
-             <div class="field full" data-runtime-section="native" style="display:none;">
-               <label for="targetFilesystemPaths">Filesystem paths</label>
-               <textarea id="targetFilesystemPaths" placeholder="/home/alice/Documents&#10;C:\\Users\\Alice\\My Documents"></textarea>
-               <div class="helper">Ingresa una ruta explicita por linea. No se explora recursivamente el filesystem remoto desde el Control Plane.</div>
+              <div class="field full filesystem-path-editor" data-runtime-section="native" data-path-editor="create" style="display:none;">
+                <label for="targetFilesystemPathInput">Rutas del worker</label>
+                <div class="helper">Agrega rutas absolutas que existan en el worker seleccionado. No hay navegación remota desde el Control Plane. Ejemplos: Linux <code>/home/alice/Documents</code>; Windows <code>C:\\Users\\Alice</code> o <code>\\\\server\\share\\folder</code>.</div>
+                <div class="filesystem-path-entry"><input id="targetFilesystemPathInput" aria-describedby="targetFilesystemPathError targetFilesystemPathCount" placeholder="/srv/data" /><button type="button" class="btn secondary sm" data-path-add="target">Agregar ruta</button></div>
+                <div id="targetFilesystemPathError" class="form-error" role="alert" style="display:none;"></div>
+                 <ul id="targetFilesystemPathList" class="filesystem-path-list"></ul>
+                 <div id="targetFilesystemPathCount" class="helper" aria-live="polite">0 rutas agregadas</div>
+                 <button type="button" class="btn secondary sm" id="targetEstimateSize" disabled>Calcular tamaño bruto</button>
+                 <div id="targetEstimateStatus" class="helper" role="status" aria-live="polite"></div>
+                 <div class="helper">Suma tamaños lógicos de archivos; no estima deduplicación, compresión ni el tamaño final del repositorio. No se leen contenidos ni se crea un backup.</div>
              </div>
              <div id="targetProjectSummary" class="helper" data-runtime-section="docker">Selecciona un worker para ver sus compose projects y volumenes detectados.</div>
              <details class="sub-section">
@@ -4893,11 +4899,11 @@ docker compose up -d
                    <div class="form-grid">
                 <div class="field"><label for="etName">Nombre</label><input id="etName" value="${escapeHtml(target.name)}" required /></div>
                 <div class="field"><label for="etWorkerId">Worker</label><select id="etWorkerId" ${eligibleWorkers.length || currentWorkerEligible ? "" : "disabled"}>${workerOptions || '<option value="">-- No hay workers online --</option>'}</select>${workerWarning}<div class="helper">Cambiar el worker solo reasigna el target; no copia volumenes ni inventario entre workers.</div></div>
-                <div class="field"><label for="etRuntimeType">Runtime</label><select id="etRuntimeType"><option value="docker" ${(!target.runtime_type || target.runtime_type === "docker") ? "selected" : ""}>Docker / Compose</option><option value="kubernetes" ${target.runtime_type === "kubernetes" ? "selected" : ""}>Kubernetes</option><option value="native" ${target.runtime_type === "native" ? "selected" : ""}>Native filesystem worker</option></select></div>
-                <div class="field"><label for="etBackupMode">Modo</label><select id="etBackupMode"><option value="hot" ${target.backup_mode === "hot" ? "selected" : ""}>hot</option><option value="cold" ${target.backup_mode === "cold" ? "selected" : ""}>cold</option></select></div>
+                 <div class="field"><label for="etRuntimeType">Runtime</label><select id="etRuntimeType"><option value="docker" ${(!target.runtime_type || target.runtime_type === "docker") ? "selected" : ""}>Docker / Compose</option><option value="kubernetes" ${target.runtime_type === "kubernetes" ? "selected" : ""}>Kubernetes</option><option value="native" ${target.runtime_type === "native" ? "selected" : ""}>Filesystem (worker nativo)</option></select></div>
+                 <div class="field" data-target-docker-only="mode"><label for="etBackupMode">Modo</label><select id="etBackupMode"><option value="hot" ${target.backup_mode === "hot" ? "selected" : ""}>hot</option><option value="cold" ${target.backup_mode === "cold" ? "selected" : ""}>cold</option></select></div>
                  <div class="field"><label for="etBackupStrategy">Estrategia</label><select id="etBackupStrategy"><option value="restic" ${target.backup_strategy === "restic" ? "selected" : ""}>restic</option><option value="tar" ${target.backup_strategy === "tar" ? "selected" : ""}>tar</option></select></div>
                  <div class="field"><label for="etStorageProfileId">Storage profile</label><select id="etStorageProfileId"><option value="">-- Ninguno --</option>${storageOptions}</select></div>
-                 <div class="field"><label for="etPathStorage">Ruta remota del target (opcional)</label><input id="etPathStorage" value="${escapeHtml(target.path_storage || "")}" placeholder="clientes/mi-target" /><div class="helper">Subruta POSIX relativa del repositorio restic. Reemplaza el sufijo automatico del target y no cambia la configuracion del storage profile.</div></div>
+                  <div class="field" data-target-docker-only="true"><label for="etPathStorage">Ruta remota del target (opcional)</label><input id="etPathStorage" value="${escapeHtml(target.path_storage || "")}" placeholder="clientes/mi-target" /><div class="helper">Subruta POSIX relativa del repositorio restic. Reemplaza el sufijo automatico del target y no cambia la configuracion del storage profile.</div></div>
                  <div class="field"><label for="etRetentionPolicyId">Retencion</label><select id="etRetentionPolicyId"><option value="">-- Ninguna --</option>${retentionOptions}</select></div>
                <div class="field"><label for="etCronExpression">Cron (opcional)</label><input id="etCronExpression" value="${escapeHtml(target.cron_expression || "")}" placeholder="0 3 * * * (diario 3am)" /><div class="helper">Expresion propia del target. Vacio = usa el cron global; si tampoco existe, solo manual.</div><div id="etCronPreview" class="cron-preview"></div></div>
                <div class="field"><label for="etResticPasswordSecret">Password restic (secret)</label><select id="etResticPasswordSecret"><option value="">-- Usar default de Settings --</option>${state.secrets.map(s => `<option value="${escapeHtml(s.id)}" ${s.id === target.restic_password_secret_id ? "selected" : ""}>${escapeHtml(s.name)}</option>`).join("")}</select></div>
@@ -4909,10 +4915,16 @@ docker compose up -d
                  <div id="editTargetVolumeStatus" class="helper" role="status" aria-live="polite">Cargando inventario del worker…</div>
                  <div id="editTargetVolumeList" class="volume-list" role="group" aria-labelledby="editTargetVolumeLabel" aria-describedby="editTargetVolumeStatus"><div class="helper">Cargando volúmenes disponibles…</div></div>
                  </section>
-                 <section class="edit-target-volume-panel" data-runtime-section="native" aria-labelledby="editTargetFilesystemPathsLabel">
+                  <section class="edit-target-volume-panel filesystem-path-editor" data-runtime-section="native" data-path-editor="edit" aria-labelledby="editTargetFilesystemPathsLabel">
                  <div class="volume-selector-heading"><span id="editTargetFilesystemPathsLabel" class="field-label">Filesystem paths</span></div>
-                 <textarea id="etFilesystemPaths" placeholder="/home/alice/Documents&#10;C:\\Users\\Alice\\My Documents">${escapeHtml((target.filesystem_paths || []).join("\n"))}</textarea>
-                 <div class="helper">Una ruta explicita por linea; el Control Plane no navega el filesystem remoto.</div>
+                  <div class="helper">Agrega rutas absolutas del worker seleccionado. No hay navegación remota desde el Control Plane. Ejemplos: Linux <code>/home/alice/Documents</code>; Windows <code>C:\\Users\\Alice</code> o <code>\\\\server\\share\\folder</code>.</div>
+                  <div class="filesystem-path-entry"><input id="etFilesystemPathInput" aria-describedby="etFilesystemPathError etFilesystemPathCount" placeholder="/srv/data" /><button type="button" class="btn secondary sm" data-path-add="et">Agregar ruta</button></div>
+                  <div id="etFilesystemPathError" class="form-error" role="alert" style="display:none;"></div>
+                   <ul id="etFilesystemPathList" class="filesystem-path-list"></ul>
+                   <div id="etFilesystemPathCount" class="helper" aria-live="polite">0 rutas agregadas</div>
+                   <button type="button" class="btn secondary sm" id="etEstimateSize" disabled>Calcular tamaño bruto</button>
+                   <div id="etEstimateStatus" class="helper" role="status" aria-live="polite"></div>
+                   <div class="helper">Suma tamaños lógicos de archivos; no estima deduplicación, compresión ni el tamaño final del repositorio. No se leen contenidos ni se crea un backup.</div>
                  </section>
                </div>
                <details class="sub-section edit-target-advanced">
@@ -4940,6 +4952,9 @@ docker compose up -d
       const editRuntimeSelect = document.getElementById("etRuntimeType");
       const editSubmit = document.getElementById("etSubmit");
       const editError = document.getElementById("etError");
+       let editEstimateUpdate = () => {};
+       const editFilesystemPaths = bindFilesystemPathEditor("et", target.filesystem_paths || [], () => editEstimateUpdate());
+       editEstimateUpdate = bindFilesystemSizeEstimate("et", editFilesystemPaths, editWorkerSelect);
       const editVolumeState = { stacks: {}, expanded: {} };
       let editVolumeSelectionReady = false;
       let editVolumeRequestId = 0;
@@ -5038,7 +5053,7 @@ docker compose up -d
               name: document.getElementById("etName").value.trim(),
               worker_id: document.getElementById("etWorkerId").value,
               runtime_type: document.getElementById("etRuntimeType").value,
-              filesystem_paths: document.getElementById("etRuntimeType").value === "native" ? parseFilesystemPathsField("etFilesystemPaths") : [],
+              filesystem_paths: document.getElementById("etRuntimeType").value === "native" ? editFilesystemPaths.getPaths() : [],
               namespace: target.runtime_type === "kubernetes" ? target.namespace : undefined,
               pvc_names: target.runtime_type === "kubernetes" ? (target.pvc_names || []) : undefined,
               backup_mode: document.getElementById("etRuntimeType").value === "native" ? "hot" : document.getElementById("etBackupMode").value,
@@ -5046,15 +5061,18 @@ docker compose up -d
                runtime_command: emptyToNull(document.getElementById("etRuntimeCommand").value),
                runtime_environment: parseJsonField("etRuntimeEnvironment", "runtime environment"),
                storage_profile_id: emptyToNull(document.getElementById("etStorageProfileId").value),
-               path_storage: emptyToNull(document.getElementById("etPathStorage").value),
                retention_policy_id: emptyToNull(document.getElementById("etRetentionPolicyId").value),
               restic_password_secret_id: emptyToNull(document.getElementById("etResticPasswordSecret").value),
               restore_defaults: parseJsonField("etRestoreDefaults", "restore defaults"),
               cron_expression: emptyToNull(document.getElementById("etCronExpression").value),
             };
             if (targetUpdate.runtime_type === "native" && !targetUpdate.filesystem_paths.length) {
-              throw new Error("Debes ingresar al menos una ruta filesystem explicita para un target native.");
+              document.getElementById("etFilesystemPathError").textContent = "Agrega al menos una ruta absoluta del worker.";
+              document.getElementById("etFilesystemPathError").style.display = "block";
+              document.getElementById("etFilesystemPathInput").focus();
+              return;
             }
+            if (targetUpdate.runtime_type !== "native") targetUpdate.path_storage = emptyToNull(document.getElementById("etPathStorage").value);
             if (targetUpdate.runtime_type !== "native" && editVolumeSelectionReady) {
               targetUpdate.volume_sources = getSelectedVolumeSourcesFor("editTargetVolumeList");
             }
@@ -5764,14 +5782,126 @@ docker compose up -d
       return new Set(candidates.map(volumeCandidateKey));
     }
 
-    function parseFilesystemPathsField(fieldId) {
-      const value = document.getElementById(fieldId)?.value || "";
-      return value.split(/\r?\n/).map(item => item.trim()).filter(Boolean);
-    }
-
     function setRuntimeSections(runtimeType, root = document) {
       root.querySelectorAll('[data-runtime-section="docker"]').forEach(el => { el.style.display = runtimeType === "docker" ? "" : "none"; });
       root.querySelectorAll('[data-runtime-section="native"]').forEach(el => { el.style.display = runtimeType === "native" ? "" : "none"; });
+      root.querySelectorAll('[data-target-docker-only]').forEach(el => { el.style.display = runtimeType === "native" ? "none" : ""; });
+    }
+
+    function validateFilesystemPath(path) {
+      return path.startsWith("/") ? !path.startsWith("//")
+        : /^[A-Za-z]:\\[^\\]/.test(path) || (path.startsWith("\\\\") && path.split("\\").filter(Boolean).length >= 3);
+    }
+
+    function bindFilesystemPathEditor(prefix, initialPaths = [], onChange = () => {}) {
+      const input = document.getElementById(`${prefix}FilesystemPathInput`);
+      const list = document.getElementById(`${prefix}FilesystemPathList`);
+      const error = document.getElementById(`${prefix}FilesystemPathError`);
+      const count = document.getElementById(`${prefix}FilesystemPathCount`);
+      const paths = [...new Set(initialPaths)];
+      const render = () => {
+        list.replaceChildren();
+        paths.forEach((path, index) => {
+          const item = document.createElement("li");
+          const text = document.createElement("span");
+          text.textContent = path;
+          const remove = document.createElement("button");
+          remove.type = "button";
+          remove.className = "btn ghost sm";
+          remove.textContent = "Quitar";
+          remove.setAttribute("aria-label", `Quitar ruta ${path}`);
+           remove.addEventListener("click", () => { paths.splice(index, 1); render(); onChange(); });
+          item.append(text, remove);
+          list.append(item);
+        });
+        count.textContent = `${paths.length} ${paths.length === 1 ? "ruta agregada" : "rutas agregadas"}`;
+      };
+      const add = () => {
+        const path = input.value.trim();
+        error.style.display = "none";
+        if (!validateFilesystemPath(path)) {
+          error.textContent = "Ingresa una ruta absoluta válida de Linux, Windows o UNC.";
+          error.style.display = "block";
+          input.focus();
+          return;
+        }
+        if (!paths.includes(path)) paths.push(path);
+        input.value = "";
+        render();
+        onChange();
+        input.focus();
+      };
+      document.querySelector(`[data-path-add="${prefix === "et" ? "et" : "target"}"]`).addEventListener("click", add);
+      input.addEventListener("keydown", event => { if (event.key === "Enter") { event.preventDefault(); add(); } });
+      input.addEventListener("input", () => { error.style.display = "none"; });
+      render();
+      return { getPaths: () => [...paths] };
+    }
+
+    function bindFilesystemSizeEstimate(prefix, pathEditor, workerSelect) {
+      const button = document.getElementById(`${prefix}EstimateSize`);
+      const status = document.getElementById(`${prefix}EstimateStatus`);
+      let generation = 0;
+      let running = false;
+      const update = () => {
+        generation += 1;
+        running = false;
+        if (!running && button) button.disabled = !workerSelect.value || !pathEditor.getPaths().length;
+        if (status && !running) status.textContent = "";
+      };
+      workerSelect.addEventListener("change", update);
+      button.addEventListener("click", async () => {
+        if (running) return;
+        const requestGeneration = ++generation;
+        const paths = pathEditor.getPaths();
+        const workerId = workerSelect.value;
+        if (!workerId || !paths.length) return;
+        running = true;
+        button.disabled = true;
+        status.textContent = "Analizando rutas…";
+        try {
+          const submitted = await apiPost("/api/v1/filesystem-size-estimates", { worker_id: workerId, filesystem_paths: paths });
+          const deadline = Date.now() + 90000;
+          let completed = false;
+          while (Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            const response = await apiGet(`/api/v1/filesystem-size-estimates/${encodeURIComponent(submitted.operation_id)}`);
+            if (requestGeneration !== generation) return;
+            if (response.status === "expired") throw new Error("La solicitud venció; vuelve a intentarlo.");
+            if (response.status !== "complete") continue;
+            const result = response.result || {};
+            if (result.status && result.status !== 200) {
+              const failure = new Error("El worker rechazó la solicitud; verifica que sea un worker nativo online.");
+              failure.status = result.status;
+              throw failure;
+            }
+            const bytes = new Intl.NumberFormat("es-CO").format(Number(result.logical_bytes || 0));
+            const details = `${bytes} bytes (${formatJobBytes(result.logical_bytes) || "0 B"}) · ${result.file_count || 0} archivos · ${result.directory_count || 0} directorios · ${result.symlinks_skipped || 0} enlaces simbólicos omitidos`;
+            status.textContent = result.complete ? details : `${details}. Resultado parcial: algunas rutas son inaccesibles o se alcanzó el límite de análisis.`;
+            completed = true;
+            break;
+          }
+          if (!completed && requestGeneration === generation) throw new Error("El análisis superó el tiempo de espera. Comprueba que el worker siga online y vuelve a intentarlo.");
+        } catch (error) {
+          if (requestGeneration === generation) {
+            const message = error.status === 403
+              ? "El usuario del worker no tiene permisos para leer algunas rutas."
+              : error.status === 409
+                ? "El worker está offline o no admite el runtime nativo."
+                : error.status === 404
+                  ? "La solicitud venció; vuelve a intentarlo."
+                  : `No se pudo calcular el tamaño: ${error.message}`;
+            status.textContent = message;
+          }
+        } finally {
+          if (requestGeneration === generation) {
+            running = false;
+            button.disabled = !workerSelect.value || !pathEditor.getPaths().length;
+          }
+        }
+      });
+      update();
+      return update;
     }
 
     function updateTargetBackupModeForRuntime(runtimeType, selectId) {
@@ -5789,6 +5919,9 @@ docker compose up -d
     function bindTargetForm() {
       const form = document.getElementById("createTargetForm");
       if (!form) return;
+       let estimateUpdate = () => {};
+       const filesystemPathsEditor = bindFilesystemPathEditor("target", [], () => estimateUpdate());
+       estimateUpdate = bindFilesystemSizeEstimate("target", filesystemPathsEditor, document.getElementById("targetWorkerId"));
       form.addEventListener("submit", async (e) => {
         e.preventDefault();
         const submitBtn = document.getElementById("createTargetSubmitBtn");
@@ -5798,10 +5931,13 @@ docker compose up -d
            const selectedSources = runtimeType === "native" ? [] : getSelectedVolumeSources();
            const volumeList = document.getElementById("targetVolumeList");
            const hasExplicitVolumeSources = runtimeType !== "native" && volumeList?.dataset.volumeSourceSelection === "true";
-           const filesystemPaths = runtimeType === "native" ? parseFilesystemPathsField("targetFilesystemPaths") : [];
-           if (runtimeType === "native" && !filesystemPaths.length) {
-             alert("Debes ingresar al menos una ruta filesystem explicita para un target native.");
-             return;
+            const filesystemPaths = runtimeType === "native" ? filesystemPathsEditor.getPaths() : [];
+            if (runtimeType === "native" && !filesystemPaths.length) {
+              const error = document.getElementById("targetFilesystemPathError");
+              error.textContent = "Agrega al menos una ruta absoluta del worker.";
+              error.style.display = "block";
+              document.getElementById("targetFilesystemPathInput").focus();
+              return;
            }
            const backupStrategy = document.getElementById("targetBackupStrategy").value;
           const resticPasswordSecret = emptyToNull(document.getElementById("targetResticPasswordSecret")?.value || "");
@@ -5818,12 +5954,12 @@ docker compose up -d
              volume_targets: selectedVols.length ? selectedVols : null,
              volume_sources: hasExplicitVolumeSources ? selectedSources : null,
              filesystem_paths: runtimeType === "native" ? filesystemPaths : [],
-             backup_mode: document.getElementById("targetBackupMode").value,
+              backup_mode: runtimeType === "native" ? "hot" : document.getElementById("targetBackupMode").value,
             backup_strategy: backupStrategy,
              runtime_command: emptyToNull(document.getElementById("targetRuntimeCommand").value),
              runtime_environment: parseJsonField("targetRuntimeEnvironment", "runtime environment del target"),
              storage_profile_id: emptyToNull(document.getElementById("targetStorageProfileId").value),
-             path_storage: emptyToNull(document.getElementById("targetPathStorage").value),
+              path_storage: runtimeType === "native" ? null : emptyToNull(document.getElementById("targetPathStorage").value),
              retention_policy_id: emptyToNull(document.getElementById("targetRetentionPolicyId").value),
             restic_password_secret_id: resticPasswordSecret,
             restore_defaults: parseJsonField("targetRestoreDefaults", "restore defaults del target"),

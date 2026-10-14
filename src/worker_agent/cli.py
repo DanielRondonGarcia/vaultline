@@ -225,8 +225,14 @@ def _enroll(args: argparse.Namespace) -> int:
         _enrollment_config_payload(control_plane_url, ca_file, worker_name),
     )
     print(
-        "Enrollment completed. Durable worker credentials and the Control Plane connection settings "
-        "were stored for daemon use."
+        "SUCCESS: Worker enrolled.\n"
+        f"  Worker ID: {response['worker_id']}\n"
+        "  Control Plane settings: saved\n"
+        "  Credential: stored securely\n"
+        "\n"
+        "If installed as a service, it will pick up enrollment within the next poll "
+        "(default up to 30 seconds).\n"
+        "Check status: vaultline-worker service status"
     )
     return 0
 
@@ -399,6 +405,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if arguments == ["backup-engine"]:
         return _backup_engine(argparse.Namespace(command="backup-engine"))
+    if arguments == ["__filesystem-size-worker"]:
+        return _filesystem_size_worker()
     parser = build_parser()
     if not arguments:
         parser.print_help()
@@ -431,6 +439,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             print("error: worker state could not be saved; rerun from an elevated PowerShell (Run as administrator) or as root.", file=sys.stderr)
         else:
             print("error: worker state could not be saved; check filesystem permissions and retry.", file=sys.stderr)
+        return 1
+
+
+def _filesystem_size_worker() -> int:
+    from src.worker_agent.infrastructure.filesystem_size_estimator import (
+        MAX_WORKER_INPUT_BYTES,
+        MAX_WORKER_OUTPUT_BYTES,
+        _valid_paths,
+        scan_filesystem_size,
+    )
+
+    try:
+        raw = sys.stdin.buffer.read(MAX_WORKER_INPUT_BYTES + 1)
+        if len(raw) > MAX_WORKER_INPUT_BYTES:
+            return 2
+        payload = json.loads(raw)
+        paths = payload.get("paths") if isinstance(payload, dict) else None
+        if not _valid_paths(paths):
+            return 2
+        result = scan_filesystem_size(paths)
+        output = json.dumps(result, ensure_ascii=True, separators=(",", ":"))
+        if len(output.encode("utf-8")) > MAX_WORKER_OUTPUT_BYTES:
+            return 1
+        sys.stdout.write(output)
+        return 0
+    except Exception:
         return 1
 
 

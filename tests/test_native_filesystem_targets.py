@@ -164,10 +164,23 @@ class NativeFilesystemTargetTests(unittest.TestCase):
             html = handle.read()
 
         self.assertIn('id="targetRuntimeType"', html)
-        self.assertIn('id="targetFilesystemPaths"', html)
+        self.assertIn('data-path-editor="create"', html)
+        self.assertIn('data-path-editor="edit"', html)
+        self.assertIn('id="targetEstimateSize"', html)
+        self.assertIn('id="etEstimateSize"', html)
+        self.assertIn('filesystem-size-estimates', html)
+        self.assertIn("Analizando rutas…", html)
+        self.assertIn("Intl.NumberFormat", html)
+        self.assertIn("result.file_count", html)
+        self.assertIn("result.directory_count", html)
+        self.assertIn("result.symlinks_skipped", html)
+        self.assertIn("No se leen contenidos ni se crea un backup.", html)
+        self.assertIn("/home/alice/Documents", html)
+        self.assertIn("C:\\\\Users\\\\Alice", html)
+        self.assertIn("No hay navegación remota", html)
         self.assertIn('data-runtime-section="docker"', html)
         self.assertIn('targetBackupMode.value = "hot"', html)
-        self.assertNotIn("recursive filesystem browser", html.lower())
+        self.assertNotIn('id="targetFilesystemPaths"', html)
 
     def test_ui_edit_preserves_existing_kubernetes_runtime_without_silent_docker_conversion(self):
         with open("src/control_plane/ui/index.html", "r", encoding="utf-8") as handle:

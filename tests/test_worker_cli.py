@@ -76,6 +76,28 @@ class WorkerNativeCLITests(unittest.TestCase):
         self.assertIn("self-check", help_text)
         self.assertNotIn("backup-engine", help_text)
 
+    def test_filesystem_size_worker_command_is_hidden_and_reads_bounded_json(self):
+        from src.worker_agent import cli
+
+        stdout = io.StringIO()
+        stdin = io.TextIOWrapper(io.BytesIO(b'{"paths":["/tmp"]}'), encoding="utf-8")
+        result = {"complete": True, "logical_bytes": 0, "file_count": 0, "directory_count": 0,
+                  "symlinks_skipped": 0, "roots": []}
+        with patch("src.worker_agent.cli.sys.stdin", stdin), patch("src.worker_agent.cli.sys.stdout", stdout), patch(
+            "src.worker_agent.infrastructure.filesystem_size_estimator.scan_filesystem_size", return_value=result
+        ) as scan:
+            self.assertEqual(cli.main(["__filesystem-size-worker"]), 0)
+        self.assertEqual(json.loads(stdout.getvalue()), result)
+        scan.assert_called_once_with(["/tmp"])
+        self.assertNotIn("__filesystem-size-worker", cli.build_parser().format_help())
+
+    def test_filesystem_size_worker_rejects_invalid_json_payload(self):
+        from src.worker_agent import cli
+
+        stdin = io.TextIOWrapper(io.BytesIO(b'{"paths":[]}'), encoding="utf-8")
+        with patch("src.worker_agent.cli.sys.stdin", stdin):
+            self.assertEqual(cli.main(["__filesystem-size-worker"]), 2)
+
     def test_daemon_defaults_to_native_continuous_worker_main(self):
         from src.worker_agent import cli
 

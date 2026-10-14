@@ -300,6 +300,7 @@ class ControlPlaneApplication:
     scheduler: "SchedulerService | None" = None
     live_file_service: LiveFileService | None = None
     live_lane: "LiveWorkerLane | None" = None
+    filesystem_size_estimates: dict | None = None
 
 
 class ControlPlaneHTTPServer(ThreadingHTTPServer):
@@ -333,12 +334,22 @@ class ControlPlaneHTTPSServer((NativeThreadingHTTPSServer or ThreadingHTTPServer
 class LiveWorkerLane:
     def __init__(self, max_pending=64):
         self.max_pending, self._lock, self._pending, self._operations = max_pending, threading.Condition(), {}, {}
-    def submit(self, worker_id, payload, stream=None):
+        threading.Thread(target=self._cleanup_expired_operations, daemon=True, name="live-worker-lane-cleanup").start()
+
+    def _cleanup_expired_operations(self):
+        stop = threading.Event()
+        while True:
+            stop.wait(30)
+            self.expire()
+    def submit(self, worker_id, payload, stream=None, metadata=None):
+        self.expire()
         with self._lock:
             if sum(map(len, self._pending.values())) >= self.max_pending: raise LiveLimitError("live request queue limit reached")
+            if len(self._operations) >= self.max_pending * 4: raise LiveLimitError("live operation limit reached")
             operation_id = uuid4().hex; self._pending.setdefault(worker_id, deque()).append({**payload, "operation_id": operation_id})
-            self._operations[operation_id] = {"worker_id": worker_id, "target_id": payload.get("target_id"), "result": None, "started": threading.Event(), "stream": stream}; return operation_id
+            self._operations[operation_id] = {"worker_id": worker_id, "target_id": payload.get("target_id"), "result": None, "started": threading.Event(), "stream": stream, "metadata": metadata or {}, "created_at": datetime.now().timestamp()}; return operation_id
     def poll(self, worker_id, limit=4):
+        self.expire()
         with self._lock:
             pending = self._pending.get(worker_id, deque()); items = [pending.popleft() for _ in range(min(max(1, int(limit)), 16)) if pending]
             if not pending: self._pending.pop(worker_id, None)
@@ -374,6 +385,12 @@ class LiveWorkerLane:
         for operation_id, operation in list(self._operations.items()):
             if operation.get("target_id") == target_id: self.cancel(operation_id)
 
+    def expire(self, max_age=300):
+        cutoff = datetime.now().timestamp() - max_age
+        with self._lock:
+            for operation_id, operation in list(self._operations.items()):
+                if operation.get("created_at", 0) < cutoff:
+                    self.cancel(operation_id)
 
 class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
     server_version = "docker-volume-backup-control-plane/0.1"
@@ -536,6 +553,23 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     },
                     head_only=head_only,
                 )
+            if len(parts) == 4 and parts[:3] == ["api", "v1", "filesystem-size-estimates"]:
+                if not self._require_auth(ROLE_ADMIN, head_only=head_only, api_mode=True):
+                    return
+                lane = self._live_lane()
+                session = self._current_session()
+                if lane is None:
+                    return self._write_json(404, {"status": "expired"}, head_only=head_only)
+                lane.expire()
+                with lane._lock:
+                    operation = lane._operations.get(parts[3])
+                    if operation is None or operation.get("metadata", {}).get("owner") != session.get("username"):
+                        return self._write_json(404, {"status": "expired"}, head_only=head_only)
+                result = operation.get("result")
+                if result is None:
+                    return self._write_json(200, {"status": "pending"}, head_only=head_only)
+                lane.finish(parts[3])
+                return self._write_json(200, {"status": "complete", "result": result}, head_only=head_only)
             if len(parts) == 6 and parts[:3] == ["api", "v1", "targets"] and parts[4] == "live":
                 if parts[5] == "events" and not head_only:
                     return self._stream_live_events(parts[3])
@@ -709,7 +743,10 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                 return self._handle_live_chunk(parts[3], self._read_raw_body(64 * 1024))
             except ValueError:
                 return self._write_json(413, {"error": "live chunk exceeds the permitted bound"})
-        body = self._read_json_body()
+        try:
+            body = self._read_json_body()
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            return self._write_json(413, {"error": "request body is invalid or exceeds the permitted bound"})
         try:
             if path in ("/api/v1/workers/register", "/api/v1/worker-enrollments/sign"):
                 return self._write_json(404, {"error": "legacy worker trust path is unsupported"})
@@ -862,6 +899,30 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                         200,
                         self._control_plane_service().revoke_worker(parts[4], body.get("version")),
                     )
+
+            if path == "/api/v1/filesystem-size-estimates":
+                if not self._require_auth(ROLE_ADMIN, api_mode=True):
+                    return
+                if not isinstance(body, dict) or set(body) != {"worker_id", "filesystem_paths"}:
+                    raise ValueError("worker_id and filesystem_paths are required")
+                service = self._control_plane_service()
+                worker_id = body.get("worker_id")
+                worker = service.worker_repository.get(worker_id) if isinstance(worker_id, str) else None
+                if worker is None or service._worker_status(worker) != "online":
+                    return self._write_json(409, {"error": "selected worker is offline or unavailable"})
+                if not service._worker_supports_runtime(worker, "native"):
+                    return self._write_json(409, {"error": "selected worker does not support native filesystem paths"})
+                paths = service._normalize_filesystem_paths(body.get("filesystem_paths"), required=True)
+                if len(paths) > 64 or any(not service._is_absolute_native_path(path) for path in paths):
+                    raise ValueError("filesystem_paths must contain bounded absolute native paths")
+                lane = self._live_lane()
+                if lane is None:
+                    return self._write_json(503, {"error": "live worker lane unavailable"})
+                try:
+                    operation_id = lane.submit(worker_id, {"operation": "filesystem.size_estimate", "worker_id": worker_id, "filesystem_paths": paths}, metadata={"owner": self._current_session().get("username")})
+                except LiveLimitError:
+                    return self._write_json(429, {"error": "filesystem size estimate queue is full"})
+                return self._write_json(202, {"operation_id": operation_id})
 
             if path == "/api/v1/targets":
                 if not self._require_auth(ROLE_ADMIN, api_mode=True):
@@ -1688,6 +1749,8 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
 
     def _read_json_body(self):
         content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length < 0 or content_length > 2 * 1024 * 1024:
+            raise ValueError("request body exceeds the permitted bound")
         if content_length <= 0:
             self._raw_body = b""
             return {}

@@ -198,10 +198,37 @@ class NativeRestoreTests(unittest.TestCase):
     def test_frozen_native_runtime_selects_bundled_restic_instead_of_host_path(self):
         adapter = NativeRuntimeAdapter(python_executable=sys.executable)
         executable_name = "restic.exe" if sys.platform == "win32" else "restic"
+        rclone_name = "rclone.exe" if sys.platform == "win32" else "rclone"
         payload = {
             "runtime_type": "native",
             "filesystem_paths": ["/srv/app"],
             "command": ["restic", "snapshots", "--json"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"PATH": "host-tools"}, clear=True):
+            bundled = Path(directory) / executable_name
+            bundled.write_text("synthetic bundled executable", encoding="utf-8")
+            bundled.chmod(0o755)
+            bundled_rclone = Path(directory) / rclone_name
+            bundled_rclone.write_text("synthetic bundled rclone", encoding="utf-8")
+            bundled_rclone.chmod(0o755)
+            with patch.object(sys, "frozen", True, create=True), patch.object(
+                sys, "_MEIPASS", directory, create=True
+            ), patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="host-restic"):
+                command, environment = adapter._command_and_environment(payload)
+                self.assertTrue(adapter.self_check()["executables"]["restic"])
+                self.assertTrue(adapter.self_check()["executables"]["rclone"])
+
+        self.assertEqual(command, [str(bundled), "snapshots", "--json"])
+        self.assertEqual(environment["PATH"].split(os.pathsep)[:2], [directory, "host-tools"])
+
+    def test_frozen_native_runtime_selects_bundled_rclone_for_restricted_about(self):
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable)
+        executable_name = "rclone.exe" if sys.platform == "win32" else "rclone"
+        payload = {
+            "runtime_type": "native",
+            "filesystem_paths": ["/srv/app"],
+            "command": ["rclone", "about", "remote:", "--json"],
         }
 
         with tempfile.TemporaryDirectory() as directory:
@@ -210,11 +237,48 @@ class NativeRestoreTests(unittest.TestCase):
             bundled.chmod(0o755)
             with patch.object(sys, "frozen", True, create=True), patch.object(
                 sys, "_MEIPASS", directory, create=True
-            ), patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="host-restic"):
+            ), patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="host-rclone"):
                 command, _environment = adapter._command_and_environment(payload)
-                self.assertTrue(adapter.self_check()["executables"]["restic"])
 
-        self.assertEqual(command, [str(bundled), "snapshots", "--json"])
+        self.assertEqual(command, [str(bundled), "about", "remote:", "--json"])
+
+    def test_frozen_native_runtime_fails_closed_when_bundled_rclone_is_missing(self):
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable)
+        payload = {
+            "runtime_type": "native",
+            "filesystem_paths": ["/srv/app"],
+            "command": ["rclone", "about", "remote:", "--json"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(sys, "frozen", True, create=True), patch.object(
+            sys, "_MEIPASS", directory, create=True
+        ), patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="host-rclone"):
+            with self.assertRaisesRegex(FileNotFoundError, "bundled rclone executable"):
+                adapter._command_and_environment(payload)
+
+    def test_source_mode_resolves_rclone_through_host_path(self):
+        from src.rclone_executable import resolve_rclone_executable
+
+        with patch.object(sys, "frozen", False, create=True):
+            self.assertEqual(resolve_rclone_executable(), "rclone")
+
+    def test_frozen_restic_environment_fails_closed_instead_of_falling_back_to_host_rclone(self):
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable)
+        payload = {
+            "runtime_type": "native",
+            "filesystem_paths": ["/srv/app"],
+            "command": ["restic", "snapshots", "--json"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"PATH": "host-tools"}, clear=True):
+            bundled_restic = Path(directory) / ("restic.exe" if sys.platform == "win32" else "restic")
+            bundled_restic.write_text("synthetic bundled executable", encoding="utf-8")
+            bundled_restic.chmod(0o755)
+            with patch.object(sys, "frozen", True, create=True), patch.object(
+                sys, "_MEIPASS", directory, create=True
+            ), patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="host-restic"):
+                with self.assertRaisesRegex(FileNotFoundError, "bundled rclone executable"):
+                    adapter._command_and_environment(payload)
 
     def test_frozen_native_runtime_fails_closed_when_bundled_restic_is_missing(self):
         adapter = NativeRuntimeAdapter(python_executable=sys.executable)

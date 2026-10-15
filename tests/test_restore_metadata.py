@@ -103,11 +103,15 @@ class RestoreMetadataTests(unittest.TestCase):
     def test_frozen_metadata_inspection_uses_bundled_restic_not_host_path(self):
         runner = Mock(return_value=SimpleNamespace(returncode=0, stdout=line(), stderr=""))
         executable_name = "restic.exe" if sys.platform == "win32" else "restic"
+        rclone_name = "rclone.exe" if sys.platform == "win32" else "rclone"
 
         with tempfile.TemporaryDirectory() as directory:
             bundled = Path(directory) / executable_name
             bundled.write_text("synthetic bundled executable", encoding="utf-8")
             bundled.chmod(0o755)
+            bundled_rclone = Path(directory) / rclone_name
+            bundled_rclone.write_text("synthetic bundled executable", encoding="utf-8")
+            bundled_rclone.chmod(0o755)
             with patch.object(sys, "frozen", True, create=True), patch.object(
                 sys, "_MEIPASS", directory, create=True
             ):

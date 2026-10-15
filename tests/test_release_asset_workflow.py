@@ -32,8 +32,11 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertIn("PyInstaller build/vaultline-worker.spec", self.workflow)
         linux_job = self.workflow.split("  native-linux:", 1)[1].split("  native-windows:", 1)[0]
         self.assertIn("scripts/download_pinned_restic.py --platform linux --arch", linux_job)
+        self.assertIn("scripts/download_pinned_rclone.py --platform linux --arch", linux_job)
         self.assertIn("export VAULTLINE_RESTIC_BINARY=/tmp/vaultline-restic/restic", linux_job)
+        self.assertIn("export VAULTLINE_RCLONE_BINARY=/tmp/vaultline-rclone/rclone", linux_job)
         self.assertLess(linux_job.index("download_pinned_restic.py"), linux_job.index("python -m PyInstaller"))
+        self.assertLess(linux_job.index("download_pinned_rclone.py"), linux_job.index("python -m PyInstaller"))
         self.assertIn("scripts/build_worker_deb.sh", self.workflow)
 
     def test_linux_debian_builder_is_invoked_with_bash(self):
@@ -61,8 +64,11 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         job = self.windows_job()
         self.assertLess(job.index("scripts/set_worker_build_version.py"), job.index("python -m PyInstaller"))
         self.assertIn("scripts/download_pinned_restic.py --platform windows --arch amd64", job)
+        self.assertIn("scripts/download_pinned_rclone.py --platform windows --arch amd64", job)
         self.assertIn("$env:VAULTLINE_RESTIC_BINARY", job)
+        self.assertIn("$env:VAULTLINE_RCLONE_BINARY", job)
         self.assertLess(job.index("download_pinned_restic.py"), job.index("python -m PyInstaller"))
+        self.assertLess(job.index("download_pinned_rclone.py"), job.index("python -m PyInstaller"))
         from src.worker_agent._build_info import VERSION
         self.assertEqual(VERSION, "dev")
 

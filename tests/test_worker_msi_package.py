@@ -64,14 +64,17 @@ class WorkerMsiPackageTests(unittest.TestCase):
         self.assertEqual(install_dir.get("Id"), "INSTALLFOLDER")
         self.assertEqual(install_dir.get("Name"), "Vaultline")
 
-        files = list(self.find_all("File"))
-        self.assertEqual(len(files), 2)
-        self.assertEqual(files[0].get("Source"), "$(var.WorkerExe)")
+        files = {node.get("Id"): node for node in self.find_all("File")}
+        self.assertEqual(set(files), {"WorkerExe", "ResticLicenseFile", "RcloneLicenseFile"})
+        self.assertEqual(files["WorkerExe"].get("Source"), "$(var.WorkerExe)")
         self.assertIn("WorkerExe", self.source)
         self.assertRegex(self.source, r"\?define WorkerExe\s*=")
-        self.assertEqual(files[1].get("Source"), "$(var.ResticLicense)")
-        self.assertEqual(files[1].get("Name"), "restic-v0.19.1-LICENSE")
+        self.assertEqual(files["ResticLicenseFile"].get("Source"), "$(var.ResticLicense)")
+        self.assertEqual(files["ResticLicenseFile"].get("Name"), "restic-v0.19.1-LICENSE")
+        self.assertEqual(files["RcloneLicenseFile"].get("Source"), "$(var.RcloneLicense)")
+        self.assertEqual(files["RcloneLicenseFile"].get("Name"), "rclone-v1.75.2-COPYING")
         self.assertIn("ResticLicense", self.source)
+        self.assertIn("RcloneLicense", self.source)
 
     def test_registers_auto_start_local_system_service_hosting_service_run(self):
         installs = list(self.find_all("ServiceInstall"))
@@ -180,7 +183,7 @@ class WorkerMsiPackageTests(unittest.TestCase):
         lowered = self.source.lower()
         for forbidden in ("token", "secret", "credential", "password", "worker.env", "worker.json"):
             self.assertNotIn(forbidden, lowered)
-        self.assertEqual(len(list(self.find_all("File"))), 2)
+        self.assertEqual(len(list(self.find_all("File"))), 3)
         self.assertEqual(len(list(self.find_all("IniFile"))), 0)
         self.assertEqual(len(list(self.find_all("RegistryValue"))), 0)
 

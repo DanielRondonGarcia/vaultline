@@ -13,7 +13,8 @@ from typing import Any, Callable, Dict, Iterable, List
 from src.worker_agent.application.policies.runtime_command_policy import RuntimeCommandPolicy
 from src.worker_agent.application.ports.runtime_port import RuntimePort
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
-from src.restic_executable import resolve_restic_executable
+from src.restic_executable import resolve_restic_executable, restic_subprocess_environment
+from src.rclone_executable import resolve_rclone_executable
 
 MAX_RESOLVED_FILES = 32
 MAX_RESOLVED_FILE_BYTES = 1024 * 1024
@@ -155,6 +156,8 @@ class NativeRuntimeAdapter(RuntimePort):
     def _require_executable(self, executable: str) -> str:
         if executable == "restic" and getattr(sys, "frozen", False):
             return resolve_restic_executable()
+        if executable == "rclone" and getattr(sys, "frozen", False):
+            return resolve_rclone_executable()
         if self._which(executable) is None and not (os.path.isabs(executable) and os.path.exists(executable)):
             raise FileNotFoundError(
                 f"required executable '{executable}' is not available on this native worker PATH"
@@ -212,6 +215,8 @@ class NativeRuntimeAdapter(RuntimePort):
         if command == ["/root/backup.sh"]:
             environment["PYTHONIOENCODING"] = "utf-8"
             return self._backup_engine_command(), environment
+        if command[0] == "restic":
+            environment = restic_subprocess_environment(environment)
         command[0] = self._require_executable(command[0])
         return command, environment
 
@@ -303,9 +308,12 @@ class NativeRuntimeAdapter(RuntimePort):
     def self_check(self) -> Dict[str, Any]:
         executables = {}
         for name in ("tar", "restic", "gpg", "rclone", "aws", "ssh", "scp"):
-            if name == "restic" and getattr(sys, "frozen", False):
+            if name in {"restic", "rclone"} and getattr(sys, "frozen", False):
                 try:
-                    resolve_restic_executable()
+                    if name == "restic":
+                        resolve_restic_executable()
+                    else:
+                        resolve_rclone_executable()
                 except OSError:
                     executables[name] = False
                 else:

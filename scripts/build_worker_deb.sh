@@ -45,6 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TEMPLATE_ROOT="${REPO_ROOT}/packaging/debian"
 RESTIC_LICENSE="${REPO_ROOT}/packaging/licenses/restic-v0.19.1-LICENSE"
+RCLONE_LICENSE="${REPO_ROOT}/packaging/licenses/rclone-v1.75.2-COPYING"
 PACKAGE_NAME="vaultline-worker"
 ASSET_NAME="vaultline-worker_${VERSION}_${ARCH}.deb"
 OUTPUT_PATH="${OUTPUT_DIR%/}/${ASSET_NAME}"
@@ -71,6 +72,10 @@ if [[ ! -f "${RESTIC_LICENSE}" ]]; then
   printf 'error: bundled Restic license is missing: %s\n' "${RESTIC_LICENSE}" >&2
   exit 2
 fi
+if [[ ! -f "${RCLONE_LICENSE}" ]]; then
+  printf 'error: bundled rclone license is missing: %s\n' "${RCLONE_LICENSE}" >&2
+  exit 2
+fi
 
 sed \
   -e "s/@VERSION@/${VERSION}/g" \
@@ -87,6 +92,8 @@ install -m 0644 "${TEMPLATE_ROOT}/usr/share/doc/vaultline-worker/worker.env.exam
   "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/worker.env.example"
 install -m 0644 "${RESTIC_LICENSE}" \
   "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/restic-v0.19.1-LICENSE"
+install -m 0644 "${RCLONE_LICENSE}" \
+  "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/rclone-v1.75.2-COPYING"
 
 test -f "${PACKAGE_ROOT}/DEBIAN/control"
 test -x "${PACKAGE_ROOT}/DEBIAN/postinst"
@@ -95,6 +102,7 @@ test -x "${PACKAGE_ROOT}/usr/bin/vaultline-worker"
 test -f "${PACKAGE_ROOT}/lib/systemd/system/docker-volume-backup-worker.service"
 test -f "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/worker.env.example"
 test -f "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/restic-v0.19.1-LICENSE"
+test -f "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/rclone-v1.75.2-COPYING"
 
 LC_ALL=C dpkg-deb --build --root-owner-group "${PACKAGE_ROOT}" "${OUTPUT_PATH}"
 

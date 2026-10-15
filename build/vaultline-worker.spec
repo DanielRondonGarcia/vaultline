@@ -13,11 +13,17 @@ block_cipher = None
 ROOT = Path(SPECPATH).resolve().parent
 RESTIC_BINARY = Path(os.environ.get("VAULTLINE_RESTIC_BINARY", ""))
 RESTIC_LICENSE = ROOT / "packaging/licenses/restic-v0.19.1-LICENSE"
+RCLONE_BINARY = Path(os.environ.get("VAULTLINE_RCLONE_BINARY", ""))
+RCLONE_LICENSE = ROOT / "packaging/licenses/rclone-v1.75.2-COPYING"
 
 if not RESTIC_BINARY.is_file():
     raise SystemExit("VAULTLINE_RESTIC_BINARY must point to the verified Restic release executable")
 if not RESTIC_LICENSE.is_file():
     raise SystemExit(f"the bundled Restic license is missing: {RESTIC_LICENSE}")
+if not RCLONE_BINARY.is_file():
+    raise SystemExit("VAULTLINE_RCLONE_BINARY must point to the verified rclone release executable")
+if not RCLONE_LICENSE.is_file():
+    raise SystemExit(f"the bundled rclone license is missing: {RCLONE_LICENSE}")
 
 hiddenimports = [
     "src.app.main",
@@ -57,8 +63,8 @@ if sys.platform == "win32":
 a = Analysis(
     [str(ROOT / "src/worker_agent/cli.py")],
     pathex=[str(ROOT)],
-    binaries=[(str(RESTIC_BINARY), ".")],
-    datas=[(str(RESTIC_LICENSE), "licenses/restic")],
+    binaries=[(str(RESTIC_BINARY), "."), (str(RCLONE_BINARY), ".")],
+    datas=[(str(RESTIC_LICENSE), "licenses/restic"), (str(RCLONE_LICENSE), "licenses/rclone")],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

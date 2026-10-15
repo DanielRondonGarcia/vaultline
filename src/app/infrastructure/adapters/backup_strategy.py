@@ -14,7 +14,8 @@ from src.app.domain.models import BackupConfig, BackupResult, RestoreConfig, Res
 from src.app.application.ports.ports import BackupStrategy, RestoreStrategy
 from src.app.domain.restore_ownership import RestoreOwnershipPolicy, parse_uid_gid
 from src.restic_retention import build_restic_forget_command
-from src.restic_executable import resolve_restic_executable
+from src.restic_executable import resolve_restic_executable, restic_subprocess_environment
+from src.rclone_executable import resolve_rclone_executable
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +26,8 @@ UNSUPPORTED_METADATA = ["acl", "xattr", "timestamps", "special metadata"]
 def _require_executable(name: str) -> str:
     if name == "restic" and getattr(sys, "frozen", False):
         return resolve_restic_executable()
+    if name == "rclone" and getattr(sys, "frozen", False):
+        return resolve_rclone_executable()
     if shutil.which(name) is None:
         raise FileNotFoundError(f"required executable '{name}' is not available on PATH")
     return name
@@ -492,6 +495,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
         
         try:
             restic = _require_executable("restic") or "restic"
+            env = restic_subprocess_environment(env)
             # Check if repo is initialized
             init_check_cmd = [restic, "snapshots", "--json", "--latest", "1"]
             try:
@@ -597,6 +601,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
 
         try:
             restic = _require_executable("restic") or "restic"
+            env = restic_subprocess_environment(env)
             _ensure_direct_restore_target_is_writable(config)
             policy = _ownership_policy(config)
             snapshot = source_path or config.source or "latest"

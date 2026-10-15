@@ -7,7 +7,7 @@ from typing import Any
 from src.app.application.ports.ports import ResticMetadataInspectorPort
 from src.app.domain.restore_metadata import MAX_OUTPUT_BYTES, ResticMetadataEvidence, parse_restic_ls_long
 from src.app.domain.restore_ownership import RestoreOwnershipPolicy
-from src.restic_executable import resolve_restic_executable
+from src.restic_executable import resolve_restic_executable, restic_subprocess_environment
 
 
 def _value(config: Any, *names: str) -> Any:
@@ -30,6 +30,7 @@ class ResticMetadataInspectorAdapter(ResticMetadataInspectorPort):
             repository, password = _value(config, "restic_repository", "repository"), _value(config, "restic_password", "password")
             if repository is not None: env["RESTIC_REPOSITORY"] = str(repository)
             if password is not None: env["RESTIC_PASSWORD"] = str(password)
+            env = restic_subprocess_environment(env)
             result = self.runner(
                 [resolve_restic_executable(), "ls", "--long", snapshot],
                 env=env,

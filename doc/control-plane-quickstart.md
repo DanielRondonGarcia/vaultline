@@ -213,7 +213,7 @@ Reglas que no cambian:
 
 - No pongas el token en argumentos, archivos, artefactos, scripts, variables de entorno persistentes ni logs.
 - Descarga el asset desde la UI o desde la [página canónica de releases de Vaultline](https://github.com/DanielRondonGarcia/vaultline/releases) y verifícalo con `SHA256SUMS` cuando esté disponible.
-- Las herramientas externas `restic, tar, gpg, rclone, aws, ssh y scp` se instalan aparte según el backup/storage usado.
+- Restic v0.19.1 and rclone v1.75.2 executables are bundled with native worker packages. Keep `rclone.conf` and repository credentials in their separate secrets; they are never included in the package. Install the remaining external tools (`tar`, `gpg`, `aws`, `ssh`, and `scp`) separately as required by the backup or storage target.
 - V2 seguro separa el bootstrap token de la credencial durable generada por el cliente. V1 legacy con variable de entorno de token sigue documentado solo para workers existentes o despliegues Compose heredados.
 
 | Plataforma | Paquete | Servicio | Estado y credenciales |
@@ -252,12 +252,12 @@ Diagnóstico local redacted:
 python -m src.worker_agent.cli self-check
 ```
 
-El self-check informa presencia de configuración y disponibilidad de ejecutables
-sin imprimir valores de entorno, URL, tokens, credenciales, firmas ni contenido
-del archivo de credenciales. Los ejecutables externos (`restic`, `rclone`,
-`gpg`, `aws`, `ssh`, `scp`, `tar`) se instalan manualmente en el host; no todos
-son obligatorios para todos los targets, dependen del storage profile y de las
-operaciones habilitadas.
+The self-check reports configuration presence and executable availability
+without printing environment values, URLs, tokens, credentials, signatures, or
+credential-file contents. In source/development mode, executables (`restic`,
+`rclone`, `gpg`, `aws`, `ssh`, `scp`, and `tar`) are resolved from the host PATH;
+not all are required for every target, as requirements depend on the storage
+profile and enabled operations.
 
 Configuración recomendada:
 

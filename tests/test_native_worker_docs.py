@@ -35,7 +35,10 @@ class NativeWorkerDocsTests(unittest.TestCase):
             "C:\\ProgramData\\Vaultline\\worker",
             "glibc >= 2.17",
             "SmartScreen",
-            "restic, tar, gpg, rclone, aws, ssh y scp",
+            "Restic v0.19.1 and rclone v1.75.2 executables are bundled with native worker packages",
+            "Keep `rclone.conf` and repository credentials in their separate secrets",
+            "Install the remaining external tools (`tar`, `gpg`, `aws`, `ssh`, and `scp`) separately",
+            "In source/development mode, executables (`restic`,",
             "espera el enrolamiento",
         ):
             self.assertIn(marker, self.quickstart)
@@ -50,6 +53,7 @@ class NativeWorkerDocsTests(unittest.TestCase):
         self.assertIn("#### Runner Linux con systemd", native)
         self.assertIn("#### Runner Windows como servicio (MSI)", native)
         self.assertIn("##### Alternativa: ejecutable portable", native)
+        self.assertIn("Restic v0.19.1 and rclone v1.75.2 executables are bundled with native worker packages", native)
         self.assertNotIn("Task Scheduler", native)
         self.assertNotIn("ScheduledTask", native)
         self.assertNotIn("No usa Windows SCM", native)
@@ -88,10 +92,12 @@ class NativeWorkerDocsTests(unittest.TestCase):
         self.assertIn("python -m src.worker_agent.cli daemon", native)
 
     def test_readme_links_to_native_worker_package_guidance_concisely(self):
-        self.assertIn("Worker nativo", self.readme)
+        self.assertIn("packaged native worker guide", self.readme)
         self.assertIn("doc/control-plane-quickstart.md#worker-nativo-empaquetado-v2-seguro", self.readme)
         self.assertIn("vaultline-worker enroll --control-plane-url <url>", self.readme)
         self.assertIn("VaultlineWorker (Windows MSI) / docker-volume-backup-worker.service (Linux .deb)", self.readme)
+        self.assertIn("Native packages include Restic v0.19.1 and rclone v1.75.2 executables", self.readme)
+        self.assertIn("keep `rclone.conf` and repository credentials in separate secrets", self.readme)
         self.assertNotIn("Task Scheduler", self.readme)
 
     def test_public_docs_use_canonical_vaultline_repository_and_images(self):

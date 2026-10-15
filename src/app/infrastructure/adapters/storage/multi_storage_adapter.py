@@ -7,7 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from src.app.domain.models import BackupConfig, RestoreCandidate, RestoreConfig
 from src.app.application.ports.ports import StoragePort
-from src.restic_executable import resolve_restic_executable
+from src.restic_executable import resolve_restic_executable, restic_subprocess_environment
+from src.rclone_executable import resolve_rclone_executable
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +97,7 @@ class MultiStorageAdapter(StoragePort):
             return self._download_scp(source, config)
         if source.startswith("rclone://"):
             remote_path = source.removeprefix("rclone://")
-            return self._download_to_temp(["rclone", "copyto", remote_path])
+            return self._download_to_temp([resolve_rclone_executable(), "copyto", remote_path])
         if config.backup_strategy == "restic":
             return source or "latest"
         return source
@@ -125,6 +126,7 @@ class MultiStorageAdapter(StoragePort):
             env["RESTIC_PASSWORD"] = config.restic_password or os.environ.get("RESTIC_PASSWORD")
 
         try:
+            env = restic_subprocess_environment(env)
             result = subprocess.run(
                 [resolve_restic_executable(), "snapshots", "--json"],
                 capture_output=True,
@@ -188,7 +190,7 @@ class MultiStorageAdapter(StoragePort):
 
     def _list_rclone_candidates(self, remote: str, strategy: str) -> list[RestoreCandidate]:
         try:
-            result = subprocess.run(["rclone", "lsjson", remote], capture_output=True, text=True, check=True)
+            result = subprocess.run([resolve_rclone_executable(), "lsjson", remote], capture_output=True, text=True, check=True)
             items = __import__("json").loads(result.stdout or "[]")
             return [
                 RestoreCandidate(
@@ -243,7 +245,7 @@ class MultiStorageAdapter(StoragePort):
     def _upload_rclone(self, file_path: str, remote: str):
         logger.info(f"Uploading via Rclone to {remote}")
         # Assume config.rclone_remote includes a destination such as "remote:/backups".
-        cmd = ["rclone", "copy", file_path, remote]
+        cmd = [resolve_rclone_executable(), "copy", file_path, remote]
         subprocess.run(cmd, check=True)
 
     def _archive_local(self, file_path: str, archive_path: str):

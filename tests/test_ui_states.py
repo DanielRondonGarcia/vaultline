@@ -2023,8 +2023,9 @@ class WorkerUiStateTests(unittest.TestCase):
             "ProgramData\\\\Vaultline\\\\worker",
             "glibc >= 2.17",
             "SmartScreen",
-            "Restic se incluye con el worker nativo",
-            "tar, gpg, rclone, aws, ssh y scp se instalan por separado",
+            "Los ejecutables de Restic y rclone se incluyen con el worker nativo",
+            "rclone.conf</code> y las credenciales del repositorio en secretos separados",
+            "Instala por separado las demás herramientas externas (tar, gpg, aws, ssh y scp)",
             "espera el enrolamiento",
         ):
             self.assertIn(marker, self.source)
@@ -2085,7 +2086,7 @@ class WorkerUiStateTests(unittest.TestCase):
             self.assertNotIn(stale, tab_source)
         self.assertIn("SmartScreen", tab_source)
         self.assertIn("sin reiniciar", tab_source)
-        self.assertIn("no hace falta re-enrolar", tab_source)
+        self.assertIn("sin necesidad de volver a enrolar", tab_source)
         self.assertIn("worker.env es opcional", tab_source)
         self.assertIn("vaultline-worker.exe daemon", tab_source)
         self.assertIn("service install", tab_source)

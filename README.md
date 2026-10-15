@@ -109,7 +109,7 @@ El worker incluye un servicio `demo-app` (nginx) de ejemplo. Edita
 `deploy/worker/docker-compose.yml` para añadir tus propios servicios con
 sus volúmenes — el worker los descubrirá automáticamente vía `docker.sock`.
 
-Para hosts sin Docker, usa la guía de [Worker nativo empaquetado](doc/control-plane-quickstart.md#worker-nativo-empaquetado-v2-seguro): instala el `.deb` (Linux) o el `.msi` (Windows), que deja el servicio corriendo a la espera del enrolamiento, y ejecuta una sola vez `vaultline-worker enroll --control-plane-url <url>` como root/administrador pegando el secreto en el prompt oculto. La UI ofrece los paquetes y el secreto V2.
+For hosts without Docker, follow the [packaged native worker guide](doc/control-plane-quickstart.md#worker-nativo-empaquetado-v2-seguro): install the Linux `.deb` or Windows `.msi`, then run `vaultline-worker enroll --control-plane-url <url>` once as root or administrator and enter the secret at the hidden prompt. The service starts and waits for enrollment. Native packages include Restic v0.19.1 and rclone v1.75.2 executables; keep `rclone.conf` and repository credentials in separate secrets. The UI offers the packages and V2 secret.
 
 ### 3. Configurar el backup desde la UI
 

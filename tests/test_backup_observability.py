@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import sqlite3
 import threading
@@ -30,6 +31,7 @@ from src.control_plane.infrastructure.repositories.in_memory import (
 from src.control_plane.infrastructure.repositories.sqlite import SQLiteJobRepository
 from src.control_plane.infrastructure.security.secret_codec import SecretCodec
 from src.security.hmac_protocol import digest_secret, verify_request
+from src.restic_retention import restic_retention_config_from_environment
 from src.worker_agent.application.services.worker_agent_service import _JobProgressReporter, WorkerAgentService
 from src.worker_agent.domain.models import WorkerAgentConfig
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
@@ -57,6 +59,57 @@ class BackupObservabilityServiceTests(unittest.TestCase):
             secret_codec=codec,
             settings_repository=InMemorySettingsRepository(),
         )
+
+    def test_backup_payload_carries_selected_retention_policy_for_docker_and_native_targets(self):
+        service = self.make_service()
+        target = service.target_repository.get("target-a")
+        target.runtime_environment.update(
+            {
+                "RESTIC_KEEP_LAST": "99",
+                "RESTIC_KEEP_HOURLY": "99",
+                "RESTIC_KEEP_DAILY": "99",
+                "RESTIC_KEEP_WEEKLY": "99",
+                "RESTIC_KEEP_MONTHLY": "12",
+                "RESTIC_KEEP_YEARLY": "1",
+            }
+        )
+        policy = service.create_retention_policy(
+            "selected",
+            keep_last=7,
+            keep_hourly=24,
+            keep_daily=7,
+            keep_weekly=4,
+            keep_monthly=6,
+            keep_yearly=2,
+            prune=True,
+        )
+        target.retention_policy_id = policy.id
+
+        for runtime_type in ("docker", "native"):
+            with self.subTest(runtime_type=runtime_type):
+                target.runtime_type = runtime_type
+                environment = service._build_backup_payload(target)["environment"]
+
+                self.assertEqual(environment["RESTIC_RETENTION_POLICY_CONFIGURED"], "true")
+                self.assertEqual(
+                    {key: environment[key] for key in (
+                        "RESTIC_KEEP_LAST",
+                        "RESTIC_KEEP_HOURLY",
+                        "RESTIC_KEEP_DAILY",
+                        "RESTIC_KEEP_WEEKLY",
+                        "RESTIC_KEEP_MONTHLY",
+                        "RESTIC_KEEP_YEARLY",
+                    )},
+                    {
+                        "RESTIC_KEEP_LAST": "7",
+                        "RESTIC_KEEP_HOURLY": "24",
+                        "RESTIC_KEEP_DAILY": "7",
+                        "RESTIC_KEEP_WEEKLY": "4",
+                        "RESTIC_KEEP_MONTHLY": "6",
+                        "RESTIC_KEEP_YEARLY": "2",
+                    },
+                )
+                self.assertEqual(environment["RESTIC_PRUNE"], "true")
 
     def test_storage_context_reports_effective_source_kind_and_redacted_display(self):
         service = self.make_service()
@@ -487,6 +540,33 @@ class ProgressClientAndWorkerTests(unittest.TestCase):
 
 
 class RuntimeAndResticStreamingTests(unittest.TestCase):
+    @staticmethod
+    def perform_synthetic_restic_backup(config, forget_error=None):
+        class Stream:
+            def __init__(self, lines):
+                self.lines = list(lines)
+
+            def readline(self):
+                return self.lines.pop(0) if self.lines else ""
+
+        class Process:
+            def __init__(self):
+                self.stdout = Stream(['{"message_type":"summary","data_added":123,"total_duration":4.5}\n'])
+                self.stderr = Stream([])
+                self.returncode = 0
+
+            def wait(self):
+                return 0
+
+        run = Mock()
+        if forget_error is not None:
+            run.side_effect = [Mock(), forget_error]
+        with patch("src.app.infrastructure.adapters.backup_strategy._require_executable"), patch(
+            "src.app.infrastructure.adapters.backup_strategy.subprocess.Popen", side_effect=lambda *_args, **_kwargs: Process()
+        ), patch("src.app.infrastructure.adapters.backup_strategy.subprocess.run", run):
+            result = ResticBackupStrategy().perform_backup(config)
+        return result, run
+
     def test_docker_streaming_emits_short_initial_chunks_before_long_secret_tail(self):
         secret = "s" * 4096
         first_emitted = threading.Event()
@@ -537,7 +617,17 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
             "runtime",
             {
                 "command": "restic snapshots --json",
-                "environment": {"RESTIC_PASSWORD": "restic-password-value"},
+                "environment": {
+                    "RESTIC_PASSWORD": "restic-password-value",
+                    "RESTIC_RETENTION_POLICY_CONFIGURED": "true",
+                    "RESTIC_KEEP_LAST": "7",
+                    "RESTIC_KEEP_HOURLY": "",
+                    "RESTIC_KEEP_DAILY": "",
+                    "RESTIC_KEEP_WEEKLY": "",
+                    "RESTIC_KEEP_MONTHLY": "6",
+                    "RESTIC_KEEP_YEARLY": "",
+                    "RESTIC_PRUNE": "false",
+                },
             },
             output_callback=chunks.append,
         )
@@ -546,6 +636,18 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
         self.assertNotIn("restic-password-value", repr(result))
         self.assertNotIn("restic-password-value", "".join(chunks))
         self.assertIn("status", "".join(chunks))
+        self.assertEqual(
+            runtime.client.containers.run.call_args.kwargs["environment"]["RESTIC_KEEP_MONTHLY"],
+            "6",
+        )
+        self.assertEqual(
+            runtime.client.containers.run.call_args.kwargs["environment"]["RESTIC_KEEP_HOURLY"],
+            "",
+        )
+        self.assertEqual(
+            runtime.client.containers.run.call_args.kwargs["environment"]["RESTIC_PRUNE"],
+            "false",
+        )
 
     def test_restic_backup_streams_json_status_and_preserves_summary_and_prune(self):
         status_line = '{"message_type":"status","percent_done":0.5,"files_done":1}\n'
@@ -584,7 +686,129 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
         popen.assert_called_once()
         self.assertNotIn("shell", popen.call_args.kwargs)
         self.assertEqual(run.call_count, 2)
-        self.assertEqual(run.call_args_list[-1].args[0][1], "forget")
+        self.assertEqual(
+            run.call_args_list[-1].args[0],
+            [
+                "restic", "forget",
+                "--keep-daily", "7",
+                "--keep-weekly", "4",
+                "--keep-monthly", "12",
+                "--keep-yearly", "1",
+                "--prune",
+            ],
+        )
+
+    def test_target_policy_fields_shape_normal_backup_forget_command(self):
+        service = BackupObservabilityServiceTests().make_service()
+        target = service.target_repository.get("target-a")
+        target.runtime_environment.update({"RESTIC_KEEP_MONTHLY": "12", "RESTIC_KEEP_YEARLY": "1"})
+        policy = service.create_retention_policy(
+            "selected",
+            keep_last=7,
+            keep_hourly=24,
+            keep_daily=7,
+            keep_weekly=4,
+            keep_monthly=6,
+            keep_yearly=2,
+            prune=True,
+        )
+        target.retention_policy_id = policy.id
+        payload = service._build_backup_payload(target)
+        retention = restic_retention_config_from_environment(payload["environment"])
+        config = BackupConfig(
+            source_paths=["/backup"],
+            restic_repository="local:/repo",
+            **retention,
+        )
+
+        result, run = self.perform_synthetic_restic_backup(config)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            run.call_args_list[-1].args[0],
+            [
+                "restic", "forget",
+                "--keep-last", "7",
+                "--keep-hourly", "24",
+                "--keep-daily", "7",
+                "--keep-weekly", "4",
+                "--keep-monthly", "6",
+                "--keep-yearly", "2",
+                "--prune",
+            ],
+        )
+
+    def test_target_policy_without_prune_keeps_rules_and_omits_prune_flag(self):
+        service = BackupObservabilityServiceTests().make_service()
+        target = service.target_repository.get("target-a")
+        target.runtime_environment.update(
+            {
+                "RESTIC_KEEP_HOURLY": "99",
+                "RESTIC_KEEP_DAILY": "99",
+                "RESTIC_KEEP_WEEKLY": "99",
+                "RESTIC_KEEP_YEARLY": "99",
+            }
+        )
+        policy = service.create_retention_policy(
+            "selected",
+            keep_last=7,
+            keep_monthly=6,
+            prune=False,
+        )
+        target.retention_policy_id = policy.id
+        payload = service._build_backup_payload(target)
+        retention = restic_retention_config_from_environment(payload["environment"])
+        self.assertIsNone(retention["restic_keep_hourly"])
+        self.assertIsNone(retention["restic_keep_daily"])
+        self.assertIsNone(retention["restic_keep_weekly"])
+        self.assertIsNone(retention["restic_keep_yearly"])
+        config = BackupConfig(source_paths=["/backup"], restic_repository="local:/repo", **retention)
+
+        result, run = self.perform_synthetic_restic_backup(config)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            run.call_args_list[-1].args[0],
+            ["restic", "forget", "--keep-last", "7", "--keep-monthly", "6"],
+        )
+
+    def test_no_target_policy_preserves_legacy_retention_defaults(self):
+        retention = restic_retention_config_from_environment({})
+        self.assertEqual(
+            retention,
+            {
+                "restic_keep_last": None,
+                "restic_keep_hourly": None,
+                "restic_keep_daily": 7,
+                "restic_keep_weekly": 4,
+                "restic_keep_monthly": 12,
+                "restic_keep_yearly": 1,
+                "restic_prune": True,
+            },
+        )
+        self.assertTrue(restic_retention_config_from_environment({"RESTIC_PRUNE": "false"})["restic_prune"])
+
+    def test_invalid_retention_values_fail_without_running_forget(self):
+        config = BackupConfig(
+            source_paths=["/backup"],
+            restic_repository="local:/repo",
+            restic_keep_monthly=-1,
+        )
+
+        result, run = self.perform_synthetic_restic_backup(config)
+
+        self.assertFalse(result.success)
+        self.assertEqual(run.call_count, 1)
+
+    def test_restic_backup_is_not_successful_when_forget_fails(self):
+        result, _run = self.perform_synthetic_restic_backup(
+            BackupConfig(source_paths=["/backup"], restic_repository="local:/repo"),
+            forget_error=subprocess.CalledProcessError(
+                1, ["restic", "forget"], stderr="synthetic failure"
+            ),
+        )
+
+        self.assertFalse(result.success)
 
 
 if __name__ == "__main__":

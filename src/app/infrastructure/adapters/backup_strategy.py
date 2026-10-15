@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional
 from src.app.domain.models import BackupConfig, BackupResult, RestoreConfig, RestoreResult
 from src.app.application.ports.ports import BackupStrategy, RestoreStrategy
 from src.app.domain.restore_ownership import RestoreOwnershipPolicy, parse_uid_gid
+from src.restic_retention import build_restic_forget_command
 
 logger = logging.getLogger(__name__)
 
@@ -523,21 +524,30 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             
             size = summary.get("data_added", 0)
             
-            # Prune old snapshots
-            logger.info("Pruning old snapshots...")
-            prune_cmd = [
-                "restic", "forget", "--prune",
-                "--keep-daily", str(config.restic_keep_daily),
-                "--keep-weekly", str(config.restic_keep_weekly),
-                "--keep-monthly", str(config.restic_keep_monthly),
-                "--keep-yearly", str(config.restic_keep_yearly)
-            ]
+            prune_cmd = build_restic_forget_command(
+                keep_last=config.restic_keep_last,
+                keep_hourly=config.restic_keep_hourly,
+                keep_daily=config.restic_keep_daily,
+                keep_weekly=config.restic_keep_weekly,
+                keep_monthly=config.restic_keep_monthly,
+                keep_yearly=config.restic_keep_yearly,
+                prune=config.restic_prune,
+            )
+            logger.info(
+                "Pruning old snapshots..."
+                if config.restic_prune
+                else "Applying Restic retention rules without pruning..."
+            )
             try:
                 subprocess.run(prune_cmd, env=env, check=True)
-                logger.info("Pruning finished successfully.")
-            except subprocess.CalledProcessError as e:
-                logger.error(f"Pruning failed: {e}")
-                # We don't fail the whole backup if prune fails, but we log it.
+            except subprocess.CalledProcessError as exc:
+                logger.error("Restic retention command failed with exit status %s", exc.returncode)
+                raise RuntimeError("Restic retention command failed") from None
+            logger.info(
+                "Pruning finished successfully."
+                if config.restic_prune
+                else "Restic retention rules finished successfully without pruning."
+            )
             
             return BackupResult(
                 timestamp=timestamp,

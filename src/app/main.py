@@ -15,6 +15,7 @@ except ModuleNotFoundError:  # Native workers do not require the Docker SDK.
     DockerAdapter = None
 from src.app.infrastructure.adapters.notifier.influx_notifier import InfluxNotifier
 from src.app.infrastructure.adapters.backup_strategy import TarballBackupStrategy, ResticBackupStrategy
+from src.restic_retention import restic_retention_config_from_environment
 
 class FlushingStreamHandler(logging.StreamHandler):
     def emit(self, record):
@@ -174,10 +175,7 @@ def main():
     rclone_remote = os.environ.get("RCLONE_REMOTE")
     local_archive_path = os.environ.get("BACKUP_ARCHIVE")
 
-    restic_keep_daily = int(os.environ.get("RESTIC_KEEP_DAILY", 7))
-    restic_keep_weekly = int(os.environ.get("RESTIC_KEEP_WEEKLY", 4))
-    restic_keep_monthly = int(os.environ.get("RESTIC_KEEP_MONTHLY", 12))
-    restic_keep_yearly = int(os.environ.get("RESTIC_KEEP_YEARLY", 1))
+    restic_retention = restic_retention_config_from_environment(os.environ)
 
     pre_backup_cmd = os.environ.get("PRE_BACKUP_COMMAND")
     post_backup_cmd = os.environ.get("POST_BACKUP_COMMAND")
@@ -260,12 +258,9 @@ def main():
         rclone_remote=rclone_remote,
         local_archive_path=local_archive_path,
         backup_strategy=backup_strategy_name,
-        restic_keep_daily=restic_keep_daily,
-        restic_keep_weekly=restic_keep_weekly,
-        restic_keep_monthly=restic_keep_monthly,
-        restic_keep_yearly=restic_keep_yearly,
         pre_backup_command=pre_backup_cmd,
-        post_backup_command=post_backup_cmd
+        post_backup_command=post_backup_cmd,
+        **restic_retention,
     )
 
     container_config = ContainerConfig(

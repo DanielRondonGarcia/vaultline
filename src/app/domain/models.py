@@ -4,6 +4,8 @@ from datetime import datetime
 
 from typing import TYPE_CHECKING
 
+from src.restic_retention import LEGACY_RETENTION_DEFAULTS
+
 if TYPE_CHECKING:
     from src.app.domain.restore_ownership import RestoreOwnershipPolicy
 
@@ -22,12 +24,15 @@ class BackupConfig:
     rclone_remote: Optional[str] = None
     local_archive_path: Optional[str] = None
     backup_strategy: str = "tar"  # "tar" or "restic"
-    restic_keep_daily: Optional[int] = 7
-    restic_keep_weekly: Optional[int] = 4
-    restic_keep_monthly: Optional[int] = 12
-    restic_keep_yearly: Optional[int] = 1
+    restic_keep_daily: Optional[int] = LEGACY_RETENTION_DEFAULTS["keep_daily"]
+    restic_keep_weekly: Optional[int] = LEGACY_RETENTION_DEFAULTS["keep_weekly"]
+    restic_keep_monthly: Optional[int] = LEGACY_RETENTION_DEFAULTS["keep_monthly"]
+    restic_keep_yearly: Optional[int] = LEGACY_RETENTION_DEFAULTS["keep_yearly"]
     pre_backup_command: Optional[str] = None
     post_backup_command: Optional[str] = None
+    restic_keep_last: Optional[int] = None
+    restic_keep_hourly: Optional[int] = None
+    restic_prune: bool = True
 
 @dataclass
 class ContainerConfig:

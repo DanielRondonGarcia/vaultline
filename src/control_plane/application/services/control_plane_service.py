@@ -43,6 +43,7 @@ from src.control_plane.domain.models import (
     WorkerStatus,
     utcnow,
 )
+from src.restic_retention import apply_target_retention_policy, build_restic_forget_command
 
 logger = logging.getLogger(__name__)
 _TARGET_FIELD_UNSET = object()
@@ -2157,6 +2158,9 @@ class ControlPlaneService:
         effective_mode = configured_mode if backup_mode is None else self._validate_runtime_backup_mode(target.runtime_type, backup_mode)
         environment, volumes, resolved_files = self._resolve_runtime_dependencies(target)
         environment.setdefault("BACKUP_STRATEGY", target.backup_strategy)
+        if target.retention_policy_id and str(target.backup_strategy).strip().lower() == "restic":
+            policy = self._require_retention_policy(target.retention_policy_id)
+            environment = apply_target_retention_policy(environment, policy)
         volumes = self._normalize_runtime_volumes(volumes, target)
         if target.runtime_type == "native":
             environment.pop("BACKUP_SOURCES", None)
@@ -2403,21 +2407,15 @@ class ControlPlaneService:
         if policy is None:
             raise ValueError(f"target {target.id} has no retention policy configured")
 
-        command_parts = ["restic", "forget"]
-        if policy.keep_last is not None:
-            command_parts.extend(["--keep-last", str(policy.keep_last)])
-        if policy.keep_hourly is not None:
-            command_parts.extend(["--keep-hourly", str(policy.keep_hourly)])
-        if policy.keep_daily is not None:
-            command_parts.extend(["--keep-daily", str(policy.keep_daily)])
-        if policy.keep_weekly is not None:
-            command_parts.extend(["--keep-weekly", str(policy.keep_weekly)])
-        if policy.keep_monthly is not None:
-            command_parts.extend(["--keep-monthly", str(policy.keep_monthly)])
-        if policy.keep_yearly is not None:
-            command_parts.extend(["--keep-yearly", str(policy.keep_yearly)])
-        if policy.prune:
-            command_parts.append("--prune")
+        command_parts = build_restic_forget_command(
+            keep_last=policy.keep_last,
+            keep_hourly=policy.keep_hourly,
+            keep_daily=policy.keep_daily,
+            keep_weekly=policy.keep_weekly,
+            keep_monthly=policy.keep_monthly,
+            keep_yearly=policy.keep_yearly,
+            prune=policy.prune,
+        )
 
         return {
             "target_id": target.id,

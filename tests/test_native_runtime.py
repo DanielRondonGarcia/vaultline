@@ -9,6 +9,35 @@ from src.worker_agent.infrastructure.adapters.native_runtime import NativeRuntim
 
 
 class NativeRuntimeAdapterTests(unittest.TestCase):
+    def test_native_runtime_overlays_explicit_unset_retention_fields(self):
+        adapter = NativeRuntimeAdapter()
+        payload = {
+            "runtime_type": "native",
+            "filesystem_paths": ["/srv/app"],
+            "command": ["restic", "snapshots", "--json"],
+            "environment": {
+                "RESTIC_RETENTION_POLICY_CONFIGURED": "true",
+                "RESTIC_KEEP_LAST": "7",
+                "RESTIC_KEEP_HOURLY": "",
+                "RESTIC_KEEP_DAILY": "",
+                "RESTIC_KEEP_WEEKLY": "",
+                "RESTIC_KEEP_MONTHLY": "6",
+                "RESTIC_KEEP_YEARLY": "",
+                "RESTIC_PRUNE": "false",
+            },
+        }
+
+        with patch.dict(os.environ, {"RESTIC_KEEP_HOURLY": "99", "RESTIC_KEEP_MONTHLY": "12"}), patch.object(
+            adapter, "_require_executable"
+        ):
+            _command, environment = adapter._command_and_environment(payload)
+
+        self.assertEqual(environment["RESTIC_KEEP_LAST"], "7")
+        self.assertEqual(environment["RESTIC_KEEP_HOURLY"], "")
+        self.assertEqual(environment["RESTIC_KEEP_MONTHLY"], "6")
+        self.assertEqual(environment["RESTIC_KEEP_YEARLY"], "")
+        self.assertEqual(environment["RESTIC_PRUNE"], "false")
+
     def test_rclone_file_secret_is_materialized_and_removed_after_process(self):
         adapter = NativeRuntimeAdapter()
         secret = "[remote]\ntype = s3\nsecret_access_key = hidden-value\n"

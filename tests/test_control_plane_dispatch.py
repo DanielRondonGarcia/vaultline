@@ -1303,6 +1303,29 @@ class ControlPlaneDispatchTests(unittest.TestCase):
         second_fingerprint = service._repository_fingerprint(target)
         self.assertNotEqual(first_fingerprint, second_fingerprint)
 
+    def test_manual_retention_command_uses_the_selected_target_policy_fields(self):
+        service = self.make_service()
+        target = service.target_repository.get("target-a")
+        policy = service.create_retention_policy(
+            "selected",
+            keep_last=7,
+            keep_hourly=24,
+            keep_daily=7,
+            keep_weekly=4,
+            keep_monthly=6,
+            keep_yearly=2,
+            prune=True,
+        )
+        target.retention_policy_id = policy.id
+
+        payload = service._build_retention_payload(target)
+
+        self.assertEqual(
+            payload["command"],
+            "restic forget --keep-last 7 --keep-hourly 24 --keep-daily 7 "
+            "--keep-weekly 4 --keep-monthly 6 --keep-yearly 2 --prune",
+        )
+
     def test_path_storage_replaces_only_the_global_target_suffix(self):
         service = self.make_service()
         target = service.target_repository.get("target-a")

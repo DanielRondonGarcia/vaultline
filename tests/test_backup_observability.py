@@ -540,8 +540,10 @@ class ProgressClientAndWorkerTests(unittest.TestCase):
 
 
 class RuntimeAndResticStreamingTests(unittest.TestCase):
-    @staticmethod
-    def perform_synthetic_restic_backup(config, forget_error=None):
+    RESOLVED_RESTIC = "/pyinstaller-bundle/restic"
+
+    @classmethod
+    def perform_synthetic_restic_backup(cls, config, forget_error=None):
         class Stream:
             def __init__(self, lines):
                 self.lines = list(lines)
@@ -561,10 +563,13 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
         run = Mock()
         if forget_error is not None:
             run.side_effect = [Mock(), forget_error]
-        with patch("src.app.infrastructure.adapters.backup_strategy._require_executable"), patch(
+        with patch(
+            "src.app.infrastructure.adapters.backup_strategy._require_executable", return_value=cls.RESOLVED_RESTIC
+        ) as require_executable, patch(
             "src.app.infrastructure.adapters.backup_strategy.subprocess.Popen", side_effect=lambda *_args, **_kwargs: Process()
         ), patch("src.app.infrastructure.adapters.backup_strategy.subprocess.run", run):
             result = ResticBackupStrategy().perform_backup(config)
+        require_executable.assert_called_once_with("restic")
         return result, run
 
     def test_docker_streaming_emits_short_initial_chunks_before_long_secret_tail(self):
@@ -670,7 +675,9 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
 
         callback_lines = []
         strategy = ResticBackupStrategy()
-        with patch("src.app.infrastructure.adapters.backup_strategy._require_executable") as require_executable, patch(
+        with patch(
+            "src.app.infrastructure.adapters.backup_strategy._require_executable", return_value=self.RESOLVED_RESTIC
+        ) as require_executable, patch(
             "src.app.infrastructure.adapters.backup_strategy.subprocess.Popen", return_value=Process()
         ) as popen, patch("src.app.infrastructure.adapters.backup_strategy.subprocess.run") as run:
             result = strategy.perform_backup(
@@ -685,11 +692,13 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
         require_executable.assert_called_once_with("restic")
         popen.assert_called_once()
         self.assertNotIn("shell", popen.call_args.kwargs)
+        self.assertEqual(popen.call_args.args[0], [self.RESOLVED_RESTIC, "backup", "--json", "/backup"])
         self.assertEqual(run.call_count, 2)
+        self.assertEqual(run.call_args_list[0].args[0], [self.RESOLVED_RESTIC, "snapshots", "--json", "--latest", "1"])
         self.assertEqual(
             run.call_args_list[-1].args[0],
             [
-                "restic", "forget",
+                self.RESOLVED_RESTIC, "forget",
                 "--keep-daily", "7",
                 "--keep-weekly", "4",
                 "--keep-monthly", "12",
@@ -727,7 +736,7 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
         self.assertEqual(
             run.call_args_list[-1].args[0],
             [
-                "restic", "forget",
+                self.RESOLVED_RESTIC, "forget",
                 "--keep-last", "7",
                 "--keep-hourly", "24",
                 "--keep-daily", "7",
@@ -769,7 +778,7 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
         self.assertTrue(result.success, result.error)
         self.assertEqual(
             run.call_args_list[-1].args[0],
-            ["restic", "forget", "--keep-last", "7", "--keep-monthly", "6"],
+            [self.RESOLVED_RESTIC, "forget", "--keep-last", "7", "--keep-monthly", "6"],
         )
 
     def test_no_target_policy_preserves_legacy_retention_defaults(self):

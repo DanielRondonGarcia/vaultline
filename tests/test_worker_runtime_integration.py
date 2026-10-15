@@ -140,11 +140,18 @@ class KubernetesDependencyAndReleaseTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "release-dispatch.yml").read_text(encoding="utf-8")
         manifest = (ROOT / "deploy" / "worker" / "k8s" / "worker.yaml").read_text(encoding="utf-8")
 
-        self.assertGreaterEqual(workflow.count("platforms: linux/amd64,linux/arm64"), 3)
-        self.assertIn("target: backup-runtime", workflow)
-        self.assertIn("target: control-plane", workflow)
-        self.assertIn("target: worker", workflow)
-        self.assertIn("INSTALL_DOCKER_CLI=true", workflow)
+        image_job = workflow.split("  image-build:", 1)[1].split("  publish-release:", 1)[0]
+        native_linux_job = workflow.split("  native-linux:", 1)[1].split("  native-windows:", 1)[0]
+
+        self.assertEqual(image_job.count("--platform linux/amd64"), 3)
+        self.assertNotIn("linux/arm64", image_job)
+        self.assertIn("--target backup-runtime", image_job)
+        self.assertIn("--target control-plane", image_job)
+        self.assertIn("--target worker", image_job)
+        self.assertIn("INSTALL_DOCKER_CLI=true", image_job)
+        self.assertIn("- arch: amd64", native_linux_job)
+        self.assertIn("- arch: arm64", native_linux_job)
+        self.assertIn("runner: ubuntu-24.04-arm", native_linux_job)
         self.assertIn("ghcr.io/danielrondongarcia/vaultline-worker:latest", manifest)
         self.assertIn("name: WORKER_RUNTIME\n              value: kubernetes", manifest)
         self.assertIn("name: BACKUP_RUNTIME_IMAGE\n              value: ghcr.io/danielrondongarcia/vaultline:latest", manifest)

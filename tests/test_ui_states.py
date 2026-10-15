@@ -1999,9 +1999,10 @@ class WorkerUiStateTests(unittest.TestCase):
             'renderNativeWorkerTab',
             'No se infiere desde el navegador',
             'vaultline-worker enroll',
-            'prompt oculto',
             'copyEnrollmentSecret',
-            'Pegar solo en el prompt oculto',
+            'Copiar secreto',
+            'Copiar comandos',
+            'Token de un solo uso en el comando',
             'SHA256',
             'SHA256SUMS',
             'No hay assets nativos publicados para esta version',
@@ -2010,8 +2011,21 @@ class WorkerUiStateTests(unittest.TestCase):
             self.assertIn(marker, self.source)
         commands_block = re.search(r"function renderNativeWorkerTab\(.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(commands_block)
-        self.assertNotIn("e.secret", commands_block.group(0))
-        self.assertNotIn("WORKER_ENROLLMENT_TOKEN", commands_block.group(0))
+        tab_source = commands_block.group(0)
+        # The token is embedded on purpose (single-use, short-lived); the old
+        # "never paste it into commands" guidance must be gone.
+        self.assertIn("addWorkerState.enrollment", tab_source)
+        self.assertIn("--bootstrap-token ${secret}", tab_source)
+        self.assertIn("NATIVE_WORKER_TOKEN_PLACEHOLDER", tab_source)
+        self.assertIn("NATIVE_WORKER_ASSET_URL_PLACEHOLDER", tab_source)
+        self.assertIn("Generar credencial", tab_source)
+        self.assertNotIn("WORKER_ENROLLMENT_TOKEN", tab_source)
+        for stale in ("prompt oculto", "No lo pegues en comandos", "Secreto separado"):
+            self.assertNotIn(stale, self.source)
+        self.assertIn('const NATIVE_WORKER_TOKEN_PLACEHOLDER = "<BOOTSTRAP_TOKEN>";', self.source)
+        self.assertIn('const NATIVE_WORKER_ASSET_URL_PLACEHOLDER = "<ASSET_URL>";', self.source)
+        self.assertIn("ttl_minutes };", self.source)
+        self.assertIn("${escapeHtml(commands)}", tab_source)
 
     def test_worker_enrollment_native_instructions_preserve_platform_contract(self):
         for marker in (
@@ -2060,19 +2074,42 @@ class WorkerUiStateTests(unittest.TestCase):
         windows_commands = windows.group(1)
         linux_commands = linux.group(1)
 
-        self.assertIn("msiexec /i ${packageName} /qn /norestart", windows_commands)
-        self.assertIn("vaultline-worker enroll --control-plane-url ${cpUrl}", windows_commands)
+        # Copy-paste contract: every line is a command (no `#` comments, no blank
+        # lines), ordered download -> install -> enroll with token -> status.
+        for name, block in (("windows", windows_commands), ("linux", linux_commands)):
+            with self.subTest(block=name):
+                lines = block.split("\n")
+                self.assertTrue(all(line.strip() for line in lines), lines)
+                self.assertFalse(any(line.lstrip().startswith("#") for line in lines), lines)
+                self.assertIn("enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", block)
+                self.assertIn("${assetUrl}", block)
+
+        self.assertIn("Invoke-WebRequest -Uri ${assetUrl} -OutFile $msi", windows_commands)
+        self.assertIn("$msi = \"$env:TEMP\\\\${packageName}\"", windows_commands)
+        # msiexec returns immediately in PowerShell: the block must wait for the install.
+        self.assertIn("Start-Process msiexec.exe -ArgumentList ('/i \"{0}\" /qn /norestart' -f $msi) -Wait", windows_commands)
+        # A fresh install updates the machine PATH only; the session must reload it.
+        self.assertIn('$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine")', windows_commands)
+        self.assertIn("vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", windows_commands)
         self.assertIn("vaultline-worker service status", windows_commands)
-        self.assertIn("espera el enrolamiento", windows_commands)
-        self.assertLess(windows_commands.index("msiexec /i"), windows_commands.index("enroll --control-plane-url"))
+        self.assertLess(windows_commands.index("Invoke-WebRequest"), windows_commands.index("msiexec.exe"))
+        self.assertLess(windows_commands.index("msiexec.exe"), windows_commands.index("$env:Path ="))
+        self.assertLess(windows_commands.index("$env:Path ="), windows_commands.index("enroll --control-plane-url"))
         self.assertLess(windows_commands.index("enroll --control-plane-url"), windows_commands.index("service status"))
 
+        self.assertIn("curl -fsSL -o ${packageName} ${assetUrl}", linux_commands)
         self.assertIn("sudo dpkg -i ${packageName}", linux_commands)
-        self.assertIn("sudo vaultline-worker enroll --control-plane-url ${cpUrl}", linux_commands)
-        self.assertIn("systemctl status docker-volume-backup-worker.service", linux_commands)
-        self.assertIn("espera el enrolamiento", linux_commands)
+        self.assertIn("sudo vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", linux_commands)
+        self.assertIn("sudo systemctl status docker-volume-backup-worker.service --no-pager", linux_commands)
+        self.assertLess(linux_commands.index("curl -fsSL"), linux_commands.index("dpkg -i"))
         self.assertLess(linux_commands.index("dpkg -i"), linux_commands.index("enroll --control-plane-url"))
         self.assertLess(linux_commands.index("enroll --control-plane-url"), linux_commands.index("systemctl status"))
+
+        # Guidance lives in the panel text, not inside the command block.
+        self.assertIn("espera el enrolamiento", tab_source)
+        self.assertIn("Run as administrator", tab_source)
+        self.assertIn("journalctl -u docker-volume-backup-worker.service -f", tab_source)
+        self.assertIn('data-code-id="modalCode">Copiar comandos</button>', tab_source)
 
         # The service is already running after install: no manual enable/start and no Task Scheduler.
         for stale in (

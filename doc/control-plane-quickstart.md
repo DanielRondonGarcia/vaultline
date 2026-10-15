@@ -206,12 +206,13 @@ La opción recomendada para nuevos workers nativos es el flujo V2 seguro desde l
 El modelo es el mismo en ambas plataformas, al estilo `tailscaled` + `tailscale up`:
 
 1. **Instala el paquete.** El instalador registra y arranca el servicio del SO. El servicio espera el enrolamiento sin salir: reporta `not_ready` en `/healthz` y revisa la credencial en cada ciclo.
-2. **Enrola una sola vez** como administrador o root: `vaultline-worker enroll --control-plane-url <url>`. Pega el secreto solo en el prompt oculto. El comando guarda la credencial durable y la URL del Control Plane (`worker.json`) en el directorio de estado.
+2. **Enrola una sola vez** como administrador o root: `vaultline-worker enroll --control-plane-url <url> --bootstrap-token <token>`. La UI genera este comando con el token ya incluido, listo para pegar. Si omites `--bootstrap-token` (y la variable `VAULTLINE_BOOTSTRAP_TOKEN`), el CLI lo pide en un prompt oculto. El comando guarda la credencial durable y la URL del Control Plane (`worker.json`) en el directorio de estado.
 3. **Listo.** El servicio toma la credencial en el siguiente ciclo de polling (30 s por defecto) sin reiniciar.
 
 Reglas que no cambian:
 
-- No pongas el token en argumentos, archivos, artefactos, scripts, variables de entorno persistentes ni logs.
+- El bootstrap token es de un solo uso y expira según el TTL elegido en la UI (60 minutos por defecto). Pegarlo en el comando `enroll` es aceptable porque deja de servir en cuanto se consume o expira; si quieres, limpia el historial de la terminal después de enrolar. No lo guardes en archivos, scripts, unidades del servicio, variables de entorno persistentes ni logs.
+- Si `enroll` falla, el CLI imprime el motivo real ya redactado (por ejemplo `HTTP 400 (code=enrollment_expired)`), conserva el intento pendiente y nombra la salida: con el mismo token puedes reintentar; si el token expiró o ya se usó, genera uno nuevo en la UI y ejecuta antes `vaultline-worker enroll --reset-pending`.
 - Descarga el asset desde la UI o desde la [página canónica de releases de Vaultline](https://github.com/DanielRondonGarcia/vaultline/releases) y verifícalo con `SHA256SUMS` cuando esté disponible.
 - Restic v0.19.1 and rclone v1.75.2 executables are bundled with native worker packages. Keep `rclone.conf` and repository credentials in their separate secrets; they are never included in the package. Install the remaining external tools (`tar`, `gpg`, `aws`, `ssh`, and `scp`) separately as required by the backup or storage target.
 - V2 seguro separa el bootstrap token de la credencial durable generada por el cliente. V1 legacy con variable de entorno de token sigue documentado solo para workers existentes o despliegues Compose heredados.
@@ -285,20 +286,23 @@ El paquete `.deb` hace todo el trabajo de instalación: crea el usuario
 `/var/lib/docker-volume-backup` y habilita y arranca
 `docker-volume-backup-worker.service`, que espera el enrolamiento.
 
+La UI (**Workers → Agregar worker → Worker nativo**) genera este bloque con la
+URL del asset y el token ya rellenados; se pega completo como root y queda
+listo. Descarga, instala (el servicio queda arrancado, esperando el
+enrolamiento), enrola y muestra el estado:
+
 ```bash
-# 1. Instalar (el servicio queda arrancado, esperando el enrolamiento)
+curl -fsSL -o vaultline-worker_<version>_amd64.deb https://github.com/DanielRondonGarcia/vaultline/releases/download/<version>/vaultline-worker_<version>_amd64.deb
 sudo dpkg -i vaultline-worker_<version>_amd64.deb
-
-# 2. Enrolar una sola vez; pega el secreto solo en el prompt oculto.
-#    Escribe worker_credentials.json y worker.json en /var/lib/docker-volume-backup
-#    con dueño dvb-worker.
-sudo vaultline-worker enroll --control-plane-url https://backups.example.com
-
-# 3. Verificar: el servicio toma la credencial en el siguiente ciclo (30 s)
-systemctl status docker-volume-backup-worker.service
-journalctl -u docker-volume-backup-worker.service -f
-vaultline-worker service status
+sudo vaultline-worker enroll --control-plane-url https://backups.example.com --bootstrap-token <token>
+sudo systemctl status docker-volume-backup-worker.service --no-pager
 ```
+
+`enroll` escribe `worker_credentials.json` y `worker.json` en
+`/var/lib/docker-volume-backup` con dueño `dvb-worker`; el servicio toma la
+credencial en el siguiente ciclo (30 s). Para seguir los logs:
+`journalctl -u docker-volume-backup-worker.service -f` o
+`vaultline-worker service status`.
 
 `/etc/docker-volume-backup/worker.env` es **opcional**. Créalo solo para
 overrides no secretos (`WORKER_NAME`, `WORKER_POLL_INTERVAL_SECONDS`,
@@ -338,19 +342,24 @@ registra y arranca el servicio `VaultlineWorker` (Windows SCM, cuenta
 espera el enrolamiento escribiendo "Waiting for enrollment" en
 `C:\ProgramData\Vaultline\worker\logs\worker.log`.
 
+La UI genera este bloque con la URL del asset y el token ya rellenados; se pega
+completo en una PowerShell **elevada** (Run as administrator). Descarga el MSI,
+lo instala en silencio esperando a que termine (SmartScreen puede advertir: el
+MSI no está firmado), recarga el `PATH` de la sesión (el MSI añade
+`C:\Program Files\Vaultline` al `PATH` del sistema, pero la consola abierta no
+lo ve hasta recargarlo), enrola y muestra el estado:
+
 ```powershell
-# 1. Instalar (doble clic sobre el .msi o silencioso). SmartScreen puede advertir:
-#    el MSI no esta firmado.
-msiexec /i vaultline-worker_<version>_windows-amd64.msi /qn /norestart
-
-# 2. Abrir una PowerShell elevada NUEVA (para que cargue el PATH) y enrolar una
-#    sola vez; pega el secreto solo en el prompt oculto.
-vaultline-worker enroll --control-plane-url https://backups.example.com
-
-# 3. Verificar: el servicio toma la credencial en el siguiente ciclo (30 s)
+$msi = "$env:TEMP\vaultline-worker_<version>_windows-amd64.msi"
+Invoke-WebRequest -Uri https://github.com/DanielRondonGarcia/vaultline/releases/download/<version>/vaultline-worker_<version>_windows-amd64.msi -OutFile $msi
+Start-Process msiexec.exe -ArgumentList ('/i "{0}" /qn /norestart' -f $msi) -Wait
+$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+vaultline-worker enroll --control-plane-url https://backups.example.com --bootstrap-token <token>
 vaultline-worker service status
-Get-Content C:\ProgramData\Vaultline\worker\logs\worker.log -Tail 50
 ```
+
+El servicio toma la credencial en el siguiente ciclo (30 s). Para ver los logs:
+`Get-Content C:\ProgramData\Vaultline\worker\logs\worker.log -Tail 50`.
 
 `service status` imprime JSON con el estado del servicio y la ruta `log_file`.
 `enroll` escribe `worker_credentials.json` y `worker.json` (URL del Control

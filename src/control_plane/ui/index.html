@@ -1231,7 +1231,7 @@
                    </div>`
                 : `<div class="alert warning" role="alert"><strong>Bootstrap desde cero.</strong> No hay migracion ni registro abierto. Genera un secreto HMAC de un solo uso y provisiona una credencial nueva.</div>
                    <div class="alert warning" role="alert"><strong>Si el worker ya existe, no lo agregues otra vez.</strong> Usa <strong>Renovar enrollment</strong> en su fila para conservar el mismo <code>worker_id</code> y evitar duplicados.</div>
-                   <div class="helper">El secreto no se muestra: usa el boton de copia, guardalo en un gestor de secretos y entregalo al worker solo durante el primer arranque.</div>
+                   <div class="helper">El secreto se genera en el navegador y se entrega al worker una sola vez: en los comandos del worker nativo o como WORKER_ENROLLMENT_TOKEN en Compose. Expira según el TTL y se invalida al usarse.</div>
                    <div class="field-row">
                      <div class="field"><label for="awName">Nombre del worker</label><input id="awName" name="worker_name" autocomplete="off" placeholder="worker-prod-01" value="worker" /></div>
                      <div class="field"><label for="awHost">Host</label><input id="awHost" name="worker_host" autocomplete="off" placeholder="srv-prod-01" value="unknown-host" /></div>
@@ -1274,7 +1274,7 @@
           : "/api/v1/admin/worker-enrollments";
         const payload = isRenewal ? { ttl_minutes, secret } : { name, host_name, ttl_minutes, secret };
         const enrollment = await apiPost(endpoint, payload);
-        addWorkerState.enrollment = { ...enrollment, worker_id: enrollment.worker_id || workerId, name, host_name, secret };
+        addWorkerState.enrollment = { ...enrollment, worker_id: enrollment.worker_id || workerId, name, host_name, secret, ttl_minutes };
         addWorkerState.step = "commands";
         renderAddWorkerModal();
       }, "Generando...").catch((error) => {
@@ -1315,44 +1315,52 @@
       return `<dl class="native-asset-meta"><div><dt>Tag</dt><dd>${escapeHtml(state.latestVersion || "release")}</dd></div><div><dt>Archivo</dt><dd><a href="${escapeHtml(asset.url)}" target="_blank" rel="noopener">${escapeHtml(asset.name || "descargar")}</a></dd></div>${asset.sha256 ? `<div><dt>SHA256</dt><dd><code>${escapeHtml(asset.sha256)}</code></dd></div>` : ""}${checksums ? `<div><dt>Checksums</dt><dd><a href="${escapeHtml(checksums.url)}" target="_blank" rel="noopener">SHA256SUMS</a></dd></div>` : ""}${secondary}</dl>`;
     }
 
+    // Placeholders are rendered verbatim inside the command block when the UI
+    // cannot resolve a value, so a pasted command fails loudly instead of silently.
+    const NATIVE_WORKER_TOKEN_PLACEHOLDER = "<BOOTSTRAP_TOKEN>";
+    const NATIVE_WORKER_ASSET_URL_PLACEHOLDER = "<ASSET_URL>";
+
     function renderNativeWorkerTab(cpUrl) {
       const { platform, info, asset, secondaryAsset, checksums } = assetForSelectedNativePlatform();
       const downloadUrl = asset ? asset.url : nativeWorkerReleaseUrl();
       const downloadLabel = asset ? "Descargar asset directo" : "Abrir pagina de release";
       const packageName = (asset && asset.name) || `vaultline-worker_${state.latestVersion || "<version>"}_${info.packageSuffix}`;
-      const linuxCommands = `# 1. Instala el paquete: crea el usuario dvb-worker, habilita y arranca
-#    docker-volume-backup-worker.service, que espera el enrolamiento.
+      // Release assets embed the tag in their file name, so without a resolved
+      // asset there is no deterministic download URL to offer.
+      const assetUrl = asset ? asset.url : NATIVE_WORKER_ASSET_URL_PLACEHOLDER;
+      const enrollment = addWorkerState.enrollment;
+      const secret = (enrollment && enrollment.secret) || NATIVE_WORKER_TOKEN_PLACEHOLDER;
+      const ttlMinutes = (enrollment && enrollment.ttl_minutes) || null;
+      const linuxCommands = `curl -fsSL -o ${packageName} ${assetUrl}
 sudo dpkg -i ${packageName}
-
-# 2. Enrola una sola vez (pega el secreto solo en el prompt oculto).
-#    Guarda la credencial y la URL del Control Plane en /var/lib/docker-volume-backup.
-sudo vaultline-worker enroll --control-plane-url ${cpUrl}
-
-# 3. El servicio toma la credencial en el siguiente ciclo (30 s) sin reiniciar.
-systemctl status docker-volume-backup-worker.service
-journalctl -u docker-volume-backup-worker.service -f`;
-      const windowsCommands = `# 1. Instala el MSI (doble clic o silencioso): registra y arranca el servicio
-#    VaultlineWorker (LocalSystem, inicio automatico), que espera el enrolamiento.
-msiexec /i ${packageName} /qn /norestart
-
-# 2. Abre una PowerShell elevada NUEVA (refresca el PATH) y enrola una sola vez.
-#    Pega el secreto solo en el prompt oculto; la credencial y la URL del
-#    Control Plane quedan en C:\\ProgramData\\Vaultline\\worker.
-vaultline-worker enroll --control-plane-url ${cpUrl}
-
-# 3. El servicio toma la credencial en el siguiente ciclo (30 s) sin reiniciar.
-vaultline-worker service status
-Get-Content C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log -Tail 50`;
+sudo vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}
+sudo systemctl status docker-volume-backup-worker.service --no-pager`;
+      // msiexec returns immediately in PowerShell; Start-Process -Wait keeps the
+      // pasted block sequential. The MSI appends C:\Program Files\Vaultline to
+      // the machine PATH, which the current session does not see until reloaded.
+      const windowsCommands = `$msi = "$env:TEMP\\${packageName}"
+Invoke-WebRequest -Uri ${assetUrl} -OutFile $msi
+Start-Process msiexec.exe -ArgumentList ('/i "{0}" /qn /norestart' -f $msi) -Wait
+$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}
+vaultline-worker service status`;
       const commands = info.os === "windows" ? windowsCommands : linuxCommands;
       const platformNote = info.os === "windows"
-        ? "Windows x64 instala el servicio SCM VaultlineWorker desde el MSI. Estado y credenciales en C:\\ProgramData\\Vaultline\\worker; logs en C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log. El MSI y el ejecutable no estan firmados: puede aparecer SmartScreen. El ejecutable portable queda solo para diagnostico (vaultline-worker.exe daemon) o para registrar el servicio a mano (service install)."
-        : "Linux requiere glibc >= 2.17. El .deb crea el usuario dvb-worker, /var/lib/docker-volume-backup y docker-volume-backup-worker.service. /etc/docker-volume-backup/worker.env es opcional: solo para overrides como WORKER_NAME o WORKER_POLL_INTERVAL_SECONDS (el entorno siempre gana sobre worker.json).";
+        ? "Windows x64: ejecuta el bloque en una PowerShell elevada (Run as administrator). Instala el servicio SCM VaultlineWorker desde el MSI (LocalSystem, inicio automatico). Estado y credenciales en C:\\ProgramData\\Vaultline\\worker; logs en C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log. El MSI y el ejecutable no estan firmados: puede aparecer SmartScreen. El ejecutable portable queda solo para diagnostico (vaultline-worker.exe daemon) o para registrar el servicio a mano (service install)."
+        : "Linux requiere glibc >= 2.17. El .deb crea el usuario dvb-worker, /var/lib/docker-volume-backup y docker-volume-backup-worker.service; sigue los logs con journalctl -u docker-volume-backup-worker.service -f. /etc/docker-volume-backup/worker.env es opcional: solo para overrides como WORKER_NAME o WORKER_POLL_INTERVAL_SECONDS (el entorno siempre gana sobre worker.json).";
+      const tokenNotice = enrollment && enrollment.secret
+        ? `<div class="alert info" role="status"><strong>Token de un solo uso en el comando.</strong> El comando <code>enroll</code> ya incluye el bootstrap token: expira ${ttlMinutes ? `en ${escapeHtml(String(ttlMinutes))} minutos` : "al cumplirse el TTL configurado"} (${escapeHtml(fmtDate(enrollment.expires_at))}) y se invalida al usarse. Si el enrolamiento falla después de ese plazo, vuelve a <strong>Generar credencial</strong> y copia los comandos de nuevo. Si lo prefieres, limpia el historial de la terminal después de enrolar.</div>`
+        : `<div class="alert warning" role="alert"><strong>Falta el bootstrap token.</strong> Los comandos muestran <code>${escapeHtml(NATIVE_WORKER_TOKEN_PLACEHOLDER)}</code> porque aún no hay una credencial generada. Pulsa <strong>Volver</strong> y luego <strong>Generar credencial</strong> para obtener comandos listos para pegar.</div>`;
+      const assetNotice = asset
+        ? ""
+        : `<div class="alert warning" role="alert"><strong>Sin URL de descarga.</strong> Los comandos muestran <code>${escapeHtml(NATIVE_WORKER_ASSET_URL_PLACEHOLDER)}</code>: reemplázalo por la URL del asset <code>${escapeHtml(packageName)}</code> desde la pagina de release.</div>`;
       return `<div class="native-worker-panel" data-native-worker-platform="${escapeHtml(platform)}">
         <div class="field"><label for="nativePlatformSelect">Plataforma del worker remoto</label><select id="nativePlatformSelect" aria-describedby="nativePlatformHint">${Object.entries(NATIVE_WORKER_PLATFORMS).map(([key, value]) => `<option value="${escapeHtml(key)}" ${key === platform ? "selected" : ""}>${escapeHtml(value.label)}</option>`).join("")}</select><div class="hint" id="nativePlatformHint">Selecciona explicitamente la plataforma del host remoto. No se infiere desde el navegador.</div></div>
         <div class="card compact"><div class="eyebrow">Asset nativo</div>${renderAssetMetadata(asset, checksums, secondaryAsset, info.secondaryLabel)}<a class="btn secondary sm" href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener">${downloadLabel}</a></div>
-        <div class="alert info" role="status"><strong>Secreto separado.</strong> Usa <strong>Copiar secreto de enrolamiento</strong>. Pegar solo en el prompt oculto de <code>vaultline-worker enroll</code>. No lo pegues en comandos, archivos, artefactos ni tareas.</div>
-        <p class="helper">El paquete instala y arranca el servicio, que espera el enrolamiento; ejecuta <code>enroll</code> una vez como administrador o root y el servicio toma la credencial sin reiniciar. Al actualizar, instala el paquete nuevo sobre el existente: se conservan el estado y las credenciales, sin necesidad de volver a enrolar. ${escapeHtml(platformNote)} Los ejecutables de Restic y rclone se incluyen con el worker nativo. Mantén <code>rclone.conf</code> y las credenciales del repositorio en secretos separados; no se incluyen en el paquete. Instala por separado las demás herramientas externas (tar, gpg, aws, ssh y scp) según lo requiera el destino.</p>
-        <div class="code-block"><button class="copy-btn" data-code-id="modalCode">Copiar</button><pre id="modalCode">${escapeHtml(commands)}</pre></div>
+        ${tokenNotice}
+        ${assetNotice}
+        <p class="helper">Pega el bloque completo como administrador o root: descarga el paquete, lo instala (el servicio arranca y espera el enrolamiento), enrola una vez con el token y muestra el estado; el servicio toma la credencial sin reiniciar. Al actualizar, instala el paquete nuevo sobre el existente: se conservan el estado y las credenciales, sin necesidad de volver a enrolar. ${escapeHtml(platformNote)} Los ejecutables de Restic y rclone se incluyen con el worker nativo. Mantén <code>rclone.conf</code> y las credenciales del repositorio en secretos separados; no se incluyen en el paquete. Instala por separado las demás herramientas externas (tar, gpg, aws, ssh y scp) según lo requiera el destino.</p>
+        <div class="code-block"><button class="copy-btn" data-code-id="modalCode">Copiar comandos</button><pre id="modalCode">${escapeHtml(commands)}</pre></div>
       </div>`;
     }
 
@@ -1420,7 +1428,7 @@ docker compose up -d
             </div>
             <div class="modal-body">
               ${isRenewal ? `<div class="alert info" role="status">El nuevo Compose conserva el mismo <code>worker_id</code> y no crea un registro duplicado. La credencial anterior se reemplazara cuando este token se consuma correctamente.</div>` : ""}
-             <div class="card compact"><div class="eyebrow">${isRenewal ? "Enrollment renovado" : "Credencial HMAC lista"}</div><div class="value" style="font-size:13px;font-family:var(--font-mono);word-break:break-all">Worker ID: ${escapeHtml(workerId)}</div><div class="meta">Nombre: ${escapeHtml(wName)}. Host: ${escapeHtml(wHost)}. Expira: ${escapeHtml(fmtDate(e.expires_at))}. El secreto no se muestra ni se incluye en los comandos.</div><button class="btn ghost sm" id="copyEnrollmentSecret">Copiar secreto de enrolamiento</button><div class="support">Guardalo en un gestor de secretos y elimina WORKER_ENROLLMENT_TOKEN después del primer arranque; conserva el archivo 0600.</div></div>
+             <div class="card compact"><div class="eyebrow">${isRenewal ? "Enrollment renovado" : "Credencial HMAC lista"}</div><div class="value" style="font-size:13px;font-family:var(--font-mono);word-break:break-all">Worker ID: ${escapeHtml(workerId)}</div><div class="meta">Nombre: ${escapeHtml(wName)}. Host: ${escapeHtml(wHost)}. Expira: ${escapeHtml(fmtDate(e.expires_at))}. El secreto es de un solo uso: la pestaña Worker nativo lo incluye en el comando <code>enroll</code>; en Compose va en <code>WORKER_ENROLLMENT_TOKEN</code>.</div><button class="btn ghost sm" id="copyEnrollmentSecret">Copiar secreto</button><div class="support">Si lo guardas en un gestor de secretos, elimina WORKER_ENROLLMENT_TOKEN después del primer arranque y conserva el archivo 0600.</div></div>
             <div class="card compact">
               <div class="eyebrow">URL del Control Plane en los comandos</div>
               <div class="value" style="font-size:13px;font-family:var(--font-mono);word-break:break-all">${escapeHtml(cpUrl)}</div>
@@ -1462,13 +1470,14 @@ docker compose up -d
       if (nativePlatformSelect) nativePlatformSelect.addEventListener("change", () => { addWorkerState.nativePlatform = nativePlatformSelect.value; renderAddWorkerCommands(); });
       const copyBtn = tabContent.querySelector(".copy-btn");
       if (copyBtn) {
+        const copyLabel = copyBtn.textContent;
         copyBtn.addEventListener("click", () => {
           const codeEl = document.getElementById("modalCode");
           if (!codeEl) return;
           navigator.clipboard.writeText(codeEl.textContent).then(() => {
             copyBtn.textContent = "Copiado";
             copyBtn.classList.add("copied");
-            setTimeout(() => { copyBtn.textContent = "Copiar"; copyBtn.classList.remove("copied"); }, 1500);
+            setTimeout(() => { copyBtn.textContent = copyLabel; copyBtn.classList.remove("copied"); }, 1500);
           }).catch(() => {});
         });
       }

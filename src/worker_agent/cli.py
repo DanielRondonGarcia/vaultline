@@ -22,7 +22,11 @@ from src.security.hmac_protocol import digest_secret
 from src.worker_agent import main as worker_main
 from src.worker_agent._build_info import VERSION as BUILD_VERSION
 from src.worker_agent.infrastructure.adapters.native_runtime import NativeRuntimeAdapter
-from src.worker_agent.infrastructure.api_client.control_plane_client import ControlPlaneClient
+from src.worker_agent.infrastructure.api_client.control_plane_client import (
+    ControlPlaneClient,
+    ControlPlaneHTTPError,
+    safe_diagnostic_text,
+)
 from src.worker_agent.infrastructure.security.credential_store import WorkerCredentialStore
 from src.worker_agent.state_paths import (
     resolve_credential_file,
@@ -142,6 +146,43 @@ def _enrollment_config_payload(control_plane_url: str, ca_file: str | None, work
     return payload
 
 
+# Mirrors the Control Plane minimum for bootstrap secrets so an obviously
+# truncated paste fails here instead of leaving a pending attempt behind.
+BOOTSTRAP_TOKEN_MIN_BYTES = 32
+BOOTSTRAP_TOKEN_ENV = "VAULTLINE_BOOTSTRAP_TOKEN"
+RESET_PENDING_COMMAND = "vaultline-worker enroll --reset-pending"
+
+
+def _collect_bootstrap_token(args: argparse.Namespace) -> str | None:
+    """Return a validated bootstrap token from flag, env, or hidden prompt; None when rejected."""
+    token = _optional(args.bootstrap_token) or _optional(os.environ.get(BOOTSTRAP_TOKEN_ENV))
+    if token is None:
+        token = getpass.getpass("Bootstrap token (input is hidden, paste then press Enter): ").strip()
+    if not token:
+        print("error: bootstrap token is empty; copy it from the Control Plane UI and retry.", file=sys.stderr)
+        return None
+    if len(token.encode("utf-8")) < BOOTSTRAP_TOKEN_MIN_BYTES:
+        print(
+            f"error: bootstrap token is too short (expected at least {BOOTSTRAP_TOKEN_MIN_BYTES} bytes); "
+            "it looks truncated. Copy the full token from the Control Plane UI and retry.",
+            file=sys.stderr,
+        )
+        return None
+    return token
+
+
+def _enrollment_failure_detail(exc: BaseException) -> str:
+    """Describe a failed enrollment call without leaking hosts, tokens, or credentials."""
+    if isinstance(exc, ControlPlaneHTTPError):
+        return str(exc)
+    # URLError wraps the socket/TLS cause in .reason; that is the useful part.
+    reason = getattr(exc, "reason", None)
+    detail = safe_diagnostic_text(reason if reason is not None else exc)
+    if not detail:
+        return exc.__class__.__name__
+    return f"{exc.__class__.__name__}: {detail}"
+
+
 def _enroll(args: argparse.Namespace) -> int:
     store = WorkerCredentialStore(resolve_credential_file())
     if args.reset_pending:
@@ -158,6 +199,11 @@ def _enroll(args: argparse.Namespace) -> int:
         return 2
     ca_file = _optional(args.ca_file) or _optional(os.environ.get("CONTROL_PLANE_CA_FILE"))
     worker_name = _optional(args.worker_name) or _optional(os.environ.get("WORKER_NAME"))
+    if ca_file and not Path(ca_file).exists():
+        print(
+            "warning: --ca-file does not exist; the system trust store will be used to verify the Control Plane TLS certificate.",
+            file=sys.stderr,
+        )
 
     # enroll runs elevated (administrator/root): lock the dedicated state
     # directory down before any enrollment state lands in it, so the service
@@ -189,7 +235,9 @@ def _enroll(args: argparse.Namespace) -> int:
                 )
             return 1
 
-    bootstrap_token = getpass.getpass("Bootstrap token: ")
+    bootstrap_token = _collect_bootstrap_token(args)
+    if bootstrap_token is None:
+        return 2
     token_digest = digest_secret(bootstrap_token)
     pending = store.load_pending_enrollment()
     if pending is None:
@@ -203,7 +251,7 @@ def _enroll(args: argparse.Namespace) -> int:
     if pending.token_digest != token_digest:
         print(
             "A pending enrollment already exists for a different bootstrap token. "
-            "Re-run with the original token, or run 'enroll --reset-pending' if you intentionally want to discard the pending attempt.",
+            f"Re-run with the original token, or run '{RESET_PENDING_COMMAND}' if you intentionally want to discard the pending attempt.",
             file=sys.stderr,
         )
         return 2
@@ -221,11 +269,12 @@ def _enroll(args: argparse.Namespace) -> int:
             labels=_enrollment_labels(),
         )
     except Exception as exc:
+        print(f"Enrollment failed: {_enrollment_failure_detail(exc)}", file=sys.stderr)
         print(
-            "Enrollment did not complete. The pending attempt was saved; re-run enroll with the same bootstrap token to retry.",
+            "The pending attempt was saved; re-run enroll with the same bootstrap token to retry. "
+            f"If the token expired or was already used, generate a new one in the Control Plane UI and run '{RESET_PENDING_COMMAND}' first.",
             file=sys.stderr,
         )
-        print(f"Enrollment error type: {exc.__class__.__name__}", file=sys.stderr)
         return 1
 
     if store.load() is None:
@@ -356,12 +405,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     enroll = subcommands.add_parser(
         "enroll",
-        help="Securely complete native worker first-run enrollment using a hidden bootstrap token prompt.",
+        help="Complete native worker first-run enrollment with a single-use bootstrap token (flag, env, or hidden prompt).",
     )
     enroll.add_argument(
         "--control-plane-url",
         default=None,
         help="Control Plane base URL (required unless CONTROL_PLANE_URL is set). Persisted to worker.json for the daemon.",
+    )
+    enroll.add_argument(
+        "--bootstrap-token",
+        default=None,
+        help=(
+            "Single-use bootstrap token copied from the Control Plane UI "
+            f"(falls back to {BOOTSTRAP_TOKEN_ENV}, then to a hidden prompt)."
+        ),
     )
     enroll.add_argument(
         "--ca-file",
@@ -437,13 +494,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "verify the state directory grants SYSTEM and Administrators access. No credential was enrolled."
             )
             if getattr(exc, "pending_state_may_exist", False):
-                message += " Pending state may need reset with 'enroll --reset-pending'."
+                message += f" Pending state may need reset with '{RESET_PENDING_COMMAND}'."
             print(message, file=sys.stderr)
             return 1
         if _is_windows() and getattr(exc, "pending_state_may_exist", False):
             print(
                 "error: Windows could not secure worker credentials; check the state directory ACL. "
-                "No credential was enrolled. Pending state may need reset with 'enroll --reset-pending'.",
+                f"No credential was enrolled. Pending state may need reset with '{RESET_PENDING_COMMAND}'.",
                 file=sys.stderr,
             )
             return 1

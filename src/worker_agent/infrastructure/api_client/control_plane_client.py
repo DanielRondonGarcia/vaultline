@@ -17,7 +17,7 @@ _HTTP_ERROR_DETAIL_LIMIT = 512
 _HTTP_ERROR_BODY_READ_LIMIT = 4096
 
 
-def _safe_diagnostic_text(value: Any, limit: int = _HTTP_ERROR_DETAIL_LIMIT) -> str:
+def safe_diagnostic_text(value: Any, limit: int = _HTTP_ERROR_DETAIL_LIMIT) -> str:
     text = " ".join(str(value or "").split())
     text = re.sub(r"(?i)(?:https?|http\+docker)://[^\s]+", "<url>", text)
     text = re.sub(
@@ -40,7 +40,7 @@ def _safe_endpoint_path(path: str) -> str:
     raw_path = raw_path.split("?", 1)[0].split("#", 1)[0]
     if not raw_path.startswith("/"):
         raw_path = f"/{raw_path}"
-    return _safe_diagnostic_text(raw_path) or "/"
+    return safe_diagnostic_text(raw_path) or "/"
 
 
 class ControlPlaneHTTPError(HTTPError):
@@ -56,8 +56,8 @@ class ControlPlaneHTTPError(HTTPError):
     ):
         self.method = str(method).upper()
         self.path = _safe_endpoint_path(path)
-        self.detail = _safe_diagnostic_text(detail)
-        self.server_code = _safe_diagnostic_text(server_code) if server_code is not None else ""
+        self.detail = safe_diagnostic_text(detail)
+        self.server_code = safe_diagnostic_text(server_code) if server_code is not None else ""
 
         message = f"Control Plane rejected {self.method} {self.path}: HTTP {status}"
         if self.server_code:
@@ -93,9 +93,9 @@ def _parse_http_error_detail(body: str, reason: Any) -> tuple[str, Any]:
                 detail = payload[key]
                 break
 
-    safe_detail = _safe_diagnostic_text(detail)
+    safe_detail = safe_diagnostic_text(detail)
     if not safe_detail:
-        safe_detail = _safe_diagnostic_text(reason) or "no response detail"
+        safe_detail = safe_diagnostic_text(reason) or "no response detail"
     return safe_detail, server_code
 
 

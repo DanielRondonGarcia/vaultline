@@ -45,6 +45,24 @@ class EnrollmentAttempt:
 _ATTEMPT_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{12,128}$")
 
 
+class EnrollmentRejectedError(ValueError):
+    """A bootstrap token rejection carrying a stable machine-readable code."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def _reject_enrollment(enrollment):
+    """Raise the typed rejection for a missing, used, or expired enrollment."""
+    if not enrollment:
+        raise EnrollmentRejectedError("enrollment_unknown", "unknown worker enrollment token")
+    if enrollment.used:
+        raise EnrollmentRejectedError("enrollment_used", "worker enrollment token already used")
+    if enrollment.expires_at < utcnow():
+        raise EnrollmentRejectedError("enrollment_expired", "worker enrollment token expired")
+
+
 class WorkerAuthState:
     def __init__(self, database_path=None):
         self._lock, self.path = Lock(), database_path if database_path and database_path != ":memory:" else None
@@ -141,8 +159,7 @@ class WorkerAuthState:
     def complete(self, secret, version="1", labels=None):
         with self._lock:
             e = self._enrollment(digest_secret(secret or ""))
-            if not e or e.used or e.expires_at < utcnow():
-                raise ValueError("invalid or expired worker enrollment")
+            _reject_enrollment(e)
             current = self._current(e.worker_id)
             if current:
                 current.status, current.revoked_at, version = "revoked", utcnow(), str(int(current.version) + 1)
@@ -173,8 +190,7 @@ class WorkerAuthState:
         if existing:
             return self._replay_v2_attempt(existing, attempt_id, credential_digest, enrollment_digest, labels)
         e = self._enrollments.get(enrollment_digest)
-        if not e or e.used or e.expires_at < utcnow():
-            raise ValueError("invalid or expired worker enrollment")
+        _reject_enrollment(e)
         current = self._current(e.worker_id)
         version = str(int(current.version) + 1) if current else "1"
         if current:
@@ -199,11 +215,8 @@ class WorkerAuthState:
                     db,
                 )
             row = db.execute("SELECT * FROM auth_enrollments WHERE secret_digest=?", (enrollment_digest,)).fetchone()
-            if not row:
-                raise ValueError("invalid or expired worker enrollment")
-            e = Enrollment(row[1], row[0], row[2], row[3], json.loads(row[4]), datetime.fromisoformat(row[5]), bool(row[6]))
-            if e.used or e.expires_at < utcnow():
-                raise ValueError("invalid or expired worker enrollment")
+            e = Enrollment(row[1], row[0], row[2], row[3], json.loads(row[4]), datetime.fromisoformat(row[5]), bool(row[6])) if row else None
+            _reject_enrollment(e)
             current_row = db.execute("SELECT * FROM worker_credentials WHERE worker_id=? AND status='active' ORDER BY CAST(version AS INTEGER) DESC LIMIT 1", (e.worker_id,)).fetchone()
             version = str(int(current_row[1]) + 1) if current_row else "1"
             if current_row:

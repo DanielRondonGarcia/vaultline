@@ -62,6 +62,55 @@ class WorkerEnrollmentV2StateTests(unittest.TestCase):
 
         self.assertEqual(replay["credential_version"], first["credential_version"])
 
+    def test_v2_rejections_carry_distinct_codes_for_unknown_used_and_expired_tokens(self):
+        from src.control_plane.infrastructure.security.worker_auth import EnrollmentRejectedError
+
+        for name, auth in self.auth_states():
+            with self.subTest(name=name):
+                credential = "n" * 32
+                with self.assertRaises(EnrollmentRejectedError) as unknown:
+                    auth.complete_v2("u" * 32, "attempt-unknown12345", credential)
+                self.assertEqual(unknown.exception.code, "enrollment_unknown")
+                self.assertEqual(str(unknown.exception), "unknown worker enrollment token")
+
+                used_token = "v" * 32
+                auth.create_enrollment("worker", "host", {}, used_token, worker_id="worker-used")
+                auth.complete_v2(used_token, "attempt-used12345678", credential)
+                # A different attempt against a V2-consumed token hits the replay guard, not the code path.
+                with self.assertRaises(ValueError) as replay_conflict:
+                    auth.complete_v2(used_token, "attempt-other1234567", credential)
+                self.assertEqual(str(replay_conflict.exception), "invalid worker enrollment request")
+
+                expired_token = "w" * 32
+                auth.create_enrollment("worker", "host", {}, expired_token, worker_id="worker-expired", ttl_minutes=1)
+                self._expire(auth, expired_token)
+                with self.assertRaises(EnrollmentRejectedError) as expired:
+                    auth.complete_v2(expired_token, "attempt-expired12345", credential)
+                self.assertEqual(expired.exception.code, "enrollment_expired")
+
+                reused_token = "x" * 32
+                auth.create_enrollment("worker", "host", {}, reused_token, worker_id="worker-reused")
+                self._mark_used_without_attempt(auth, reused_token)
+                with self.assertRaises(EnrollmentRejectedError) as used:
+                    auth.complete_v2(reused_token, "attempt-reused123456", credential)
+                self.assertEqual(used.exception.code, "enrollment_used")
+
+    @staticmethod
+    def _expire(auth, token):
+        digest = digest_secret(token)
+        if auth.path:
+            with auth._db() as db:
+                db.execute("UPDATE auth_enrollments SET expires_at=? WHERE secret_digest=?", ("2000-01-01T00:00:00", digest))
+        else:
+            enrollment = auth._enrollments[digest]
+            enrollment.expires_at = enrollment.expires_at.replace(year=2000)
+
+    @staticmethod
+    def _mark_used_without_attempt(auth, token):
+        # Simulates a V1 completion (or an older server) that consumed the token
+        # without recording a V2 attempt, so the V2 path sees used=1 directly.
+        auth._mark_used(digest_secret(token))
+
     def test_v2_rejects_short_credential_and_attempt_id(self):
         auth = WorkerAuthState()
         bootstrap = "i" * 32
@@ -120,6 +169,31 @@ class WorkerEnrollmentV2ApiTests(unittest.TestCase):
         signature = sign_request(digest_secret(credential), "POST", "/api/v1/workers/worker-api/heartbeat", body, timestamp, "nonce", "worker-api", "1")
         with patch("time.time", return_value=int(timestamp)):
             self.auth.authenticate("worker-api", "POST", "/api/v1/workers/worker-api/heartbeat", body, timestamp, "nonce", "worker-api", "1", signature)
+
+    def test_v2_endpoint_returns_400_with_error_and_code_that_the_client_surfaces(self):
+        from src.worker_agent.infrastructure.api_client.control_plane_client import ControlPlaneHTTPError
+
+        client = ControlPlaneClient(self.base_url)
+        expired = "r" * 32
+        self.auth.create_enrollment("native", "host", {}, expired, worker_id="worker-api-expired")
+        self.auth._enrollments[digest_secret(expired)].expires_at = self.auth._enrollments[digest_secret(expired)].expires_at.replace(year=2000)
+
+        for token, expected_code, expected_error in (
+            ("s" * 32, "enrollment_unknown", "unknown worker enrollment token"),
+            (expired, "enrollment_expired", "worker enrollment token expired"),
+        ):
+            with self.subTest(code=expected_code):
+                with self.assertRaises(ControlPlaneHTTPError) as raised:
+                    client.complete_worker_enrollment_v2(token, "attempt-api-reject123", "t" * 32)
+                error = raised.exception
+                self.assertEqual(error.status, 400)
+                self.assertEqual(error.server_code, expected_code)
+                self.assertEqual(error.detail, expected_error)
+                self.assertEqual(
+                    str(error),
+                    f"Control Plane rejected POST /api/v2/worker-enrollments/complete: HTTP 400 (code={expected_code}): {expected_error}",
+                )
+        self.assertEqual(self.registered, [])
 
     def test_v2_endpoint_replay_ignores_changed_labels_for_registration_metadata(self):
         bootstrap = "p" * 32

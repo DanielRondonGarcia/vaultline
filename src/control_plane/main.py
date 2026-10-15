@@ -1297,7 +1297,10 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
         except KeyError as exc:
             return self._write_json(400, {"error": f"missing field: {exc.args[0]}"})
         except ValueError as exc:
-            return self._write_json(400, {"error": str(exc)})
+            payload = {"error": str(exc)}
+            if getattr(exc, "code", None):
+                payload["code"] = exc.code
+            return self._write_json(400, payload)
         except RuntimeError as exc:
             return self._write_json(400, {"error": str(exc)})
         except Exception as exc:

@@ -57,7 +57,7 @@ class WorkerEnrollmentCLITests(unittest.TestCase):
             with self.subTest(error_code=error_code), tempfile.TemporaryDirectory() as directory:
                 path = os.path.join(directory, "credentials.json")
                 errors = io.StringIO()
-                token = "secret-token-that-must-not-leak"
+                token = "secret-token-that-must-not-leak-0123456789"
                 failure = WorkerStateACLPermissionError(
                     "private path and https://secret.invalid", icacls_error_code=error_code,
                     pending_state_may_exist=True,
@@ -72,7 +72,7 @@ class WorkerEnrollmentCLITests(unittest.TestCase):
                 rendered = errors.getvalue()
                 self.assertEqual(code, 1)
                 self.assertEqual(len(rendered.strip().splitlines()), 1)
-                self.assertIn("enroll --reset-pending", rendered)
+                self.assertIn("'vaultline-worker enroll --reset-pending'", rendered)
                 self.assertNotIn(token, rendered)
                 self.assertNotIn(directory, rendered)
                 self.assertNotIn("https://", rendered)
@@ -247,9 +247,138 @@ class WorkerEnrollmentCLITests(unittest.TestCase):
         rendered = out + err
         self.assertEqual(code, 2)
         self.assertIn("pending enrollment", rendered)
-        self.assertIn("reset", rendered)
+        self.assertIn("'vaultline-worker enroll --reset-pending'", rendered)
         self.assertNotIn("b" * 32, rendered)
         self.assertIsNotNone(still_pending)
+
+    def test_bootstrap_token_flag_and_env_skip_the_hidden_prompt(self):
+        sent = []
+
+        class FakeClient:
+            def __init__(self, base_url, **kwargs):
+                self.store = kwargs["credential_store"]
+
+            def complete_worker_enrollment_v2(self, bootstrap_secret, attempt_id, credential_secret, labels=None):
+                sent.append(bootstrap_secret)
+                self.store.save("worker-flag", credential_secret, "1")
+                return {"worker_id": "worker-flag", "credential_version": "1"}
+
+        from src.worker_agent import cli
+
+        flag_token = "flag-token-value-abcdefghijklmnopqrstuvwxyz"
+        env_token = "env-token-value-abcdefghijklmnopqrstuvwxyz"
+        for label, argv, env_extra in (
+            ("flag", ["enroll", "--bootstrap-token", f"  {flag_token}  "], {}),
+            ("env", ["enroll"], {"VAULTLINE_BOOTSTRAP_TOKEN": env_token}),
+        ):
+            with self.subTest(source=label), tempfile.TemporaryDirectory() as directory:
+                env = {"CONTROL_PLANE_URL": "http://cp", "WORKER_CREDENTIAL_FILE": os.path.join(directory, "credentials.json"), **env_extra}
+                with patch.dict(os.environ, env, clear=True), patch("getpass.getpass") as prompt, \
+                        patch("src.worker_agent.cli.ControlPlaneClient", side_effect=FakeClient), \
+                        redirect_stdout(io.StringIO()) as out:
+                    code = cli.main(argv)
+                self.assertEqual(code, 0)
+                prompt.assert_not_called()
+                self.assertEqual(sent[-1], flag_token if label == "flag" else env_token)
+                self.assertNotIn(sent[-1], out.getvalue())
+
+    def test_hidden_prompt_explains_that_input_is_hidden(self):
+        with tempfile.TemporaryDirectory() as directory:
+            prompts = []
+
+            def record_prompt(prompt):
+                prompts.append(prompt)
+                return ""
+
+            from src.worker_agent import cli
+
+            with patch.dict(os.environ, {"CONTROL_PLANE_URL": "http://cp", "WORKER_CREDENTIAL_FILE": os.path.join(directory, "credentials.json")}, clear=True), \
+                    patch("getpass.getpass", side_effect=record_prompt), redirect_stderr(io.StringIO()):
+                cli.main(["enroll"])
+        self.assertEqual(prompts, ["Bootstrap token (input is hidden, paste then press Enter): "])
+
+    def test_empty_or_short_token_is_rejected_before_any_pending_state_or_http_call(self):
+        from src.worker_agent import cli
+
+        for label, token, expected in (
+            ("empty", "", "bootstrap token is empty"),
+            ("whitespace", "   \n", "bootstrap token is empty"),
+            ("short", "short-token-only-31-bytes-long!", "too short"),
+        ):
+            with self.subTest(token=label), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "credentials.json")
+                errors = io.StringIO()
+                with patch.dict(os.environ, {"CONTROL_PLANE_URL": "http://cp", "WORKER_CREDENTIAL_FILE": path}, clear=True), \
+                        patch("getpass.getpass", return_value=token), \
+                        patch("src.worker_agent.cli.ControlPlaneClient") as client, redirect_stderr(errors):
+                    code = cli.main(["enroll"])
+                self.assertEqual(code, 2)
+                self.assertIn(expected, errors.getvalue())
+                client.assert_not_called()
+                self.assertFalse(WorkerCredentialStore(path).pending_path.exists())
+                self.assertEqual(os.listdir(directory), [])
+
+    def test_failure_prints_redacted_server_detail_and_named_retry_exits(self):
+        from src.worker_agent import cli
+        from src.worker_agent.infrastructure.api_client.control_plane_client import ControlPlaneHTTPError
+        from urllib.error import URLError
+
+        token = "bootstrap-token-value-1234567890"
+        cases = (
+            (
+                ControlPlaneHTTPError("POST", "/api/v2/worker-enrollments/complete", 400, "worker enrollment token expired", "enrollment_expired"),
+                "Enrollment failed: Control Plane rejected POST /api/v2/worker-enrollments/complete: HTTP 400 (code=enrollment_expired): worker enrollment token expired",
+            ),
+            (
+                URLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate"),
+                "Enrollment failed: URLError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate",
+            ),
+            (TimeoutError(), "Enrollment failed: TimeoutError"),
+            (OSError(f"connection to https://cp.invalid/?token={token} refused"), "Enrollment failed: OSError: connection to <url> refused"),
+        )
+        for failure, expected_first_line in cases:
+            class FailingClient:
+                def __init__(self, base_url, **kwargs):
+                    pass
+
+                def complete_worker_enrollment_v2(self, *args, **kwargs):
+                    raise failure
+
+            with self.subTest(failure=failure.__class__.__name__), tempfile.TemporaryDirectory() as directory:
+                code, out, err, path = self.run_enroll(directory, token=token, client_factory=FailingClient)
+                lines = err.strip().splitlines()
+                self.assertEqual(code, 1)
+                self.assertEqual(lines[0], expected_first_line)
+                self.assertIn("re-run enroll with the same bootstrap token to retry", lines[1])
+                self.assertIn("'vaultline-worker enroll --reset-pending'", lines[1])
+                self.assertNotIn(token, err)
+                self.assertNotIn("cp.invalid", err)
+                self.assertNotIn("control-plane.invalid", err)
+                self.assertIsNotNone(WorkerCredentialStore(path).load_pending_enrollment())
+
+    def test_missing_ca_file_warns_instead_of_silently_using_system_trust(self):
+        class FakeClient:
+            def __init__(self, base_url, **kwargs):
+                self.store = kwargs["credential_store"]
+
+            def complete_worker_enrollment_v2(self, bootstrap_secret, attempt_id, credential_secret, labels=None):
+                self.store.save("worker-ca", credential_secret, "1")
+                return {"worker_id": "worker-ca", "credential_version": "1"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = os.path.join(directory, "missing-ca.pem")
+            present = os.path.join(directory, "ca.pem")
+            with open(present, "w", encoding="utf-8") as stream:
+                stream.write("-----BEGIN CERTIFICATE-----\n")
+            for ca_file, expect_warning in ((missing, True), (present, False)):
+                with self.subTest(exists=not expect_warning):
+                    code, _, err, _ = self.run_enroll(
+                        directory, client_factory=FakeClient, argv=["enroll", "--ca-file", ca_file],
+                    )
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual("warning: --ca-file does not exist" in err, expect_warning)
+                    self.assertNotIn(directory, err)
+                WorkerCredentialStore(os.path.join(directory, "credentials.json")).path.unlink()
 
     def test_pending_file_never_contains_plaintext_token_and_is_removed_on_success(self):
         token = "plaintext-token-value-1234567890!!"

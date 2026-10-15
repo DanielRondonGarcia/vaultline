@@ -212,7 +212,9 @@ def _restic_progress_from_line(line: str) -> Optional[Dict[str, Any]]:
         progress["current_file"] = current_file[:512]
     percent = progress.get("percent_done")
     if isinstance(percent, (int, float)) and not isinstance(percent, bool):
-        progress["percent_done"] = min(99.9, max(0.0, float(percent)))
+        # restic reports bytes_done / total_bytes as a 0..1 fraction; the
+        # Control Plane and UI contract is a 0..100 percentage.
+        progress["percent_done"] = min(99.9, max(0.0, round(float(percent) * 100, 1)))
     return progress
 
 

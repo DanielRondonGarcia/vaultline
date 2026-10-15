@@ -34,7 +34,11 @@ from src.control_plane.infrastructure.security.secret_codec import SecretCodec
 from src.security.hmac_protocol import digest_secret, verify_request
 from src.restic_executable import restic_subprocess_environment
 from src.restic_retention import restic_retention_config_from_environment
-from src.worker_agent.application.services.worker_agent_service import _JobProgressReporter, WorkerAgentService
+from src.worker_agent.application.services.worker_agent_service import (
+    _JobProgressReporter,
+    _restic_progress_from_line,
+    WorkerAgentService,
+)
 from src.worker_agent.domain.models import WorkerAgentConfig
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
 from src.worker_agent.infrastructure.api_client.control_plane_client import ControlPlaneClient
@@ -472,7 +476,7 @@ class ProgressClientAndWorkerTests(unittest.TestCase):
         client = Client()
         reporter = _JobProgressReporter(client, "worker-a", {"id": "job-a", "lease_token": "lease"})
         reporter.start()
-        reporter.emit('{"message_type":"status","percent_done":42,"files_done":2}\n')
+        reporter.emit('{"message_type":"status","percent_done":0.42,"files_done":2}\n')
         reporter.finish()
         self.assertLessEqual(len(client.calls), 3)
         self.assertTrue(any(call["progress"].get("percent_done") == 42.0 for call in client.calls))
@@ -528,7 +532,7 @@ class ProgressClientAndWorkerTests(unittest.TestCase):
         ):
             reporter.emit(line, force=True)
         reporter.emit(
-            '{"message_type":"status","percent_done":42.5,"files_done":2,"bytes_done":128,"total_bytes":256}\n',
+            '{"message_type":"status","percent_done":0.425,"files_done":2,"bytes_done":128,"total_bytes":256}\n',
             force=True,
         )
         reporter.finish()
@@ -541,6 +545,20 @@ class ProgressClientAndWorkerTests(unittest.TestCase):
         self.assertEqual(status["files_done"], 2)
         self.assertEqual(status["bytes_done"], 128)
         self.assertEqual(status["total_bytes"], 256)
+
+    def test_restic_percent_done_fraction_is_reported_as_a_percentage(self):
+        # restic v0.19.1 emits percent_done = bytes_done / total_bytes (0..1);
+        # the UI rendered this 1.6 % backup as "0.0%".
+        early = _restic_progress_from_line(
+            '{"message_type":"status","percent_done":0.0159,"bytes_done":106000000,"total_bytes":6300000000}'
+        )
+        self.assertEqual(early["percent_done"], 1.6)
+        self.assertEqual(early["bytes_done"], 106000000)
+
+        self.assertEqual(_restic_progress_from_line('{"message_type":"status","percent_done":0}')["percent_done"], 0.0)
+        self.assertEqual(_restic_progress_from_line('{"message_type":"status","percent_done":0.5}')["percent_done"], 50.0)
+        self.assertEqual(_restic_progress_from_line('{"message_type":"status","percent_done":1}')["percent_done"], 99.9)
+        self.assertEqual(_restic_progress_from_line('{"message_type":"status","percent_done":-0.2}')["percent_done"], 0.0)
 
     def test_worker_progress_reporter_never_blocks_runtime_output_on_a_stuck_control_plane(self):
         release = threading.Event()

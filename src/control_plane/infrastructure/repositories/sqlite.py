@@ -62,6 +62,9 @@ def _json_load(value: Optional[str], fallback):
 
 
 def _datetime_text(value: Any) -> Optional[str]:
+    if isinstance(value, datetime):
+        text = value.isoformat()
+        return f"{text}Z" if value.utcoffset() is None else text
     return value.isoformat() if hasattr(value, "isoformat") else value if isinstance(value, str) else None
 
 

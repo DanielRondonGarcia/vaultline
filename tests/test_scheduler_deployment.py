@@ -26,8 +26,12 @@ from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryTargetRepository,
     InMemoryTargetStatsRepository,
     InMemoryWorkerRepository,
+    _datetime_text as in_memory_datetime_text,
 )
-from src.control_plane.infrastructure.repositories.sqlite import SQLiteJobRepository
+from src.control_plane.infrastructure.repositories.sqlite import (
+    SQLiteJobRepository,
+    _datetime_text as sqlite_datetime_text,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -154,6 +158,20 @@ class SchedulerDeploymentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             self._assert_expired_lease_failed(SQLiteJobRepository(str(Path(directory) / "control-plane.db")))
 
+    def test_lease_diagnostic_datetime_text_marks_naive_utc_and_preserves_aware_offsets(self):
+        naive_utc = datetime(2024, 6, 3, 3, 4, 5)
+        aware = datetime(2024, 6, 3, 3, 4, 5, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        for serialize in (in_memory_datetime_text, sqlite_datetime_text):
+            with self.subTest(serializer=serialize.__module__):
+                naive_text = serialize(naive_utc)
+                aware_text = serialize(aware)
+                self.assertEqual(naive_text, "2024-06-03T03:04:05Z")
+                self.assertEqual(aware_text, "2024-06-03T03:04:05+05:30")
+                self.assertEqual(
+                    datetime.fromisoformat(aware_text).astimezone(timezone.utc),
+                    aware.astimezone(timezone.utc),
+                )
+
     def test_scheduler_suppresses_existing_backup_job(self):
         service = self._service()
         target = BackupTargetRecord(name="target", worker_id="worker-a", cron_expression="* * * * *")
@@ -239,8 +257,8 @@ class SchedulerDeploymentTests(unittest.TestCase):
             attempt_count=1,
         )
         pending = JobRecord(worker_id="worker-a", command="worker.self_check")
-        issued_at = interrupted.lease_issued_at.isoformat()
-        expires_at = interrupted.lease_expires_at.isoformat()
+        issued_at = f"{interrupted.lease_issued_at.isoformat()}Z"
+        expires_at = f"{interrupted.lease_expires_at.isoformat()}Z"
         repository.save(interrupted)
         repository.save(pending)
         claimed = repository.claim_pending_for_worker("worker-a")

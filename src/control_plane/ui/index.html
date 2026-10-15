@@ -252,9 +252,17 @@
       if (!raw) return {};
       try { return JSON.parse(raw); } catch (e) { throw new Error(`JSON invalido en ${label}: ${e.message}`); }
     }
+    function uiTimeZone() {
+      const timeZone = typeof state.schedulerTimezone === "string" ? state.schedulerTimezone.trim() : "";
+      if (!timeZone) return "UTC";
+      try {
+        new Intl.DateTimeFormat("en", { timeZone });
+        return timeZone;
+      } catch (e) { return "UTC"; }
+    }
     function fmtDate(ts) {
       if (!ts) return "—";
-      try { return new Date(ts).toLocaleString("es-CO", { dateStyle: "short", timeStyle: "short" }); } catch (e) { return ts; }
+      try { return new Date(ts).toLocaleString("es-CO", { timeZone: uiTimeZone(), dateStyle: "short", timeStyle: "short" }); } catch (e) { return ts; }
     }
     function fmtSchedulerDate(ts, timeZone) {
       if (!ts) return "—";
@@ -673,6 +681,42 @@
       return `<article class="card compact"><span class="eyebrow">${escapeHtml(eyebrow)}</span><div class="title">${escapeHtml(title)}</div><div class="value">${escapeHtml(String(value))}</div><div class="meta">${escapeHtml(meta || "")}</div></article>`;
     }
 
+    function zonedDateKey(date, formatter) {
+      const parts = formatter.formatToParts(date);
+      const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
+      return `${values.year}-${values.month}-${values.day}`;
+    }
+
+    function buildActivityDays(jobs, now = new Date()) {
+      const timeZone = uiTimeZone();
+      const dateFormatter = new Intl.DateTimeFormat("en", {
+        timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      });
+      const [year, month, day] = zonedDateKey(now, dateFormatter).split("-").map(Number);
+      const currentDay = new Date(Date.UTC(year, month - 1, day));
+      const days = [];
+      for (let i = 6; i >= 0; i--) {
+        const date = new Date(currentDay);
+        date.setUTCDate(date.getUTCDate() - i);
+        const dateKey = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
+        const dayJobs = jobs.filter(job => {
+          if (!job.started_at) return false;
+          const timestamp = new Date(job.started_at);
+          return Number.isFinite(timestamp.getTime()) && zonedDateKey(timestamp, dateFormatter) === dateKey;
+        });
+        days.push({
+          label: date.toLocaleDateString("es", { timeZone: "UTC", weekday: "short" }),
+          total: dayJobs.length,
+          success: dayJobs.filter(job => job.status === "succeeded" || job.status === "success").length,
+          failed: dayJobs.filter(job => job.status === "failed").length,
+        });
+      }
+      return days;
+    }
+
     function renderDashboard(content) {
       const onlineWorkers = state.workers.filter(w => w.status === "online").length;
       const jobsSuccess = state.jobs.filter(j => j.status === "succeeded" || j.status === "success").length;
@@ -681,24 +725,7 @@
       const jobsOther = state.jobs.length - jobsSuccess - jobsFailed - jobsRunning;
       const successRate = state.jobs.length > 0 ? Math.round((jobsSuccess / state.jobs.length) * 100) : 0;
 
-      const now = new Date();
-      const days = [];
-      for (let i = 6; i >= 0; i--) {
-        const d = new Date(now);
-        d.setDate(d.getDate() - i);
-        const dayStart = new Date(d.getFullYear(), d.getMonth(), d.getDate());
-        const dayEnd = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
-        const dayJobs = state.jobs.filter(j => {
-          const ts = j.started_at ? new Date(j.started_at) : null;
-          return ts && ts >= dayStart && ts < dayEnd;
-        });
-        days.push({
-          label: d.toLocaleDateString("es", { weekday: "short" }),
-          total: dayJobs.length,
-          success: dayJobs.filter(j => j.status === "succeeded" || j.status === "success").length,
-          failed: dayJobs.filter(j => j.status === "failed").length,
-        });
-      }
+      const days = buildActivityDays(state.jobs);
       const maxDay = Math.max(1, ...days.map(d => d.total));
 
       const donutSegments = [

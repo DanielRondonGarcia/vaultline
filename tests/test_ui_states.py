@@ -1588,9 +1588,9 @@ main().catch(error => {
         self.assertIn("api/v1/scheduler/preview", preview.group(0))
         self.assertNotIn("cronNextRun(expr)", preview.group(0))
 
-    def test_timestamps_and_activity_buckets_use_configured_timezone(self):
+    def test_timestamps_and_activity_buckets_use_browser_timezone(self):
         helpers = []
-        for name in ("uiTimeZone", "fmtDate", "zonedDateKey", "buildActivityDays"):
+        for name in ("fmtDate", "fmtSchedulerDate", "zonedDateKey", "buildActivityDays"):
             helper = re.search(rf"(    function {name}\(.*?\n    \}})", self.source, re.S)
             self.assertIsNotNone(helper, name)
             helpers.append(helper.group(1))
@@ -1601,31 +1601,37 @@ process.env.TZ = "Pacific/Auckland";
 const state = { schedulerTimezone: "America/Bogota" };
 const instant = "2024-01-01T00:30:00Z";
 const formatted = fmtDate(instant);
-const expectedConfigured = new Intl.DateTimeFormat("es-CO", {
-  timeZone: "America/Bogota", dateStyle: "short", timeStyle: "short",
-}).format(new Date(instant));
 const expectedBrowser = new Date(instant).toLocaleString("es-CO", {
   dateStyle: "short", timeStyle: "short",
 });
-if (formatted !== expectedConfigured) throw new Error(`unexpected configured-zone date: ${formatted}`);
-if (formatted === expectedBrowser) throw new Error("timestamp followed the browser timezone");
+if (formatted !== expectedBrowser) throw new Error(`unexpected browser-local date: ${formatted}`);
+
+const equivalentOffset = "2023-12-31T19:30:00-05:00";
+if (new Date(equivalentOffset).getTime() !== new Date(instant).getTime()) {
+  throw new Error("UTC and explicit-offset timestamps did not represent the same instant");
+}
+if (fmtDate(equivalentOffset) !== formatted) throw new Error("explicit-offset timestamp was parsed incorrectly");
+
+const expectedScheduler = new Intl.DateTimeFormat("es-CO", {
+  timeZone: state.schedulerTimezone, dateStyle: "short", timeStyle: "short",
+}).format(new Date(instant));
+if (fmtSchedulerDate(instant, state.schedulerTimezone) !== expectedScheduler) {
+  throw new Error("scheduler timestamp did not retain its configured timezone");
+}
 
 const days = buildActivityDays([
   { started_at: "2024-01-01T04:30:00Z", status: "failed" },
   { started_at: "2024-01-01T05:30:00Z", status: "succeeded" },
 ], new Date("2024-01-01T04:45:00Z"));
 const lastDay = days[days.length - 1];
-if (lastDay.total !== 1 || lastDay.failed !== 1 || lastDay.success !== 0) {
+if (lastDay.total !== 2 || lastDay.failed !== 1 || lastDay.success !== 1) {
   throw new Error(`activity chart used the wrong calendar day: ${JSON.stringify(lastDay)}`);
 }
 
 state.schedulerTimezone = "Invalid/Timezone";
-const expectedUtc = new Intl.DateTimeFormat("es-CO", {
-  timeZone: "UTC", dateStyle: "short", timeStyle: "short",
-}).format(new Date(instant));
-if (fmtDate(instant) !== expectedUtc) throw new Error("invalid configured timezone did not fall back to UTC");
+if (fmtDate(instant) !== expectedBrowser) throw new Error("event timestamp followed the scheduler timezone");
 state.schedulerTimezone = null;
-if (fmtDate(instant) !== expectedUtc) throw new Error("missing configured timezone did not fall back to UTC");
+if (fmtDate(instant) !== expectedBrowser) throw new Error("event timestamp fell back from the browser timezone");
 '''
         result = subprocess.run(
             ["node", "--input-type=commonjs", "--eval", script],

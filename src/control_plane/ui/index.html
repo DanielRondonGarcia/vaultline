@@ -252,17 +252,9 @@
       if (!raw) return {};
       try { return JSON.parse(raw); } catch (e) { throw new Error(`JSON invalido en ${label}: ${e.message}`); }
     }
-    function uiTimeZone() {
-      const timeZone = typeof state.schedulerTimezone === "string" ? state.schedulerTimezone.trim() : "";
-      if (!timeZone) return "UTC";
-      try {
-        new Intl.DateTimeFormat("en", { timeZone });
-        return timeZone;
-      } catch (e) { return "UTC"; }
-    }
     function fmtDate(ts) {
       if (!ts) return "—";
-      try { return new Date(ts).toLocaleString("es-CO", { timeZone: uiTimeZone(), dateStyle: "short", timeStyle: "short" }); } catch (e) { return ts; }
+      try { return new Date(ts).toLocaleString("es-CO", { dateStyle: "short", timeStyle: "short" }); } catch (e) { return ts; }
     }
     function fmtSchedulerDate(ts, timeZone) {
       if (!ts) return "—";
@@ -694,9 +686,7 @@
     }
 
     function buildActivityDays(jobs, now = new Date()) {
-      const timeZone = uiTimeZone();
       const dateFormatter = new Intl.DateTimeFormat("en", {
-        timeZone,
         year: "numeric",
         month: "2-digit",
         day: "2-digit",

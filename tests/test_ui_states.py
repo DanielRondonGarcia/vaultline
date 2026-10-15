@@ -820,7 +820,12 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
         self.assertIsNotNone(target_body)
         target_source = target_body.group(0)
         self.assertIn(">Ver ultimos logs</button>", target_source)
+        self.assertIn('data-action="logs" data-id="${escapeHtml(t.id)}">Ver ultimos logs</button>', target_source)
+        self.assertNotIn("${lastJob ?", target_source)
         self.assertNotIn(">Ver logs</button>", target_source)
+        actions = re.search(r"function bindTargetActions\(\) \{.*?\n    function normalizeLiveBrowserPath", self.source, re.S)
+        self.assertIsNotNone(actions)
+        self.assertIn('else if (action === "logs") { await openLatestTargetLogs(id); }', actions.group(0))
         for marker in (
             "renderTargetLogDetailRow(t)",
             "return targetRow +",
@@ -1189,18 +1194,195 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
         self.assertIn('["succeeded", "failed", "canceled", "cancelled"]', self.source)
 
     def test_jobs_list_refresh_uses_metadata_and_preserves_loaded_detail_projection(self):
-        refresh = re.search(r"async function refreshAll\(\) \{.*", self.source, re.S)
+        refresh = re.search(r"async function refreshAll\(\) \{.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(refresh)
         refresh_source = refresh.group(0)
         self.assertNotIn("include_logs=true", self.source)
-        self.assertIn('apiGet("/api/v1/jobs")', refresh_source)
-        self.assertIn("state.jobs = mergeJobList(jobs.items || []);", refresh_source)
+        self.assertIn("const routeView = currentRouteView();", refresh_source)
+        self.assertIn('shouldFetchJobsDuringRefresh(routeView) ? apiGet("/api/v1/jobs") : Promise.resolve(null)', refresh_source)
+        self.assertIn("if (jobs) state.jobs = mergeJobList(jobs.items || []);", refresh_source)
         self.assertIn("function mergeJobList(items)", self.source)
         self.assertIn("currentLogJobSnapshot", self.source)
         self.assertIn('for (const key of ["result_summary", "storage_context", "progress", "log_lines"])', self.source)
         self.assertIn("mergeJobProjection(job);", self.source)
         self.assertIn("const mergedJobs = mergeJobList(newJobs);", self.source)
         self.assertIn("state.jobs = mergedJobs;", self.source)
+
+    def test_job_list_fetch_is_route_scoped_and_target_save_does_not_wait_for_it(self):
+        target_save = re.search(
+            r"function openEditTargetModal\(target\) \{.*?\n    function closeTargetModal",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(target_save)
+        self.assertIn("await apiPatch(`/api/v1/targets/${target.id}`, targetUpdate);", target_save.group(0))
+        self.assertIn("await refreshAll();", target_save.group(0))
+
+        render_jobs = re.search(r"function renderJobs\(content\) \{.*?\n    let _jobsRenderTableBody", self.source, re.S)
+        self.assertIsNotNone(render_jobs)
+        self.assertIn("startJobsPolling();", render_jobs.group(0))
+
+        functions = []
+        for pattern in (
+            r"function currentRouteView\(\) \{.*?\n    \}",
+            r"function route\(\) \{.*?\n    \}",
+            r"function shouldFetchJobsDuringRefresh\(view\) \{.*?\n    \}",
+            r"async function refreshDashboardJobs\(\) \{.*?\n    \}",
+            r"function getLastJobForTarget\(targetId, jobs = state\.jobs \|\| \[\]\) \{.*?\n    \}",
+            r"async function openLatestTargetLogs\(targetId\) \{.*?\n    \}",
+            r"async function refreshAll\(\) \{.*?\n    \}",
+            r"async function withBtnLoading\(btn, asyncFn, loadingText\) \{.*?\n    \}",
+            r"function startJobsPolling\(\) \{.*?\n    \}",
+            r"function stopJobsPolling\(\) \{.*?\n    \}",
+        ):
+            match = re.search(pattern, self.source, re.S)
+            self.assertIsNotNone(match, pattern)
+            functions.append(match.group(0))
+
+        script = "\n\n".join(functions) + r'''
+const state = {
+  currentUser: null,
+  currentRole: null,
+  currentView: "dashboard",
+  jobs: [],
+  workers: [],
+  targets: [],
+  storageProfiles: [],
+  retentionPolicies: [],
+  secrets: [],
+  localUsers: [],
+  settings: {},
+};
+const NAV_ITEMS = ["dashboard", "targets", "jobs"].map(id => ({ id }));
+const window = { location: { hash: "#/targets" } };
+const document = { getElementById: () => null };
+const escapeHtml = value => String(value);
+const LOG_POLL_MAX_FAILURES = 5;
+let jobsPolling = false;
+let jobsPollFailures = 0;
+let jobsPollFirstFailureAt = 0;
+let jobsPollTimer = null;
+let holdJobsRequest = false;
+let failJobsRequest = false;
+let neverJobs;
+let nextJobs = [];
+const calls = [];
+const openedLogs = [];
+const alerts = [];
+const apiGet = async path => {
+  if (path === "/api/v1/jobs") {
+    calls.push(path);
+    if (holdJobsRequest) return neverJobs;
+    if (failJobsRequest) throw new Error("jobs unavailable");
+    return { items: nextJobs };
+  }
+  if (path === "/api/v1/auth/me") return { username: "test", role: "admin" };
+  if (path === "/api/v1/targets") return { items: [{ id: "target-1" }] };
+  if (["/api/v1/workers", "/api/v1/storage-profiles", "/api/v1/retention-policies", "/api/v1/secrets", "/api/v1/admin/users"].includes(path)) return { items: [] };
+  if (path === "/api/v1/config/public") return {};
+  if (path === "/api/v1/settings/rclone-remote") return {};
+  if (path === "/api/v1/version") return { version: "test" };
+  return {};
+};
+const mergeJobList = items => items;
+const renderVersionBanner = () => {};
+const clearJobsRefreshNotice = () => {};
+const renderJobsRefreshNotice = () => {};
+const normalizeJobStatus = status => status;
+const alert = message => alerts.push(message);
+const openLogPanel = (jobId, targetId) => openedLogs.push([jobId, targetId]);
+function setView(view) {
+  state.currentView = view;
+  if (view === "jobs") startJobsPolling();
+}
+
+async function main() {
+  holdJobsRequest = true;
+  neverJobs = new Promise(() => {});
+  const saveButton = { disabled: false, innerHTML: "Save target" };
+  let deadline;
+  const targetSaveResult = await Promise.race([
+    withBtnLoading(saveButton, () => refreshAll(), "Saving").then(() => "resolved"),
+    new Promise(resolve => { deadline = setTimeout(() => resolve("blocked"), 250); }),
+  ]);
+  clearTimeout(deadline);
+  if (targetSaveResult !== "resolved") throw new Error("target save waited for the jobs request");
+  if (saveButton.disabled || saveButton.innerHTML !== "Save target") throw new Error("target save button did not leave its loading state");
+  if (calls.includes("/api/v1/jobs")) throw new Error("Targets refresh requested job history");
+
+  holdJobsRequest = false;
+  calls.length = 0;
+  nextJobs = [
+    { id: "older-target-job", target_id: "target-1", command: "backup.run", updated_at: "2026-01-01T00:00:00Z" },
+    { id: "newer-other-target", target_id: "other", command: "backup.run", updated_at: "2026-04-01T00:00:00Z" },
+    { id: "newer-ineligible-job", target_id: "target-1", command: "snapshots.list", updated_at: "2026-05-01T00:00:00Z" },
+    { id: "latest-target-job", target_id: "target-1", command: "restore.dry_run", updated_at: "2026-03-01T00:00:00Z" },
+  ];
+  await openLatestTargetLogs("target-1");
+  if (calls.filter(path => path === "/api/v1/jobs").length !== 1) throw new Error("deliberate Logs action did not perform exactly one jobs lookup");
+  if (openedLogs[0]?.[0] !== "latest-target-job" || openedLogs[0]?.[1] !== "target-1") throw new Error("deliberate Logs action did not open the latest eligible target job");
+
+  calls.length = 0;
+  await openLatestTargetLogs("target-1");
+  if (calls.includes("/api/v1/jobs")) throw new Error("cached target job was not reused");
+
+  state.jobs = [];
+  calls.length = 0;
+  nextJobs = [];
+  await openLatestTargetLogs("target-1");
+  if (alerts.length !== 1 || !alerts[0].includes("No hay ejecuciones elegibles")) throw new Error("missing target jobs were not surfaced to the user");
+
+  calls.length = 0;
+  failJobsRequest = true;
+  await openLatestTargetLogs("target-1");
+  failJobsRequest = false;
+  if (alerts.length !== 2 || !alerts[1].includes("jobs unavailable")) throw new Error("jobs lookup failure was not surfaced to the user");
+
+  calls.length = 0;
+  state.currentView = "dashboard";
+  window.location.hash = "#/dashboard";
+  nextJobs = [{ id: "dashboard-initial" }];
+  await refreshAll();
+  if (calls.filter(path => path === "/api/v1/jobs").length !== 1) throw new Error("initial Dashboard did not fetch exactly one jobs list");
+  if (state.jobs[0]?.id !== "dashboard-initial") throw new Error("initial Dashboard did not receive current jobs");
+
+  window.location.hash = "#/targets";
+  route();
+  calls.length = 0;
+  nextJobs = [{ id: "dashboard-after-targets" }];
+  window.location.hash = "#/dashboard";
+  route();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  if (calls.filter(path => path === "/api/v1/jobs").length !== 1) throw new Error("switching to Dashboard did not fetch exactly one current jobs list");
+  if (state.jobs[0]?.id !== "dashboard-after-targets") throw new Error("switching to Dashboard did not refresh job data");
+
+  calls.length = 0;
+  state.jobs = [];
+  nextJobs = [{ id: "jobs-screen-initial" }];
+  window.location.hash = "#/jobs";
+  await refreshAll();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  if (calls.filter(path => path === "/api/v1/jobs").length !== 1) throw new Error("Jobs screen duplicated or skipped its initial polling request");
+  if (state.jobs[0]?.id !== "jobs-screen-initial") throw new Error("Jobs polling did not populate the initial list");
+  stopJobsPolling();
+  process.stdout.write("route-scoped jobs refresh passed");
+}
+
+main().catch(error => {
+  stopJobsPolling();
+  console.error(error);
+  process.exitCode = 1;
+});
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "route-scoped jobs refresh passed")
 
     def test_job_logs_render_progress_storage_context_and_normalize_in_progress(self):
         for marker in (

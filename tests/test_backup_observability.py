@@ -5,6 +5,7 @@ import sys
 import sqlite3
 import threading
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from src.control_plane.infrastructure.repositories.in_memory import (
 from src.control_plane.infrastructure.repositories.sqlite import SQLiteJobRepository
 from src.control_plane.infrastructure.security.secret_codec import SecretCodec
 from src.security.hmac_protocol import digest_secret, verify_request
+from src.restic_executable import restic_subprocess_environment
 from src.restic_retention import restic_retention_config_from_environment
 from src.worker_agent.application.services.worker_agent_service import _JobProgressReporter, WorkerAgentService
 from src.worker_agent.domain.models import WorkerAgentConfig
@@ -499,8 +501,9 @@ class ProgressClientAndWorkerTests(unittest.TestCase):
             reporter.emit("Backup starting\n")
             reporter.emit("runtime output\n")
             reporter.emit("Running restic backup\n")
+        reporter.finish()
 
-        self.assertEqual([call["progress"].get("phase") for call in client.calls], ["starting", "preparing", "backup"])
+        self.assertEqual([call["progress"].get("phase") for call in client.calls[:3]], ["starting", "preparing", "backup"])
         self.assertEqual(client.calls[1]["log_lines"], ["Backup starting"])
         self.assertEqual(client.calls[2]["log_lines"], ["runtime output", "Running restic backup"])
 
@@ -528,6 +531,7 @@ class ProgressClientAndWorkerTests(unittest.TestCase):
             '{"message_type":"status","percent_done":42.5,"files_done":2,"bytes_done":128,"total_bytes":256}\n',
             force=True,
         )
+        reporter.finish()
 
         phases = [call["progress"].get("phase") for call in client.calls]
         for phase in ("preparing", "initializing", "backup", "pruning", "finalizing"):
@@ -537,6 +541,82 @@ class ProgressClientAndWorkerTests(unittest.TestCase):
         self.assertEqual(status["files_done"], 2)
         self.assertEqual(status["bytes_done"], 128)
         self.assertEqual(status["total_bytes"], 256)
+
+    def test_worker_progress_reporter_never_blocks_runtime_output_on_a_stuck_control_plane(self):
+        release = threading.Event()
+        stuck = threading.Event()
+        reader_thread = threading.current_thread()
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+                self.sender_threads = set()
+
+            def update_job_progress(self, **kwargs):
+                self.calls.append(kwargs)
+                self.sender_threads.add(threading.current_thread())
+                stuck.set()
+                release.wait(5)
+
+        client = Client()
+        reporter = _JobProgressReporter(client, "worker-a", {"id": "job-a", "lease_token": "lease"})
+        reporter.start()
+        total = reporter.MAX_QUEUED_FLUSHES * 3
+        started = time.monotonic()
+        for index in range(total):
+            reporter.emit(f'{{"message_type":"status","files_done":{index}}}\nline {index}\n', force=True)
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertTrue(stuck.wait(1))
+        self.assertEqual(len(client.calls), 1)
+        self.assertNotIn(reader_thread, client.sender_threads)
+
+        release.set()
+        reporter.finish()
+
+        self.assertLessEqual(len(client.calls), reporter.MAX_QUEUED_FLUSHES + 2)
+        sequences = [call["sequence"] for call in client.calls]
+        self.assertEqual(sequences, sorted(set(sequences)))
+        delivered = [line for call in client.calls for line in call["log_lines"] if line.startswith("line ")]
+        delivered_indexes = [int(line.split()[1]) for line in delivered]
+        self.assertEqual(delivered_indexes, sorted(set(delivered_indexes)))
+        self.assertIn(f"line {total - 1}", delivered)
+        self.assertEqual(client.calls[-1]["progress"]["files_done"], total - 1)
+        for call in client.calls:
+            self.assertLessEqual(len(call["log_lines"]), reporter.MAX_PENDING_LINES)
+
+    def test_worker_progress_reporter_finish_waits_a_bounded_time_for_a_hung_sender(self):
+        release = threading.Event()
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            def update_job_progress(self, **kwargs):
+                self.calls.append(kwargs)
+                release.wait(10)
+
+        client = Client()
+        reporter = _JobProgressReporter(client, "worker-a", {"id": "job-a", "lease_token": "lease"})
+        reporter.FINISH_TIMEOUT_SECONDS = 0.2
+        reporter.start()
+        reporter.emit("runtime output\n", force=True)
+        started = time.monotonic()
+        try:
+            reporter.finish()
+            self.assertLess(time.monotonic() - started, 2.0)
+            self.assertEqual(len(client.calls), 1)
+        finally:
+            release.set()
+
+    def test_restic_subprocess_environment_throttles_json_status_records(self):
+        prepared = restic_subprocess_environment({"PATH": "/usr/bin", "RESTIC_REPOSITORY": "/repo"})
+        self.assertEqual(prepared["RESTIC_PROGRESS_FPS"], "1")
+        self.assertEqual(prepared["RESTIC_REPOSITORY"], "/repo")
+
+        overridden = restic_subprocess_environment({"RESTIC_PROGRESS_FPS": "0.5"})
+        self.assertEqual(overridden["RESTIC_PROGRESS_FPS"], "0.5")
 
 
 class RuntimeAndResticStreamingTests(unittest.TestCase):

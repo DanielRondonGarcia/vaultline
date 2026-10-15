@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import Mock, patch
@@ -1196,10 +1197,125 @@ class WorkerReadPathTests(unittest.TestCase):
             Mock(),
         )
         check = service._cancellation_check({"id": "job-1", "payload": {}})
+        try:
+            deadline = time.monotonic() + 2
+            while not check() and time.monotonic() < deadline:
+                time.sleep(0.01)
 
-        self.assertTrue(check())
-        self.assertTrue(check())
-        self.assertEqual(client.calls, [("worker", "job-1")])
+            self.assertTrue(check())
+            self.assertTrue(check())
+            self.assertEqual(client.calls, [("worker", "job-1")])
+        finally:
+            check.close()
+
+    def test_control_plane_cancellation_probe_runs_off_the_wait_loop_at_its_own_cadence(self):
+        class Client:
+            credential_store = None
+
+            def __init__(self):
+                self.calls = []
+                self.threads = set()
+
+            def is_job_cancelled(self, worker_id, job_id):
+                self.calls.append((worker_id, job_id))
+                self.threads.add(threading.current_thread())
+                time.sleep(0.05)
+                return False
+
+        client = Client()
+        service = WorkerAgentService(
+            WorkerAgentConfig("http://control-plane", "worker", "host", worker_id="worker"),
+            client,
+            Mock(),
+        )
+        with patch.dict(os.environ, {"WORKER_CANCEL_PROBE_INTERVAL_SECONDS": "0.05"}, clear=False):
+            check = service._cancellation_check({"id": "job-1", "payload": {}})
+        try:
+            started = time.monotonic()
+            wait_loop_calls = 0
+            while time.monotonic() - started < 0.4:
+                self.assertFalse(check())
+                wait_loop_calls += 1
+                time.sleep(0.001)
+            self.assertGreater(wait_loop_calls, 50)
+            self.assertGreaterEqual(len(client.calls), 2)
+            self.assertLess(len(client.calls), wait_loop_calls)
+            self.assertNotIn(threading.current_thread(), client.threads)
+        finally:
+            check.close()
+
+    def test_control_plane_cancellation_probe_failures_never_cancel_the_job(self):
+        class Client:
+            credential_store = None
+
+            def __init__(self):
+                self.calls = 0
+                self.outcomes = [TimeoutError("control plane unreachable"), ConnectionError("down"), True]
+
+            def is_job_cancelled(self, worker_id, job_id):
+                self.calls += 1
+                outcome = self.outcomes[min(self.calls, len(self.outcomes)) - 1]
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        client = Client()
+        service = WorkerAgentService(
+            WorkerAgentConfig("http://control-plane", "worker", "host", worker_id="worker"),
+            client,
+            Mock(),
+        )
+        with patch.dict(os.environ, {"WORKER_CANCEL_PROBE_INTERVAL_SECONDS": "0.02"}, clear=False):
+            check = service._cancellation_check({"id": "job-1", "payload": {}})
+        try:
+            self.assertFalse(check())
+            deadline = time.monotonic() + 2
+            while client.calls < 2 and time.monotonic() < deadline:
+                self.assertFalse(check())
+                time.sleep(0.005)
+            self.assertFalse(check())
+            while not check() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(check())
+            self.assertEqual(client.calls, 3)
+        finally:
+            check.close()
+
+    def test_execute_job_stops_the_cancellation_probe_when_the_job_ends(self):
+        class Client:
+            credential_store = None
+
+            def __init__(self):
+                self.calls = 0
+
+            def is_job_cancelled(self, worker_id, job_id):
+                self.calls += 1
+                return False
+
+        client = Client()
+        runtime = Mock()
+
+        def run_runtime_job(**kwargs):
+            deadline = time.monotonic() + 0.1
+            while time.monotonic() < deadline:
+                kwargs["cancel_check"]()
+                time.sleep(0.005)
+            return {"success": True, "status_code": 0, "logs": "done", "stderr": ""}
+
+        runtime.run_runtime_job.side_effect = run_runtime_job
+        service = WorkerAgentService(
+            WorkerAgentConfig("http://control-plane", "worker", "host", worker_id="worker"),
+            client,
+            runtime,
+        )
+        with patch.dict(os.environ, {"WORKER_CANCEL_PROBE_INTERVAL_SECONDS": "0.02"}, clear=False):
+            result = service.execute_job({"id": "job-1", "command": "backup.run", "payload": {}, "lease_token": "lease"})
+
+        self.assertEqual(result.status, JobStatus.SUCCEEDED)
+        self.assertGreaterEqual(client.calls, 1)
+        settled = client.calls
+        time.sleep(0.15)
+        self.assertEqual(client.calls, settled)
 
 
 class WorkerMainPollingTests(unittest.TestCase):

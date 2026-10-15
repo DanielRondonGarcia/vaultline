@@ -7,8 +7,9 @@ import posixpath
 import re
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional
 from urllib.error import HTTPError
 
 from src.control_plane.domain.models import JobStatus
@@ -214,11 +215,21 @@ def _restic_progress_from_line(line: str) -> Optional[Dict[str, Any]]:
 
 
 class _JobProgressReporter:
-    """Coalesce runtime output into non-fatal, leased progress updates."""
+    """Coalesce runtime output into non-fatal, leased progress updates.
+
+    ``emit`` runs on the runtime's output reader thread and never talks to the
+    Control Plane: flushes are queued and a single sender thread performs the
+    HTTP calls. When the sender falls behind, the oldest queued flush is dropped
+    and its log lines fold into the next one, so memory stays bounded and the
+    newest progress always wins. A slow or unreachable Control Plane therefore
+    never back-pressures the runtime's stdout/stderr pipes.
+    """
 
     # Keep live updates responsive without issuing one request for every runtime line.
     FLUSH_INTERVAL_SECONDS = 0.25
     MAX_PENDING_LINES = 32
+    MAX_QUEUED_FLUSHES = 64
+    FINISH_TIMEOUT_SECONDS = 5.0
 
     def __init__(self, client, worker_id: str, job: Dict[str, Any], lease_diagnostics: Optional[_LeaseDiagnosticState] = None):
         self.client = client
@@ -233,6 +244,10 @@ class _JobProgressReporter:
         self._last_inferred_phase: Optional[str] = None
         self._last_sent = 0.0
         self._lock = threading.Lock()
+        self._outbox: Deque[tuple[int, Dict[str, Any], List[str]]] = deque()
+        self._outbox_ready = threading.Condition(self._lock)
+        self._closing = False
+        self._sender: Optional[threading.Thread] = None
         method = getattr(type(client), "update_job_progress", None)
         if callable(method):
             self._send_method = getattr(client, "update_job_progress")
@@ -290,7 +305,7 @@ class _JobProgressReporter:
             sequence = self.sequence
             progress_payload = dict(self.latest_progress)
             self._last_sent = now
-        self._send(sequence, progress_payload, lines)
+            self._enqueue_locked(sequence, progress_payload, lines)
 
     def finish(self) -> None:
         with self._lock:
@@ -298,6 +313,49 @@ class _JobProgressReporter:
                 self._pending_lines.append(self._partial_line[:16 * 1024])
                 self._partial_line = ""
         self.emit("", force=True)
+        with self._lock:
+            self._closing = True
+            self._outbox_ready.notify_all()
+            sender = self._sender
+        if sender is None:
+            return
+        sender.join(timeout=self.FINISH_TIMEOUT_SECONDS)
+        if sender.is_alive():
+            with self._lock:
+                dropped = len(self._outbox)
+                self._outbox.clear()
+            logger.warning(
+                "Job progress sender for %s is still blocked after %.1fs; dropped %s queued updates",
+                self.job_id,
+                self.FINISH_TIMEOUT_SECONDS,
+                dropped,
+            )
+
+    def _enqueue_locked(self, sequence: int, progress: Dict[str, Any], lines: List[str]) -> None:
+        if not callable(self._send_method) or not self.job_id or not isinstance(self.lease_token, str):
+            return
+        if len(self._outbox) >= self.MAX_QUEUED_FLUSHES:
+            _, _, dropped_lines = self._outbox.popleft()
+            if self._outbox:
+                next_sequence, next_progress, next_lines = self._outbox[0]
+                self._outbox[0] = (next_sequence, next_progress, (dropped_lines + next_lines)[-self.MAX_PENDING_LINES :])
+            else:
+                lines = (dropped_lines + lines)[-self.MAX_PENDING_LINES :]
+        self._outbox.append((sequence, progress, lines))
+        if self._sender is None:
+            self._sender = threading.Thread(target=self._drain, daemon=True, name=f"job-progress-{self.job_id}")
+            self._sender.start()
+        self._outbox_ready.notify()
+
+    def _drain(self) -> None:
+        while True:
+            with self._outbox_ready:
+                while not self._outbox and not self._closing:
+                    self._outbox_ready.wait()
+                if not self._outbox:
+                    return
+                sequence, progress, lines = self._outbox.popleft()
+            self._send(sequence, progress, lines)
 
     def _send(self, sequence: int, progress: Dict[str, Any], lines: List[str]) -> None:
         if not callable(self._send_method) or not self.job_id or not isinstance(self.lease_token, str):
@@ -339,6 +397,49 @@ class _JobProgressReporter:
             return
 
 
+class _RemoteCancellationProbe:
+    """Poll the Control Plane for cancellation on its own thread.
+
+    The runtime's wait loop reads a flag that never blocks on HTTP. A failed
+    probe leaves the flag untouched: an unreachable Control Plane must never
+    cancel a running job.
+    """
+
+    def __init__(self, probe: Callable[[], bool], interval_seconds: float, job_id: Any):
+        self._probe = probe
+        self._interval = interval_seconds
+        self._job_id = job_id
+        self._canceled = threading.Event()
+        self._stop = threading.Event()
+        self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+
+    def __call__(self) -> bool:
+        with self._lock:
+            if self._thread is None and not self._stop.is_set():
+                self._thread = threading.Thread(target=self._run, daemon=True, name=f"job-cancel-probe-{self._job_id}")
+                self._thread.start()
+        return self._canceled.is_set()
+
+    def close(self) -> None:
+        self._stop.set()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                if self._probe():
+                    self._canceled.set()
+                    return
+            except Exception as exc:
+                logger.debug(
+                    "Cancellation probe failed for job %s (error_type=%s)",
+                    self._job_id,
+                    _safe_worker_error_type(exc),
+                )
+            if self._stop.wait(self._interval):
+                return
+
+
 class WorkerAgentService:
     MAX_LOG_LINES = 1000
     MAX_LOG_CHARS = 4 * 1024 * 1024
@@ -358,6 +459,7 @@ class WorkerAgentService:
         "Restic repository is not configured. Set RESTIC_REPOSITORY on the target, storage profile, or Settings before running this job."
     )
     JOB_LEASE_RENEWAL_INTERVAL_SECONDS = 60.0
+    JOB_CANCEL_PROBE_INTERVAL_SECONDS = 5.0
     INTERACTIVE_COMMANDS = frozenset(
         {"snapshots.list", "snapshot.ls", "snapshot.search", "snapshot.find", "snapshot.dump", "snapshot.about", "stats.get", "storage.about"}
     )
@@ -1534,6 +1636,14 @@ class WorkerAgentService:
         combined = self._safe_job_text(payload, combined)[: self.MAX_LOG_CHARS]
         return combined.strip().splitlines()[-self.MAX_LOG_LINES :]
 
+    def _cancel_probe_interval(self) -> float:
+        raw = os.environ.get("WORKER_CANCEL_PROBE_INTERVAL_SECONDS")
+        try:
+            value = float(raw) if raw else self.JOB_CANCEL_PROBE_INTERVAL_SECONDS
+        except (TypeError, ValueError):
+            value = self.JOB_CANCEL_PROBE_INTERVAL_SECONDS
+        return min(300.0, max(0.05, value))
+
     def _cancellation_check(self, job: Dict[str, Any]) -> Callable[[], bool] | None:
         payload = job.get("payload") or {}
         event = payload.get("_cancel_event") if isinstance(payload, dict) else None
@@ -1541,13 +1651,19 @@ class WorkerAgentService:
         if not callable(hook):
             hook = job.get("cancel_check")
         client_probe = self._optional_method(self.control_plane_client, "is_job_cancelled")
-        if not callable(hook):
-            hook = client_probe
-        if not callable(hook) and not (event and callable(getattr(event, "is_set", None))):
-            return None
+        remote = None
+        if not callable(hook) and callable(client_probe):
+            worker_id, job_id = self.config.worker_id, job.get("id")
 
-        last_probe = [0.0]
-        last_value = [False]
+            def probe() -> bool:
+                try:
+                    return bool(client_probe(worker_id, job_id))
+                except TypeError:
+                    return bool(client_probe(job_id))
+
+            remote = _RemoteCancellationProbe(probe, self._cancel_probe_interval(), job_id)
+        if not callable(hook) and remote is None and not (event and callable(getattr(event, "is_set", None))):
+            return None
 
         def check() -> bool:
             if (
@@ -1558,25 +1674,16 @@ class WorkerAgentService:
                 return True
             if event is not None and callable(getattr(event, "is_set", None)) and event.is_set():
                 return True
-            now = time.monotonic()
-            if now - last_probe[0] < 0.2:
-                return last_value[0]
-            last_probe[0] = now
-            try:
-                if callable(hook):
-                    if hook is client_probe:
-                        try:
-                            value = hook(self.config.worker_id, job.get("id"))
-                        except TypeError:
-                            value = hook(job.get("id"))
-                    else:
-                        value = hook()
-                    last_value[0] = bool(value)
-            except Exception as exc:
-                logger.debug("Cancellation probe failed for job %s: %s", job.get("id"), self._safe_job_text(payload, exc))
-                last_value[0] = False
-            return last_value[0]
+            if callable(hook):
+                try:
+                    return bool(hook())
+                except Exception as exc:
+                    logger.debug("Cancellation hook failed for job %s: %s", job.get("id"), self._safe_job_text(payload, exc))
+                    return False
+            return remote() if remote is not None else False
 
+        if remote is not None:
+            check.close = remote.close
         return check
 
     @staticmethod
@@ -1960,3 +2067,7 @@ class WorkerAgentService:
                 result_summary={"error": error, "command": command},
                 log_lines=[error][: self.MAX_LOG_LINES],
             )
+        finally:
+            close_probe = getattr(cancel_check, "close", None)
+            if callable(close_probe):
+                close_probe()

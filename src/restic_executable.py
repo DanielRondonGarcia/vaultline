@@ -30,9 +30,20 @@ def resolve_restic_executable() -> str:
     return str(executable)
 
 
+RESTIC_PROGRESS_FPS_DEFAULT = "1"
+
+
 def restic_subprocess_environment(environment: dict[str, str]) -> dict[str, str]:
-    """Copy an environment and expose bundled helpers to frozen Restic children."""
+    """Copy an environment and expose bundled helpers to frozen Restic children.
+
+    Restic emits ``--json`` status records ten times per second by default
+    (``internal/ui/progress.go`` in v0.19.1), which floods the worker's log tail
+    and the progress pipe. ``RESTIC_PROGRESS_FPS`` also governs JSON output, so
+    one status record per second is enough for live progress; operators may
+    still override it.
+    """
     prepared = dict(environment)
+    prepared.setdefault("RESTIC_PROGRESS_FPS", RESTIC_PROGRESS_FPS_DEFAULT)
     if not getattr(sys, "frozen", False):
         return prepared
 

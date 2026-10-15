@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional
 from urllib.error import HTTPError
 
@@ -23,6 +24,7 @@ from src.worker_agent.infrastructure.adapters.redis_cache import RedisSnapshotCa
 from src.worker_agent.infrastructure.api_client.control_plane_client import ControlPlaneClient
 from src.worker_agent.application.services.live_target_session_manager import LiveTargetSessionKey, LiveTargetSessionManager
 from src.worker_agent.infrastructure.security.job_recovery_journal import WorkerJobRecoveryJournal
+from src.worker_agent.infrastructure.security.terminal_report_journal import WorkerTerminalReportJournal
 
 logger = logging.getLogger(__name__)
 LIVE_MOUNT_SOURCES_LIMIT = 64
@@ -460,6 +462,8 @@ class WorkerAgentService:
     )
     JOB_LEASE_RENEWAL_INTERVAL_SECONDS = 60.0
     JOB_CANCEL_PROBE_INTERVAL_SECONDS = 5.0
+    TERMINAL_REPORT_RETRY_MIN_SECONDS = 1.0
+    TERMINAL_REPORT_RETRY_MAX_SECONDS = 300.0
     INTERACTIVE_COMMANDS = frozenset(
         {"snapshots.list", "snapshot.ls", "snapshot.search", "snapshot.find", "snapshot.dump", "snapshot.about", "stats.get", "storage.about"}
     )
@@ -473,6 +477,7 @@ class WorkerAgentService:
         recovery_file: Optional[str] = None,
         recovery_journal: Optional[WorkerJobRecoveryJournal] = None,
         live_session_manager: Optional[LiveTargetSessionManager] = None,
+        terminal_report_journal: Optional[WorkerTerminalReportJournal] = None,
     ):
         self.config = config
         self.control_plane_client = control_plane_client
@@ -484,6 +489,14 @@ class WorkerAgentService:
         self.recovery_journal = recovery_journal or (
             WorkerJobRecoveryJournal(recovery_file) if recovery_file else None
         )
+        self.terminal_report_journal = terminal_report_journal or (
+            WorkerTerminalReportJournal(str(Path(recovery_file).with_name(f"{Path(recovery_file).stem}.terminal.json")))
+            if recovery_file
+            else None
+        )
+        self._pending_terminal_reports: Optional[List[Dict[str, Any]]] = None
+        self._terminal_retry_delay = self.TERMINAL_REPORT_RETRY_MIN_SECONDS
+        self._terminal_retry_at = 0.0
         self.live_sessions = live_session_manager or LiveTargetSessionManager(runtime_factory=self._live_runtime_factory, change_publisher=self._publish_live_change)
 
     def ensure_registered(self) -> str:
@@ -700,6 +713,109 @@ class WorkerAgentService:
     def _clear_recovery_record(self, job_id: Any) -> None:
         if self.recovery_journal is not None and isinstance(job_id, str):
             self.recovery_journal.clear(expected_job_id=job_id)
+
+    def _pending_terminal_reports_loaded(self) -> List[Dict[str, Any]]:
+        if self._pending_terminal_reports is None:
+            self._pending_terminal_reports = self.terminal_report_journal.load() if self.terminal_report_journal else []
+        return self._pending_terminal_reports
+
+    def _persist_pending_terminal_reports(self) -> None:
+        if self.terminal_report_journal is None:
+            return
+        try:
+            self.terminal_report_journal.write(self._pending_terminal_reports_loaded())
+        except (OSError, ValueError) as exc:
+            logger.warning("Pending terminal reports could not be persisted (error_type=%s)", _safe_worker_error_type(exc))
+
+    def _defer_terminal_report(
+        self,
+        worker_id: str,
+        job: Dict[str, Any],
+        execution: WorkerJobExecutionResult,
+        result_summary: Dict[str, Any],
+        error: Exception,
+    ) -> bool:
+        record = WorkerTerminalReportJournal.bounded_record(
+            job_id=job.get("id"),
+            worker_id=worker_id,
+            lease_token=job.get("lease_token"),
+            status=execution.status,
+            result_summary=result_summary,
+            log_lines=execution.log_lines,
+        )
+        if record is None:
+            logger.warning(
+                "Terminal report for job %s cannot be deferred (unleased or oversized result); error_type=%s",
+                job.get("id"),
+                _safe_worker_error_type(error),
+            )
+            return False
+        pending = self._pending_terminal_reports_loaded()
+        pending.append(record)
+        overflow = len(pending) - WorkerTerminalReportJournal.MAX_RECORDS
+        if overflow > 0:
+            for lost in pending[:overflow]:
+                logger.warning("Dropped pending terminal report for job %s: retry queue is full", lost["job_id"])
+            del pending[:overflow]
+        self._persist_pending_terminal_reports()
+        logger.warning(
+            "Terminal report for job %s deferred (error_type=%s); it is retried until the Control Plane accepts it",
+            job.get("id"),
+            _safe_worker_error_type(error),
+        )
+        return True
+
+    def flush_pending_terminal_reports(self, worker_id: str) -> int:
+        """Retry deferred terminal reports with backoff; never raises."""
+        pending = self._pending_terminal_reports_loaded()
+        if not pending or time.monotonic() < self._terminal_retry_at:
+            return 0
+        delivered = 0
+        while pending:
+            record = pending[0]
+            if record["worker_id"] != worker_id:
+                logger.warning("Dropped pending terminal report for job %s: worker identity changed", record["job_id"])
+                pending.pop(0)
+                continue
+            try:
+                self.control_plane_client.update_job_status(
+                    worker_id=worker_id,
+                    job_id=record["job_id"],
+                    status=record["status"],
+                    result_summary=record["result_summary"],
+                    log_lines=record["log_lines"],
+                    lease_token=record["lease_token"],
+                )
+            except Exception as exc:
+                if self._is_definitive_control_plane_rejection(exc):
+                    logger.warning(
+                        "Pending terminal report for job %s rejected by the Control Plane (error_type=%s); dropped",
+                        record["job_id"],
+                        _safe_worker_error_type(exc),
+                    )
+                    pending.pop(0)
+                    continue
+                record["attempts"] = int(record.get("attempts", 0) or 0) + 1
+                self._terminal_retry_at = time.monotonic() + self._terminal_retry_delay
+                self._terminal_retry_delay = min(self.TERMINAL_REPORT_RETRY_MAX_SECONDS, self._terminal_retry_delay * 2)
+                logger.warning(
+                    "Pending terminal report for job %s still undeliverable after %s attempts (error_type=%s)",
+                    record["job_id"],
+                    record["attempts"],
+                    _safe_worker_error_type(exc),
+                )
+                break
+            else:
+                logger.info(
+                    "Pending terminal report for job %s delivered after %s retries",
+                    record["job_id"],
+                    int(record.get("attempts", 0) or 0) + 1,
+                )
+                pending.pop(0)
+                delivered += 1
+                self._terminal_retry_delay = self.TERMINAL_REPORT_RETRY_MIN_SECONDS
+        self._persist_pending_terminal_reports()
+        return delivered
 
     @staticmethod
     def _is_definitive_control_plane_rejection(error: Exception) -> bool:
@@ -1804,17 +1920,20 @@ class WorkerAgentService:
                     log_lines=execution.log_lines,
                     lease_token=job.get("lease_token"),
                 )
-            except ValueError as exc:
-                if execution.status != JobStatus.CANCELED or "canceled" not in str(exc).lower():
-                    if self._is_definitive_control_plane_rejection(exc):
-                        self._clear_recovery_record(job.get("id"))
-                    raise
-                self._clear_recovery_record(job.get("id"))
-                updated = job
             except Exception as exc:
-                if self._is_definitive_control_plane_rejection(exc):
+                if execution.status == JobStatus.CANCELED and isinstance(exc, ValueError) and "canceled" in str(exc).lower():
                     self._clear_recovery_record(job.get("id"))
-                raise
+                    updated = job
+                elif self._is_definitive_control_plane_rejection(exc):
+                    self._clear_recovery_record(job.get("id"))
+                    raise
+                elif self._defer_terminal_report(worker_id, job, execution, result_summary, exc):
+                    # The runtime finished and the result is captured: the worker is
+                    # free for new work while the report is retried from the loop.
+                    self._clear_recovery_record(job.get("id"))
+                    updated = {**job, "status": execution.status}
+                else:
+                    raise
             else:
                 self._clear_recovery_record(job.get("id"))
             results.append(updated)
@@ -1827,6 +1946,7 @@ class WorkerAgentService:
 
     def poll_once(self, interactive: bool = False):
         worker_id = self.ensure_registered()
+        self.flush_pending_terminal_reports(worker_id)
         jobs = self._fetch_jobs(worker_id, interactive=interactive)
         if interactive:
             jobs = sorted(jobs or [], key=lambda item: item.get("command") not in self.INTERACTIVE_COMMANDS)

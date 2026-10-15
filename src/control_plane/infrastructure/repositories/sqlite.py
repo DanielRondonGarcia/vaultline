@@ -815,11 +815,13 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             log_lines = list(log_lines) if isinstance(log_lines, list) else []
             if interruption_log not in log_lines:
                 log_lines.append(interruption_log)
+            # Keep owner_worker_id and lease_token: they are the proof a late
+            # terminal report from the owning worker must present to replace
+            # this synthetic failure with the real result.
             updated = connection.execute(
                 """
                 UPDATE jobs
-                SET status = ?, owner_worker_id = NULL, lease_token = NULL,
-                    lease_issued_at = NULL, lease_expires_at = NULL,
+                SET status = ?, lease_issued_at = NULL, lease_expires_at = NULL,
                     result_summary_json = ?, log_lines_json = ?,
                     finished_at = ?, updated_at = ?
                 WHERE id = ? AND status = ?

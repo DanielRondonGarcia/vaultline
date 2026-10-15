@@ -1696,6 +1696,138 @@ class WorkerRestartRecoveryTests(unittest.TestCase):
             self.assertEqual(client.updates, [])
             container.remove.assert_called_once_with(force=True)
 
+    class OutageClient:
+        class _CredentialStore:
+            def load(self):
+                return object()
+
+        credential_store = _CredentialStore()
+
+        def __init__(self, failures):
+            self.updates = []
+            self.fetches = 0
+            self.failures = list(failures)
+
+        def fetch_jobs(self, worker_id):
+            self.fetches += 1
+            return []
+
+        def update_job_status(self, **kwargs):
+            self.updates.append(kwargs)
+            if self.failures:
+                raise self.failures.pop(0)
+            return {"status": kwargs["status"]}
+
+    @staticmethod
+    def succeeding_runtime():
+        runtime = Mock()
+        runtime.run_runtime_job.return_value = {
+            "success": True,
+            "status_code": 0,
+            "logs": "backup done lease-token-never-logged",
+            "stderr": "",
+        }
+        return runtime
+
+    def test_terminal_report_survives_control_plane_outage_and_is_delivered_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recovery_file = os.path.join(directory, "worker_job_recovery.json")
+            client = self.OutageClient([ConnectionError("control plane down"), TimeoutError("still down")])
+            service = WorkerAgentService(
+                WorkerAgentConfig("http://control-plane", "worker", "host", worker_id="worker"),
+                client,
+                self.succeeding_runtime(),
+                recovery_file=recovery_file,
+            )
+            service.TERMINAL_REPORT_RETRY_MIN_SECONDS = 0.01
+            service._terminal_retry_delay = 0.01
+
+            processed = service._process_jobs("worker", [self.job()])
+
+            self.assertEqual(processed[0]["status"], JobStatus.SUCCEEDED)
+            self.assertEqual(len(client.updates), 1)
+            self.assertFalse(os.path.exists(recovery_file))
+            self.assertTrue(os.path.exists(service.terminal_report_journal.path))
+
+            self.assertEqual(service.poll_once(), [])
+            self.assertEqual(client.fetches, 1)
+            self.assertEqual(len(client.updates), 2)
+            time.sleep(0.05)
+            self.assertEqual(service.poll_once(), [])
+            self.assertEqual(len(client.updates), 3)
+            self.assertEqual(client.updates[2], client.updates[0])
+            self.assertEqual(client.updates[2]["status"], JobStatus.SUCCEEDED)
+            self.assertEqual(client.updates[2]["lease_token"], "lease-token-never-logged")
+            self.assertIn("backup done", "\n".join(client.updates[2]["log_lines"]))
+            self.assertFalse(os.path.exists(service.terminal_report_journal.path))
+
+            service.poll_once()
+            self.assertEqual(len(client.updates), 3)
+
+    def test_terminal_report_retry_respects_backoff_between_ticks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.OutageClient([ConnectionError("down")] * 5)
+            service = WorkerAgentService(
+                WorkerAgentConfig("http://control-plane", "worker", "host", worker_id="worker"),
+                client,
+                self.succeeding_runtime(),
+                recovery_file=os.path.join(directory, "worker_job_recovery.json"),
+            )
+            service._terminal_retry_delay = 10.0
+
+            service._process_jobs("worker", [self.job()])
+            service.poll_once()
+            service.poll_once()
+            service.poll_once()
+
+            self.assertEqual(len(client.updates), 2)
+            self.assertEqual(client.fetches, 3)
+
+    def test_pending_terminal_report_is_reloaded_after_worker_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            recovery_file = os.path.join(directory, "worker_job_recovery.json")
+            first_client = self.OutageClient([ConnectionError("down")])
+            first = WorkerAgentService(
+                WorkerAgentConfig("http://control-plane", "worker", "host", worker_id="worker"),
+                first_client,
+                self.succeeding_runtime(),
+                recovery_file=recovery_file,
+            )
+            first._process_jobs("worker", [self.job()])
+
+            restarted_client = self.OutageClient([])
+            restarted = WorkerAgentService(
+                WorkerAgentConfig("http://control-plane", "worker", "host", worker_id="worker"),
+                restarted_client,
+                self.succeeding_runtime(),
+                recovery_file=recovery_file,
+            )
+            restarted.poll_once()
+
+            self.assertEqual(len(restarted_client.updates), 1)
+            self.assertEqual(restarted_client.updates[0]["job_id"], first_client.updates[0]["job_id"])
+            self.assertEqual(restarted_client.updates[0]["result_summary"], first_client.updates[0]["result_summary"])
+            self.assertEqual(restarted_client.updates[0]["log_lines"], first_client.updates[0]["log_lines"])
+            self.assertFalse(os.path.exists(restarted.terminal_report_journal.path))
+
+    def test_definitively_rejected_pending_report_is_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.OutageClient([ConnectionError("down"), ValueError("worker 'worker' does not own job 'job-restore'")])
+            service = WorkerAgentService(
+                WorkerAgentConfig("http://control-plane", "worker", "host", worker_id="worker"),
+                client,
+                self.succeeding_runtime(),
+                recovery_file=os.path.join(directory, "worker_job_recovery.json"),
+            )
+            service._terminal_retry_delay = 0.0
+
+            service._process_jobs("worker", [self.job()])
+            service.poll_once()
+            service.poll_once()
+
+            self.assertEqual(len(client.updates), 2)
+            self.assertFalse(os.path.exists(service.terminal_report_journal.path))
+
 
 if __name__ == "__main__":
     unittest.main()

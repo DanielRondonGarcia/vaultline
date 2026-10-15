@@ -273,8 +273,9 @@ class SchedulerDeploymentTests(unittest.TestCase):
         self.assertEqual(failed.attempt_count, 1)
         self.assertIsNotNone(failed.finished_at)
         self.assertIsNotNone(failed.updated_at)
-        self.assertIsNone(failed.owner_worker_id)
-        self.assertIsNone(failed.lease_token)
+        # Ownership evidence is retained so the owner's late terminal report can prove itself.
+        self.assertEqual(failed.owner_worker_id, "worker-a")
+        self.assertEqual(failed.lease_token, stale_token)
         self.assertIsNone(failed.lease_issued_at)
         self.assertIsNone(failed.lease_expires_at)
         self.assertEqual(failed.result_summary["error"], "worker lease expired before the job reported a terminal result")
@@ -290,14 +291,23 @@ class SchedulerDeploymentTests(unittest.TestCase):
         self.assertEqual(failed.log_lines, ["Worker lease expired before terminal status was reported."])
 
         service = self._service(repository)
-        with self.assertRaisesRegex(ValueError, "does not own"):
+        with self.assertRaisesRegex(ValueError, "invalid or stale"):
             service.update_job_status(
                 worker_id="worker-a",
                 job_id=interrupted.id,
                 status=JobStatus.SUCCEEDED,
-                lease_token=stale_token,
+                lease_token="not-the-lease",
             )
         self.assertEqual(repository.get(interrupted.id).status, JobStatus.FAILED)
+
+        # The owning worker's real result outlives the liveness timer.
+        service.update_job_status(
+            worker_id="worker-a",
+            job_id=interrupted.id,
+            status=JobStatus.SUCCEEDED,
+            lease_token=stale_token,
+        )
+        self.assertEqual(repository.get(interrupted.id).status, JobStatus.SUCCEEDED)
 
     @staticmethod
     def _service(job_repository=None):

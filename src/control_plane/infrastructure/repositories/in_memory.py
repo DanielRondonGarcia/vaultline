@@ -280,8 +280,8 @@ class InMemoryJobRepository(JobRepository):
                 result_summary["lease_diagnostics"] = _lease_diagnostics(job, now)
                 result_summary.pop("lease_context", None)
                 job.status = JobStatus.FAILED
-                job.owner_worker_id = None
-                job.lease_token = None
+                # Keep owner_worker_id and lease_token: a late terminal report
+                # from the owning worker must still prove ownership.
                 job.lease_issued_at = None
                 job.lease_expires_at = None
                 job.result_summary = result_summary

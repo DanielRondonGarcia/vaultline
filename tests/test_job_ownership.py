@@ -75,7 +75,7 @@ class JobOwnershipTests(unittest.TestCase):
             )
         self.assertEqual(service.job_repository.get(job.id).status, JobStatus.IN_PROGRESS)
 
-    def test_wrong_and_expired_lease_cannot_complete(self):
+    def test_wrong_lease_cannot_complete_but_owner_result_outlives_lease_expiry(self):
         service = self.make_service()
         job = service.dispatch_job("worker-a", "worker.self_check")
         claimed = service.fetch_jobs_for_worker("worker-a")[0]
@@ -84,11 +84,14 @@ class JobOwnershipTests(unittest.TestCase):
             service.update_job_status("worker-a", job.id, JobStatus.SUCCEEDED, lease_token="wrong")
         claimed.lease_expires_at = utcnow() - timedelta(seconds=1)
         service.job_repository.save(claimed)
-        with self.assertRaisesRegex(ValueError, "expired"):
-            service.update_job_status(
-                "worker-a", job.id, JobStatus.SUCCEEDED, lease_token=claimed.lease_token
-            )
         self.assertEqual(service.job_repository.get(job.id).status, JobStatus.IN_PROGRESS)
+
+        # The lease is a liveness timer, not a reason to discard the owner's result.
+        completed = service.update_job_status(
+            "worker-a", job.id, JobStatus.SUCCEEDED, lease_token=claimed.lease_token
+        )
+        self.assertEqual(completed.status, JobStatus.SUCCEEDED)
+        self.assertEqual(service.get_job(job.id).status, JobStatus.SUCCEEDED)
 
     def test_lease_renewal_extends_only_the_current_owner_lease(self):
         service = self.make_service()
@@ -175,10 +178,110 @@ class JobOwnershipTests(unittest.TestCase):
         view = service.get_job_view(interrupted.id)
         self.assertEqual(view["diagnostics"]["code"], "worker_lease_expired")
         self.assertNotIn("lease-token", json.dumps(view, default=str))
-        self.assertIsNone(observed.owner_worker_id)
-        self.assertIsNone(observed.lease_token)
+        # Ownership evidence survives expiry so a late owner report can still prove itself.
+        self.assertEqual(observed.owner_worker_id, "worker-a")
+        self.assertEqual(observed.lease_token, "lease-token")
+        self.assertIsNone(observed.lease_expires_at)
         self.assertEqual(observed.log_lines.count("Worker lease expired before terminal status was reported."), 1)
         self.assertEqual(service.get_job(interrupted.id).status, JobStatus.FAILED)
+
+    def _expired_job(self, service, command="backup.run", lease_token="lease-token"):
+        interrupted = JobRecord(
+            worker_id="worker-a",
+            command=command,
+            status=JobStatus.IN_PROGRESS,
+            owner_worker_id="worker-a",
+            lease_token=lease_token,
+            lease_issued_at=utcnow() - timedelta(minutes=6),
+            lease_expires_at=utcnow() - timedelta(minutes=1),
+        )
+        service.job_repository.save(interrupted)
+        expired = service.get_job(interrupted.id)
+        self.assertEqual(expired.status, JobStatus.FAILED)
+        self.assertEqual(expired.result_summary["diagnostic_code"], "worker_lease_expired")
+        return interrupted
+
+    def test_late_terminal_report_from_owner_replaces_lease_expiry_failure(self):
+        for repository in (None, "sqlite"):
+            with self.subTest(repository=repository or "memory"), tempfile.TemporaryDirectory() as directory:
+                service = self.make_service(
+                    SQLiteJobRepository(f"{directory}/control-plane.db") if repository else None
+                )
+                interrupted = self._expired_job(service)
+
+                with self.assertLogs("src.control_plane.application.services.control_plane_service", level="INFO") as captured:
+                    accepted = service.update_job_status(
+                        worker_id="worker-a",
+                        job_id=interrupted.id,
+                        status=JobStatus.SUCCEEDED,
+                        result_summary={"status_code": 0, "snapshot_id": "abc123"},
+                        log_lines=["Backup finished"],
+                        lease_token="lease-token",
+                    )
+                self.assertTrue(any("Late terminal report accepted after lease expiry" in line for line in captured.output))
+
+                self.assertEqual(accepted.status, JobStatus.SUCCEEDED)
+                stored = service.get_job(interrupted.id)
+                self.assertEqual(stored.status, JobStatus.SUCCEEDED)
+                self.assertEqual(stored.result_summary["snapshot_id"], "abc123")
+                self.assertNotIn("diagnostic_code", stored.result_summary)
+                self.assertNotIn("recovery", stored.result_summary)
+                self.assertIsNotNone(stored.finished_at)
+                self.assertIn("Worker lease expired before terminal status was reported.", stored.log_lines)
+                self.assertIn("Backup finished", stored.log_lines)
+                self.assertTrue(any(line.startswith("Late terminal report accepted after lease expiry") for line in stored.log_lines))
+
+                view = service.get_job_view(interrupted.id)
+                self.assertEqual(view["status"], JobStatus.SUCCEEDED)
+                self.assertIsNone(view["diagnostics"])
+                self.assertEqual(view["result_summary"]["snapshot_id"], "abc123")
+                self.assertNotIn("lease-token", json.dumps(view, default=str))
+
+                with self.assertRaisesRegex(ValueError, "not in progress"):
+                    service.update_job_status(
+                        "worker-a", interrupted.id, JobStatus.FAILED, lease_token="lease-token"
+                    )
+                self.assertEqual(service.get_job(interrupted.id).status, JobStatus.SUCCEEDED)
+
+    def test_late_terminal_report_without_summary_still_clears_the_synthetic_failure(self):
+        service = self.make_service()
+        interrupted = self._expired_job(service, command="worker.self_check")
+
+        service.update_job_status("worker-a", interrupted.id, JobStatus.FAILED, lease_token="lease-token")
+
+        stored = service.get_job(interrupted.id)
+        self.assertEqual(stored.status, JobStatus.FAILED)
+        self.assertNotIn("diagnostic_code", stored.result_summary)
+        self.assertIsNone(service.get_job_view(interrupted.id)["diagnostics"])
+
+    def test_late_terminal_report_from_non_owner_or_wrong_token_is_rejected(self):
+        service = self.make_service()
+        interrupted = self._expired_job(service)
+
+        with self.assertRaisesRegex(ValueError, "does not own"):
+            service.update_job_status("worker-b", interrupted.id, JobStatus.SUCCEEDED, lease_token="lease-token")
+        with self.assertRaisesRegex(ValueError, "invalid or stale"):
+            service.update_job_status("worker-a", interrupted.id, JobStatus.SUCCEEDED, lease_token="guessed")
+        with self.assertRaisesRegex(ValueError, "invalid or stale"):
+            service.update_job_status("worker-a", interrupted.id, JobStatus.SUCCEEDED, lease_token=None)
+
+        stored = service.get_job(interrupted.id)
+        self.assertEqual(stored.status, JobStatus.FAILED)
+        self.assertEqual(stored.result_summary["diagnostic_code"], "worker_lease_expired")
+        self.assertEqual(service.get_job_view(interrupted.id)["diagnostics"]["code"], "worker_lease_expired")
+
+    def test_late_report_cannot_overwrite_a_regular_worker_reported_failure(self):
+        service = self.make_service()
+        job = service.dispatch_job("worker-a", "worker.self_check")
+        claimed = service.fetch_jobs_for_worker("worker-a")[0]
+        service.update_job_status(
+            "worker-a", job.id, JobStatus.FAILED, result_summary={"error": "boom"}, lease_token=claimed.lease_token
+        )
+
+        with self.assertRaisesRegex(ValueError, "not in progress"):
+            service.update_job_status("worker-a", job.id, JobStatus.SUCCEEDED, lease_token=claimed.lease_token)
+        self.assertEqual(service.get_job(job.id).status, JobStatus.FAILED)
+        self.assertEqual(service.get_job(job.id).result_summary["error"], "boom")
 
     def test_duplicate_and_canceled_completion_are_rejected(self):
         service = self.make_service()

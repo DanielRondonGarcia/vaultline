@@ -3545,15 +3545,31 @@ class ControlPlaneService:
         job.status = JobStatus.normalize(job.status)
         if job.status == JobStatus.CANCELED:
             raise ValueError(f"job '{job_id}' is canceled")
-        if job.status != JobStatus.IN_PROGRESS:
+        # The lease is a liveness timer for the Control Plane, not a reason to
+        # discard the owner's real result: a worker that kept running while the
+        # Control Plane was unreachable may report after expiry already flipped
+        # the job to the synthetic worker_lease_expired failure.
+        current_summary = job.result_summary if isinstance(job.result_summary, dict) else {}
+        late_after_lease_expiry = (
+            job.status == JobStatus.FAILED and current_summary.get("diagnostic_code") == self.LEASE_DIAGNOSTIC_CODE
+        )
+        if job.status != JobStatus.IN_PROGRESS and not late_after_lease_expiry:
             raise ValueError(f"job '{job_id}' is not in progress (current status: {job.status})")
         if not isinstance(lease_token, str) or not hmac.compare_digest(job.lease_token or "", lease_token):
             raise ValueError(f"job '{job_id}' lease token is invalid or stale")
-        if not job.lease_expires_at or job.lease_expires_at <= utcnow():
-            raise ValueError(f"job '{job_id}' lease has expired")
         status = JobStatus.normalize(status)
         if status not in (JobStatus.SUCCEEDED, JobStatus.FAILED):
             raise ValueError(f"job '{job_id}' cannot be completed with status: {status}")
+        if late_after_lease_expiry:
+            logger.info(
+                "Late terminal report accepted after lease expiry for job %s from worker %s (status=%s)",
+                job_id,
+                worker_id,
+                status,
+            )
+            log_lines = list(log_lines or []) + [
+                "Late terminal report accepted after lease expiry; the worker_lease_expired diagnostic was superseded."
+            ]
         job.status = status
         job.updated_at = utcnow()
         incoming_lease_context = lease_context
@@ -3564,7 +3580,7 @@ class ControlPlaneService:
             if incoming_lease_context is not None
             else None
         )
-        if result_summary is not None:
+        if result_summary is not None or late_after_lease_expiry:
             completed_summary = dict(result_summary) if isinstance(result_summary, dict) else {}
             if normalized_lease_context is not None:
                 completed_summary["lease_context"] = normalized_lease_context

@@ -14,6 +14,7 @@ from src.app.domain.models import BackupConfig, BackupResult, RestoreConfig, Res
 from src.app.application.ports.ports import BackupStrategy, RestoreStrategy
 from src.app.domain.restore_ownership import RestoreOwnershipPolicy, parse_uid_gid
 from src.restic_retention import build_restic_forget_command
+from src.restic_executable import resolve_restic_executable
 
 logger = logging.getLogger(__name__)
 
@@ -21,9 +22,12 @@ SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 UNSUPPORTED_METADATA = ["acl", "xattr", "timestamps", "special metadata"]
 
 
-def _require_executable(name: str) -> None:
+def _require_executable(name: str) -> str:
+    if name == "restic" and getattr(sys, "frozen", False):
+        return resolve_restic_executable()
     if shutil.which(name) is None:
         raise FileNotFoundError(f"required executable '{name}' is not available on PATH")
+    return name
 
 
 class OwnershipNormalizationError(RuntimeError):
@@ -487,16 +491,16 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
         logger.info(f"Running restic backup for {sources}")
         
         try:
-            _require_executable("restic")
+            restic = _require_executable("restic") or "restic"
             # Check if repo is initialized
-            init_check_cmd = ["restic", "snapshots", "--json", "--latest", "1"]
+            init_check_cmd = [restic, "snapshots", "--json", "--latest", "1"]
             try:
                 subprocess.run(init_check_cmd, env=env, capture_output=True, check=True)
             except subprocess.CalledProcessError:
                 logger.info("Restic repository not initialized or not accessible. Attempting to initialize...")
                 # Try to init
                 try:
-                    init_cmd = ["restic", "init"]
+                    init_cmd = [restic, "init"]
                     subprocess.run(init_cmd, env=env, check=True)
                     logger.info("Restic repository initialized successfully.")
                 except subprocess.CalledProcessError as e:
@@ -504,7 +508,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                     logger.error(f"Failed to initialize restic repository: {e}")
                     raise e
 
-            cmd = ["restic", "backup", "--json"] + sources
+            cmd = [restic, "backup", "--json"] + sources
             stdout, stderr, return_code = self._run_incremental_backup(cmd, env, output_callback)
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, cmd, output=stdout, stderr=stderr)
@@ -533,6 +537,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                 keep_yearly=config.restic_keep_yearly,
                 prune=config.restic_prune,
             )
+            prune_cmd[0] = restic
             logger.info(
                 "Pruning old snapshots..."
                 if config.restic_prune
@@ -591,6 +596,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             env["RESTIC_PASSWORD"] = password
 
         try:
+            restic = _require_executable("restic") or "restic"
             _ensure_direct_restore_target_is_writable(config)
             policy = _ownership_policy(config)
             snapshot = source_path or config.source or "latest"
@@ -598,7 +604,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                 temp_dir = tempfile.mkdtemp(prefix="restore-restic-")
                 logger.info(f"Restoring restic snapshot {snapshot} into temp dir: {temp_dir}")
                 sys.stderr.flush()
-                subprocess.run(["restic", "restore", snapshot, "--target", temp_dir], env=env, check=True)
+                subprocess.run([restic, "restore", snapshot, "--target", temp_dir], env=env, check=True)
                 actions.append(f"Restore restic snapshot into temporary workspace: {snapshot}")
                 logger.info("Restic restore complete, copying entries to target volumes")
                 sys.stderr.flush()
@@ -611,7 +617,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                 _clear_target_contents(config.target_path)
                 logger.info(f"Restoring restic snapshot {snapshot} directly to {config.target_path}")
                 sys.stderr.flush()
-                subprocess.run(["restic", "restore", snapshot, "--target", config.target_path], env=env, check=True)
+                subprocess.run([restic, "restore", snapshot, "--target", config.target_path], env=env, check=True)
                 actions.append(f"Restore restic snapshot: {snapshot}")
 
             normalization = normalize_ownership(config, policy)

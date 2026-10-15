@@ -1,6 +1,9 @@
 from types import SimpleNamespace
+import sys
+import tempfile
 import unittest
-from unittest.mock import Mock
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 from src.app.domain.restore_metadata import ResticMetadataError, parse_restic_ls_long
 from src.app.domain.restore_ownership import RestoreOwnershipPolicy
@@ -96,6 +99,22 @@ class RestoreMetadataTests(unittest.TestCase):
         failed = ResticMetadataInspectorAdapter(runner=runner).inspect("snap-1")
         self.assertFalse(failed.success)
         self.assertEqual(failed.category, "restic_metadata_inspection_failed")
+
+    def test_frozen_metadata_inspection_uses_bundled_restic_not_host_path(self):
+        runner = Mock(return_value=SimpleNamespace(returncode=0, stdout=line(), stderr=""))
+        executable_name = "restic.exe" if sys.platform == "win32" else "restic"
+
+        with tempfile.TemporaryDirectory() as directory:
+            bundled = Path(directory) / executable_name
+            bundled.write_text("synthetic bundled executable", encoding="utf-8")
+            bundled.chmod(0o755)
+            with patch.object(sys, "frozen", True, create=True), patch.object(
+                sys, "_MEIPASS", directory, create=True
+            ):
+                result = ResticMetadataInspectorAdapter(runner=runner).inspect("snap-1")
+
+        self.assertTrue(result.success)
+        self.assertEqual(runner.call_args.args[0], [str(bundled), "ls", "--long", "snap-1"])
 
     def test_adapter_decodes_metadata_as_utf8_with_replacement(self):
         raw_output = (

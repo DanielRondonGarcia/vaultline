@@ -5,11 +5,19 @@ Build on each target OS/Python/architecture combination; one-file outputs are no
 portable across operating systems or architectures.
 """
 
+import os
 import sys
 from pathlib import Path
 
 block_cipher = None
 ROOT = Path(SPECPATH).resolve().parent
+RESTIC_BINARY = Path(os.environ.get("VAULTLINE_RESTIC_BINARY", ""))
+RESTIC_LICENSE = ROOT / "packaging/licenses/restic-v0.19.1-LICENSE"
+
+if not RESTIC_BINARY.is_file():
+    raise SystemExit("VAULTLINE_RESTIC_BINARY must point to the verified Restic release executable")
+if not RESTIC_LICENSE.is_file():
+    raise SystemExit(f"the bundled Restic license is missing: {RESTIC_LICENSE}")
 
 hiddenimports = [
     "src.app.main",
@@ -49,8 +57,8 @@ if sys.platform == "win32":
 a = Analysis(
     [str(ROOT / "src/worker_agent/cli.py")],
     pathex=[str(ROOT)],
-    binaries=[],
-    datas=[],
+    binaries=[(str(RESTIC_BINARY), ".")],
+    datas=[(str(RESTIC_LICENSE), "licenses/restic")],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

@@ -1,7 +1,13 @@
 import ast
+import hashlib
 import re
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from scripts import download_pinned_restic
 
 
 def _string_constants(node):
@@ -45,8 +51,86 @@ class WorkerPackagingTests(unittest.TestCase):
         self.assertIn("src.worker_agent.cli", spec)
         self.assertNotIn(".worker_credentials", spec)
         self.assertNotIn("WORKER_SECRET", spec)
-        self.assertNotIn("restic", spec.lower())
+        self.assertIn("VAULTLINE_RESTIC_BINARY", spec)
+        self.assertIn('binaries=[(str(RESTIC_BINARY), ".")]', spec)
+        self.assertIn('datas=[(str(RESTIC_LICENSE), "licenses/restic")]', spec)
+        self.assertIn("restic-v0.19.1-LICENSE", spec)
         self.assertNotIn("tar.exe", spec.lower())
+
+    def test_pinned_restic_archives_use_the_supplied_sha256_digests(self):
+        self.assertEqual(download_pinned_restic.RELEASE_TAG, "v0.19.1")
+        self.assertEqual(
+            {key: asset.sha256 for key, asset in download_pinned_restic.ASSETS.items()},
+            {
+                ("windows", "amd64"): "da948ad707ed690426473aaba2046cd61f8f90f6f0e7dab6be0d5796531de67d",
+                ("linux", "amd64"): "f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c",
+                ("linux", "arm64"): "a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465",
+            },
+        )
+
+    def test_restic_archive_digest_is_checked_before_extraction(self):
+        asset = download_pinned_restic.ResticAsset("restic.zip", "0" * 64, "zip", "restic.exe", "restic.exe")
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / asset.filename
+            archive.write_bytes(b"unverified archive")
+            with patch.object(download_pinned_restic, "_extract_archive") as extract:
+                with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
+                    download_pinned_restic._extract_verified_archive(archive, asset, Path(directory) / "out")
+            extract.assert_not_called()
+            self.assertFalse((Path(directory) / "out" / "restic.exe").exists())
+            self.assertEqual(
+                hashlib.sha256(archive.read_bytes()).hexdigest(),
+                download_pinned_restic._sha256(archive),
+            )
+
+    def test_pinned_restic_license_is_kept_for_binary_redistribution(self):
+        license_path = Path("packaging/licenses/restic-v0.19.1-LICENSE")
+        self.assertTrue(license_path.is_file())
+        license_text = license_path.read_text(encoding="utf-8")
+        self.assertIn("BSD 2-Clause License", license_text)
+        self.assertIn("Copyright (c) 2014, the restic developers", license_text)
+        self.assertIn("2. Redistributions in binary form must reproduce", license_text)
+
+        deb_builder = Path("scripts/build_worker_deb.sh").read_text(encoding="utf-8")
+        wix_source = Path("packaging/windows/vaultline-worker.wxs").read_text(encoding="utf-8")
+        self.assertIn("usr/share/doc/vaultline-worker/restic-v0.19.1-LICENSE", deb_builder)
+        self.assertIn('Name="restic-v0.19.1-LICENSE"', wix_source)
+        self.assertIn('ComponentRef Id="ResticLicense"', wix_source)
+
+    def test_backup_and_retention_commands_use_the_resolved_restic_executable(self):
+        from src.app.domain.models import BackupConfig
+        from src.app.infrastructure.adapters.backup_strategy import ResticBackupStrategy
+
+        strategy = ResticBackupStrategy()
+        strategy._run_incremental_backup = Mock(
+            return_value=('{"message_type":"summary","data_added":7,"total_duration":1.5}', "", 0)
+        )
+        bundled_restic = r"C:\\PyInstaller\\restic.exe"
+
+        with patch(
+            "src.app.infrastructure.adapters.backup_strategy._require_executable", return_value=bundled_restic
+        ), patch("src.app.infrastructure.adapters.backup_strategy.subprocess.run") as run:
+            result = strategy.perform_backup(BackupConfig(source_paths=["/backup"], restic_keep_daily=1))
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(run.call_args_list[0].args[0][0], bundled_restic)
+        self.assertEqual(strategy._run_incremental_backup.call_args.args[0][0], bundled_restic)
+        self.assertEqual(run.call_args_list[-1].args[0][0], bundled_restic)
+
+    def test_restic_snapshot_listing_uses_the_resolved_restic_executable(self):
+        from src.app.infrastructure.adapters.storage.multi_storage_adapter import MultiStorageAdapter
+
+        runner = Mock(return_value=SimpleNamespace(stdout="[]"))
+        config = SimpleNamespace(restic_password=None)
+        with patch(
+            "src.app.infrastructure.adapters.storage.multi_storage_adapter.resolve_restic_executable",
+            return_value="/bundle/restic",
+        ), patch(
+            "src.app.infrastructure.adapters.storage.multi_storage_adapter.subprocess.run", runner
+        ):
+            self.assertEqual(MultiStorageAdapter()._list_restic_candidates(config, "local:/repo"), [])
+
+        self.assertEqual(runner.call_args.args[0], ["/bundle/restic", "snapshots", "--json"])
 
     def test_vaultline_worker_spec_adds_backports_hiddenimports_only_on_windows(self):
         spec_path = Path("build/vaultline-worker.spec")

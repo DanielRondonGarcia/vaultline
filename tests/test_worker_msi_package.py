@@ -65,10 +65,13 @@ class WorkerMsiPackageTests(unittest.TestCase):
         self.assertEqual(install_dir.get("Name"), "Vaultline")
 
         files = list(self.find_all("File"))
-        self.assertEqual(len(files), 1)
+        self.assertEqual(len(files), 2)
         self.assertEqual(files[0].get("Source"), "$(var.WorkerExe)")
         self.assertIn("WorkerExe", self.source)
         self.assertRegex(self.source, r"\?define WorkerExe\s*=")
+        self.assertEqual(files[1].get("Source"), "$(var.ResticLicense)")
+        self.assertEqual(files[1].get("Name"), "restic-v0.19.1-LICENSE")
+        self.assertIn("ResticLicense", self.source)
 
     def test_registers_auto_start_local_system_service_hosting_service_run(self):
         installs = list(self.find_all("ServiceInstall"))
@@ -177,7 +180,7 @@ class WorkerMsiPackageTests(unittest.TestCase):
         lowered = self.source.lower()
         for forbidden in ("token", "secret", "credential", "password", "worker.env", "worker.json"):
             self.assertNotIn(forbidden, lowered)
-        self.assertEqual(len(list(self.find_all("File"))), 1)
+        self.assertEqual(len(list(self.find_all("File"))), 2)
         self.assertEqual(len(list(self.find_all("IniFile"))), 0)
         self.assertEqual(len(list(self.find_all("RegistryValue"))), 0)
 

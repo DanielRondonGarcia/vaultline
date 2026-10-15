@@ -195,6 +195,41 @@ class NativeRestoreTests(unittest.TestCase):
             )
         )
 
+    def test_frozen_native_runtime_selects_bundled_restic_instead_of_host_path(self):
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable)
+        executable_name = "restic.exe" if sys.platform == "win32" else "restic"
+        payload = {
+            "runtime_type": "native",
+            "filesystem_paths": ["/srv/app"],
+            "command": ["restic", "snapshots", "--json"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            bundled = Path(directory) / executable_name
+            bundled.write_text("synthetic bundled executable", encoding="utf-8")
+            bundled.chmod(0o755)
+            with patch.object(sys, "frozen", True, create=True), patch.object(
+                sys, "_MEIPASS", directory, create=True
+            ), patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="host-restic"):
+                command, _environment = adapter._command_and_environment(payload)
+                self.assertTrue(adapter.self_check()["executables"]["restic"])
+
+        self.assertEqual(command, [str(bundled), "snapshots", "--json"])
+
+    def test_frozen_native_runtime_fails_closed_when_bundled_restic_is_missing(self):
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable)
+        payload = {
+            "runtime_type": "native",
+            "filesystem_paths": ["/srv/app"],
+            "command": ["restic", "snapshots", "--json"],
+        }
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(sys, "frozen", True, create=True), patch.object(
+            sys, "_MEIPASS", directory, create=True
+        ), patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value="host-restic"):
+            with self.assertRaisesRegex(FileNotFoundError, "bundled Restic executable"):
+                adapter._command_and_environment(payload)
+
     def test_native_runtime_keeps_linux_source_overlap_case_sensitive(self):
         adapter = NativeRuntimeAdapter(python_executable=sys.executable)
         recorded = {}
@@ -313,6 +348,37 @@ class NativeRestoreTests(unittest.TestCase):
         self.assertEqual(recorded["command"], ["vaultline-worker.exe", "backup-engine"])
         self.assertEqual(recorded["env"]["BACKUP_RUNTIME_TYPE"], "native")
         self.assertIn("restore_ownership", result)
+
+    def test_restic_restore_strategy_uses_its_resolved_executable(self):
+        from src.app.domain.restore_ownership import RestoreOwnershipPolicy
+        from src.app.infrastructure.adapters.backup_strategy import ResticBackupStrategy
+
+        config = RestoreConfig(
+            target_path="/restore/native-target",
+            source="abcdef12",
+            dry_run=False,
+            force_overwrite=True,
+            backup_strategy="restic",
+            runtime_type="native",
+        )
+        bundled_restic = "/pyinstaller-bundle/restic"
+
+        with patch(
+            "src.app.infrastructure.adapters.backup_strategy._require_executable", return_value=bundled_restic
+        ), patch("src.app.infrastructure.adapters.backup_strategy._ensure_direct_restore_target_is_writable"), patch(
+            "src.app.infrastructure.adapters.backup_strategy._should_use_backup_dir_layout", return_value=False
+        ), patch("src.app.infrastructure.adapters.backup_strategy._ownership_policy", return_value=RestoreOwnershipPolicy()), patch(
+            "src.app.infrastructure.adapters.backup_strategy._clear_target_contents"
+        ), patch("src.app.infrastructure.adapters.backup_strategy.subprocess.run") as run, patch(
+            "src.app.infrastructure.adapters.backup_strategy._sqlite_warnings", return_value=[]
+        ):
+            result = ResticBackupStrategy().restore("abcdef12", config)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            run.call_args.args[0],
+            [bundled_restic, "restore", "abcdef12", "--target", config.target_path],
+        )
 
     def test_native_runtime_rejects_restore_stop_containers(self):
         adapter = NativeRuntimeAdapter(python_executable=sys.executable)

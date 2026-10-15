@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from src.app.domain.models import BackupConfig, RestoreCandidate, RestoreConfig
 from src.app.application.ports.ports import StoragePort
+from src.restic_executable import resolve_restic_executable
 
 logger = logging.getLogger(__name__)
 
@@ -125,7 +126,7 @@ class MultiStorageAdapter(StoragePort):
 
         try:
             result = subprocess.run(
-                ["restic", "snapshots", "--json"],
+                [resolve_restic_executable(), "snapshots", "--json"],
                 capture_output=True,
                 text=True,
                 check=True,

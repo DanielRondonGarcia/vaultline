@@ -2023,7 +2023,8 @@ class WorkerUiStateTests(unittest.TestCase):
             "ProgramData\\\\Vaultline\\\\worker",
             "glibc >= 2.17",
             "SmartScreen",
-            "restic, tar, gpg, rclone, aws, ssh y scp",
+            "Restic se incluye con el worker nativo",
+            "tar, gpg, rclone, aws, ssh y scp se instalan por separado",
             "espera el enrolamiento",
         ):
             self.assertIn(marker, self.source)

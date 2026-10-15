@@ -43,8 +43,9 @@ class WorkerDebPackageTests(unittest.TestCase):
         self.assertIn("install -m 0644", builder)
         self.assertNotIn("WORKER_ENROLLMENT_TOKEN", builder)
         self.assertNotIn("WORKER_SECRET", builder)
-        for tool in ("restic", "rclone", "gpg", "aws", "ssh", "scp"):
+        for tool in ("rclone", "gpg", "aws", "ssh", "scp"):
             self.assertNotIn(tool, builder.lower())
+        self.assertIn("restic-v0.19.1-LICENSE", builder)
 
     def test_package_service_preserves_identifiers_paths_and_binary_execstart(self):
         service = self.read_text(SERVICE)
@@ -145,6 +146,7 @@ class WorkerDebPackageTests(unittest.TestCase):
         self.assertIn("usr/bin/vaultline-worker", builder)
         self.assertIn("lib/systemd/system/docker-volume-backup-worker.service", builder)
         self.assertIn("usr/share/doc/vaultline-worker/worker.env.example", builder)
+        self.assertIn("usr/share/doc/vaultline-worker/restic-v0.19.1-LICENSE", builder)
         self.assertNotIn("etc/docker-volume-backup/worker.env", builder)
         self.assertNotIn("worker.env.example etc/", builder)
         self.assertIn("test -x", builder)

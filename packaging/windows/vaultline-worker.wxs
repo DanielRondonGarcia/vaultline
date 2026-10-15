@@ -34,6 +34,9 @@
 <?ifndef WorkerExe ?>
   <?define WorkerExe = "dist\vaultline-worker.exe" ?>
 <?endif?>
+<?ifndef ResticLicense ?>
+  <?define ResticLicense = "packaging\licenses\restic-v0.19.1-LICENSE" ?>
+<?endif?>
 
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
@@ -53,6 +56,7 @@
 
     <Feature Id="WorkerFeature" Title="Vaultline Worker" Level="1">
       <ComponentRef Id="WorkerExecutable" />
+      <ComponentRef Id="ResticLicense" />
       <ComponentRef Id="WorkerStateDir" />
       <ComponentRef Id="WorkerLogsDir" />
     </Feature>
@@ -97,6 +101,11 @@
               Part="last"
               System="yes" />
         </Component>
+        <Directory Id="ResticLicenseFolder" Name="licenses">
+          <Component Id="ResticLicense" Guid="4B47AF58-9322-4E72-B76A-3F96474B1B40">
+            <File Id="ResticLicenseFile" Source="$(var.ResticLicense)" Name="restic-v0.19.1-LICENSE" KeyPath="yes" />
+          </Component>
+        </Directory>
       </Directory>
     </StandardDirectory>
 

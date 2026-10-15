@@ -153,6 +153,8 @@ jobs:
               python -c "import pathlib, sysconfig; shared = sysconfig.get_config_var(\"Py_ENABLE_SHARED\"); assert shared == 1, f\"Py_ENABLE_SHARED={shared}\"; assert pathlib.Path(\"/tmp/pbs/python/lib/libpython3.11.so\").is_file(), \"missing libpython3.11.so\"; print(\"Py_ENABLE_SHARED=1\")"
               python -m pip install -r requirements-build.txt
               python scripts/set_worker_build_version.py "${{ needs.prepare.outputs.new_version }}"
+              python /workspace/scripts/download_pinned_restic.py --platform linux --arch "${{ matrix.arch }}" --output-dir /tmp/vaultline-restic
+              export VAULTLINE_RESTIC_BINARY=/tmp/vaultline-restic/restic
               python -m PyInstaller build/vaultline-worker.spec --distpath /workspace/dist --workpath /workspace/build/pyinstaller-${{ matrix.arch }} --noconfirm
               /workspace/dist/vaultline-worker --help
             '
@@ -190,7 +192,13 @@ jobs:
         run: |
           python scripts/set_worker_build_version.py "${{ needs.prepare.outputs.new_version }}"
           python -m pip install -r requirements-build.txt
+          $ResticOutput = Join-Path $env:RUNNER_TEMP "vaultline-restic-v0.19.1"
+          python scripts/download_pinned_restic.py --platform windows --arch amd64 --output-dir "$ResticOutput"
+          if ($LASTEXITCODE -ne 0) { throw "pinned Restic download failed with $LASTEXITCODE" }
+          $env:VAULTLINE_RESTIC_BINARY = Join-Path $ResticOutput "restic.exe"
           python -m PyInstaller build/vaultline-worker.spec --distpath dist --workpath build/pyinstaller-windows-amd64 --noconfirm
+          if ($LASTEXITCODE -ne 0) { throw "PyInstaller build exited with $LASTEXITCODE" }
+          Remove-Item -LiteralPath $ResticOutput -Recurse -Force
 
       - name: Smoke Windows executable
         shell: pwsh

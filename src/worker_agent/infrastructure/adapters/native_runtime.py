@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Iterable, List
 from src.worker_agent.application.policies.runtime_command_policy import RuntimeCommandPolicy
 from src.worker_agent.application.ports.runtime_port import RuntimePort
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
+from src.restic_executable import resolve_restic_executable
 
 MAX_RESOLVED_FILES = 32
 MAX_RESOLVED_FILE_BYTES = 1024 * 1024
@@ -151,11 +152,14 @@ class NativeRuntimeAdapter(RuntimePort):
             if target_flavor == source_flavor and target != source_norm and target.startswith(source_norm.rstrip("/") + "/"):
                 raise ValueError("native restore destination must not overwrite a configured source path")
 
-    def _require_executable(self, executable: str) -> None:
+    def _require_executable(self, executable: str) -> str:
+        if executable == "restic" and getattr(sys, "frozen", False):
+            return resolve_restic_executable()
         if self._which(executable) is None and not (os.path.isabs(executable) and os.path.exists(executable)):
             raise FileNotFoundError(
                 f"required executable '{executable}' is not available on this native worker PATH"
             )
+        return executable
 
     def _backup_engine_command(self) -> list[str]:
         if getattr(sys, "frozen", False):
@@ -208,7 +212,7 @@ class NativeRuntimeAdapter(RuntimePort):
         if command == ["/root/backup.sh"]:
             environment["PYTHONIOENCODING"] = "utf-8"
             return self._backup_engine_command(), environment
-        self._require_executable(command[0])
+        command[0] = self._require_executable(command[0])
         return command, environment
 
     def _materialize_resolved_files(self, payload: Dict[str, Any], environment: dict[str, str]) -> str | None:
@@ -297,7 +301,17 @@ class NativeRuntimeAdapter(RuntimePort):
         }
 
     def self_check(self) -> Dict[str, Any]:
-        executables = {name: bool(self._which(name)) for name in ("tar", "restic", "gpg", "rclone", "aws", "ssh", "scp")}
+        executables = {}
+        for name in ("tar", "restic", "gpg", "rclone", "aws", "ssh", "scp"):
+            if name == "restic" and getattr(sys, "frozen", False):
+                try:
+                    resolve_restic_executable()
+                except OSError:
+                    executables[name] = False
+                else:
+                    executables[name] = True
+            else:
+                executables[name] = bool(self._which(name))
         return {"native_available": True, "runtime_type": self.runtime_kind, "executables": executables}
 
     def cleanup_orphaned_runtime_jobs(self, recover_callback: Callable[[Any, Dict[str, Any]], str] | None = None) -> Dict[str, Any]:

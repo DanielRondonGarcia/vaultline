@@ -44,6 +44,7 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 TEMPLATE_ROOT="${REPO_ROOT}/packaging/debian"
+RESTIC_LICENSE="${REPO_ROOT}/packaging/licenses/restic-v0.19.1-LICENSE"
 PACKAGE_NAME="vaultline-worker"
 ASSET_NAME="vaultline-worker_${VERSION}_${ARCH}.deb"
 OUTPUT_PATH="${OUTPUT_DIR%/}/${ASSET_NAME}"
@@ -66,6 +67,11 @@ install -d -m 0755 "${PACKAGE_ROOT}/usr/bin"
 install -d -m 0755 "${PACKAGE_ROOT}/lib/systemd/system"
 install -d -m 0755 "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker"
 
+if [[ ! -f "${RESTIC_LICENSE}" ]]; then
+  printf 'error: bundled Restic license is missing: %s\n' "${RESTIC_LICENSE}" >&2
+  exit 2
+fi
+
 sed \
   -e "s/@VERSION@/${VERSION}/g" \
   -e "s/@ARCH@/${ARCH}/g" \
@@ -79,6 +85,8 @@ install -m 0644 "${TEMPLATE_ROOT}/lib/systemd/system/docker-volume-backup-worker
   "${PACKAGE_ROOT}/lib/systemd/system/docker-volume-backup-worker.service"
 install -m 0644 "${TEMPLATE_ROOT}/usr/share/doc/vaultline-worker/worker.env.example" \
   "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/worker.env.example"
+install -m 0644 "${RESTIC_LICENSE}" \
+  "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/restic-v0.19.1-LICENSE"
 
 test -f "${PACKAGE_ROOT}/DEBIAN/control"
 test -x "${PACKAGE_ROOT}/DEBIAN/postinst"
@@ -86,6 +94,7 @@ test -x "${PACKAGE_ROOT}/DEBIAN/prerm"
 test -x "${PACKAGE_ROOT}/usr/bin/vaultline-worker"
 test -f "${PACKAGE_ROOT}/lib/systemd/system/docker-volume-backup-worker.service"
 test -f "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/worker.env.example"
+test -f "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/restic-v0.19.1-LICENSE"
 
 LC_ALL=C dpkg-deb --build --root-owner-group "${PACKAGE_ROOT}" "${OUTPUT_PATH}"
 

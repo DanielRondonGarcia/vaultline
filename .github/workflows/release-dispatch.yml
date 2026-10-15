@@ -314,14 +314,6 @@ jobs:
 
       # ── Docker build & push ──
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        with:
-          driver-opts: image=public.ecr.aws/vend/moby/buildkit:buildx-stable-1
-
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -363,54 +355,108 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push backup runtime image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: backup-runtime
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta_runtime.outputs.tags }}
-          labels: ${{ steps.meta_runtime.outputs.labels }}
-          build-args: |
-            APP_VERSION=${{ needs.prepare.outputs.new_version }}
-            PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        # The standard Docker CLI path is native amd64; it cannot use the
+        # Buildx-only GitHub Actions cache importer/exporter.
+        env:
+          IMAGE_TAGS: ${{ steps.meta_runtime.outputs.tags }}
+          IMAGE_LABELS: ${{ steps.meta_runtime.outputs.labels }}
+          APP_VERSION: ${{ needs.prepare.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          image_tags=()
+          docker_args=()
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              image_tags+=("$tag")
+              docker_args+=(--tag "$tag")
+            fi
+          done <<< "$IMAGE_TAGS"
+          while IFS= read -r label; do
+            if [[ -n "$label" ]]; then docker_args+=(--label "$label"); fi
+          done <<< "$IMAGE_LABELS"
+          if ((${#image_tags[@]} == 0)); then
+            echo "No metadata tags generated for backup runtime image" >&2
+            exit 1
+          fi
+          docker build \
+            --platform linux/amd64 \
+            --target backup-runtime \
+            --build-arg "APP_VERSION=${APP_VERSION}" \
+            --build-arg "PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm" \
+            "${docker_args[@]}" \
+            .
+          for tag in "${image_tags[@]}"; do
+            docker push "$tag"
+          done
 
       - name: Build and push Control Plane image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: control-plane
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta_control_plane.outputs.tags }}
-          labels: ${{ steps.meta_control_plane.outputs.labels }}
-          build-args: |
-            APP_VERSION=${{ needs.prepare.outputs.new_version }}
-            PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          IMAGE_TAGS: ${{ steps.meta_control_plane.outputs.tags }}
+          IMAGE_LABELS: ${{ steps.meta_control_plane.outputs.labels }}
+          APP_VERSION: ${{ needs.prepare.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          image_tags=()
+          docker_args=()
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              image_tags+=("$tag")
+              docker_args+=(--tag "$tag")
+            fi
+          done <<< "$IMAGE_TAGS"
+          while IFS= read -r label; do
+            if [[ -n "$label" ]]; then docker_args+=(--label "$label"); fi
+          done <<< "$IMAGE_LABELS"
+          if ((${#image_tags[@]} == 0)); then
+            echo "No metadata tags generated for Control Plane image" >&2
+            exit 1
+          fi
+          docker build \
+            --platform linux/amd64 \
+            --target control-plane \
+            --build-arg "APP_VERSION=${APP_VERSION}" \
+            --build-arg "PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm" \
+            "${docker_args[@]}" \
+            .
+          for tag in "${image_tags[@]}"; do
+            docker push "$tag"
+          done
 
       - name: Build and push Worker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: worker
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta_worker.outputs.tags }}
-          labels: ${{ steps.meta_worker.outputs.labels }}
-          # The published worker image supports both WORKER_RUNTIME=docker
-          # and WORKER_RUNTIME=kubernetes. Keep Docker CLI available for the
-          # existing Docker/Compose deployment while the Kubernetes client is
-          # supplied by requirements.txt.
-          build-args: |
-            APP_VERSION=${{ needs.prepare.outputs.new_version }}
-            INSTALL_DOCKER_CLI=true
-            PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          IMAGE_TAGS: ${{ steps.meta_worker.outputs.tags }}
+          IMAGE_LABELS: ${{ steps.meta_worker.outputs.labels }}
+          APP_VERSION: ${{ needs.prepare.outputs.new_version }}
+        run: |
+          set -euo pipefail
+          image_tags=()
+          docker_args=()
+          while IFS= read -r tag; do
+            if [[ -n "$tag" ]]; then
+              image_tags+=("$tag")
+              docker_args+=(--tag "$tag")
+            fi
+          done <<< "$IMAGE_TAGS"
+          while IFS= read -r label; do
+            if [[ -n "$label" ]]; then docker_args+=(--label "$label"); fi
+          done <<< "$IMAGE_LABELS"
+          if ((${#image_tags[@]} == 0)); then
+            echo "No metadata tags generated for Worker image" >&2
+            exit 1
+          fi
+          # Keep Docker CLI available for Docker/Compose deployments; the
+          # Kubernetes client is supplied by requirements.txt.
+          docker build \
+            --platform linux/amd64 \
+            --target worker \
+            --build-arg "APP_VERSION=${APP_VERSION}" \
+            --build-arg "INSTALL_DOCKER_CLI=true" \
+            --build-arg "PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm" \
+            "${docker_args[@]}" \
+            .
+          for tag in "${image_tags[@]}"; do
+            docker push "$tag"
+          done
 
   publish-release:
     needs:

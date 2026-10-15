@@ -174,10 +174,13 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertIn("git tag -a \"${VERSION}\"", self.workflow)
         self.assertIn("git push origin \"${VERSION}\"", self.workflow)
 
-    def test_existing_image_tags_platforms_and_worker_options_are_preserved(self):
-        self.assertGreaterEqual(self.workflow.count("platforms: linux/amd64,linux/arm64"), 3)
+    def test_existing_image_tags_native_amd64_platform_and_worker_options_are_preserved(self):
+        image_job = self.image_build_job()
+        self.assertEqual(image_job.count("--platform linux/amd64"), 3)
+        self.assertNotIn("linux/arm64", image_job)
+        self.assertIn("ubuntu-24.04-arm", self.workflow)
         for target in ("backup-runtime", "control-plane", "worker"):
-            self.assertIn(f"target: {target}", self.workflow)
+            self.assertIn(f"--target {target}", image_job)
         self.assertIn("ghcr.io/${{ github.repository }}", self.workflow)
         self.assertIn("ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-control-plane", self.workflow)
         self.assertIn("ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-worker", self.workflow)
@@ -185,11 +188,19 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertIn("type=raw,value=latest", self.workflow)
         self.assertIn("INSTALL_DOCKER_CLI=true", self.workflow)
 
-    def test_buildx_uses_ecr_public_buildkit_image(self):
-        self.assertRegex(
-            self.workflow,
-            r"(?m)^      - name: Set up Docker Buildx\n        uses: docker/setup-buildx-action@v3\n        with:\n          driver-opts: image=public\.ecr\.aws/vend/moby/buildkit:buildx-stable-1$",
-        )
+    def test_release_images_use_standard_docker_cli_without_buildx_or_gha_cache(self):
+        image_job = self.image_build_job()
+        for forbidden in (
+            "docker/setup-buildx-action@v3",
+            "docker/build-push-action@v6",
+            "docker buildx",
+            "buildx-stable-1",
+            "docker/setup-qemu-action@v3",
+            "type=gha",
+        ):
+            self.assertNotIn(forbidden, image_job)
+        self.assertEqual(image_job.count("docker build"), 3)
+        self.assertEqual(image_job.count('docker push "$tag"'), 3)
 
     def test_release_image_builds_use_ecr_public_python_base_image(self):
         self.assertRegex(
@@ -198,33 +209,41 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         )
         self.assertRegex(self.dockerfile, r"(?m)^FROM \$\{PYTHON_BASE_IMAGE\} AS app-base$")
 
+        image_job = self.image_build_job()
         build_steps = dict(
             re.findall(
                 r"(?ms)^      - name: Build and push ([^\n]+)\n(.*?)(?=^      - name: |\Z)",
-                self.workflow,
+                image_job,
             )
         )
         expected_targets = {
-            "backup runtime image": "backup-runtime",
-            "Control Plane image": "control-plane",
-            "Worker image": "worker",
+            "backup runtime image": ("backup-runtime", "meta_runtime"),
+            "Control Plane image": ("control-plane", "meta_control_plane"),
+            "Worker image": ("worker", "meta_worker"),
         }
         self.assertEqual(set(build_steps), set(expected_targets))
-        for image_name, target in expected_targets.items():
+        for image_name, (target, metadata_id) in expected_targets.items():
             with self.subTest(target=target):
-                self.assertIn(f"target: {target}", build_steps[image_name])
-                build_args = re.search(
-                    r"(?ms)^          build-args: \|\n((?:(?!^          [\w-]+:).+\n)*)",
-                    build_steps[image_name],
-                )
-                self.assertIsNotNone(build_args)
+                step = build_steps[image_name]
+                self.assertIn(f"IMAGE_TAGS: ${{{{ steps.{metadata_id}.outputs.tags }}}}", step)
+                self.assertIn(f"IMAGE_LABELS: ${{{{ steps.{metadata_id}.outputs.labels }}}}", step)
+                self.assertIn(f"--target {target}", step)
+                self.assertIn("--platform linux/amd64", step)
+                self.assertIn('docker_args+=(--label "$label")', step)
+                self.assertIn('docker_args+=(--tag "$tag")', step)
+                self.assertIn('docker push "$tag"', step)
                 self.assertIn(
                     "PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm",
-                    build_args.group(1),
+                    step,
                 )
-                self.assertIn("APP_VERSION=${{ needs.prepare.outputs.new_version }}", build_args.group(1))
+                self.assertIn("APP_VERSION: ${{ needs.prepare.outputs.new_version }}", step)
                 if target == "worker":
-                    self.assertIn("INSTALL_DOCKER_CLI=true", build_args.group(1))
+                    self.assertIn('INSTALL_DOCKER_CLI=true"', step)
+
+    def image_build_job(self) -> str:
+        match = re.search(r"(?ms)^  image-build:\n(.*?)(?=^  [\w-]+:\n|\Z)", self.workflow)
+        self.assertIsNotNone(match)
+        return match.group(1)
 
 
 if __name__ == "__main__":

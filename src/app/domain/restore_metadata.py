@@ -9,9 +9,17 @@ from src.app.domain.restore_ownership import RestoreOwnershipPolicy
 
 MAX_OUTPUT_BYTES = 256 * 1024
 MAX_RECORDS = 2048
+MAX_HEADER_BYTES = 8 * 1024
+_RESTIC_MODE = r"[-?bcCdDlLpPs](?:[rwxXsStT-]{9}|[tT-][rwxXsStT-]{9})"
 _RECORD = re.compile(
-    r"^(?P<mode>[-?bcCdDlLpPs][rwxXsStT-]{9})\s+(?P<uid>\d+)\s+(?P<gid>\d+)\s+(?P<size>\d+)\s+"
+    r"^(?P<mode>" + _RESTIC_MODE + r")\s+(?P<uid>\d+)\s+(?P<gid>\d+)\s+(?P<size>\d+)\s+"
     r"(?P<mtime>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?)\s+(?P<path>.+)$"
+)
+_HEADER_TIMESTAMP = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,9})? [+-](?:[01]\d|2[0-3])[0-5]\d (?:[A-Za-z][A-Za-z0-9+-]{0,9}|[+-]\d{1,2})"
+_RESTIC_LS_HEADER = re.compile(
+    r"^snapshot (?P<snapshot>[0-9a-fA-F]{8,64}) of \[[^\]\r\n]{0,4096}\] "
+    r"(?:filtered by \[[^\]\r\n]{0,4096}\] at (?P<filtered_at>" + _HEADER_TIMESTAMP + r")|"
+    r"at (?P<listed_at>" + _HEADER_TIMESTAMP + r") filtered by \[[^\]\r\n]{0,4096}\])\:$"
 )
 
 
@@ -84,6 +92,24 @@ def parse_restic_ls_long(
     if len(text.encode("utf-8")) > max_output_bytes:
         raise ResticMetadataError("Restic metadata output exceeded the bounded limit")
     lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ResticMetadataError("Restic metadata inspection output is incomplete or over the record bound")
+    header = None
+    if len(lines[0].encode("utf-8")) <= MAX_HEADER_BYTES:
+        header = _RESTIC_LS_HEADER.fullmatch(lines[0])
+    if header is not None:
+        timestamp = header.group("filtered_at") or header.group("listed_at")
+        try:
+            datetime.fromisoformat(timestamp[:19])
+        except ValueError as exc:
+            raise ResticMetadataError("Restic metadata inspection output contains a malformed record") from exc
+        requested_snapshot = snapshot.lower()
+        header_snapshot = header.group("snapshot").lower()
+        if re.fullmatch(r"[0-9a-f]{8,64}", requested_snapshot) and not (
+            requested_snapshot.startswith(header_snapshot) or header_snapshot.startswith(requested_snapshot)
+        ):
+            raise ResticMetadataError("Restic metadata header does not match the requested snapshot")
+        lines = lines[1:]
     if not lines or len(lines) > max_records:
         raise ResticMetadataError("Restic metadata inspection output is incomplete or over the record bound")
     records = []

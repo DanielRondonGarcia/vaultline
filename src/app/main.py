@@ -127,9 +127,14 @@ def _parse_restore_read_only_paths(value) -> tuple[str, ...]:
 
 def _restore_metadata(result):
     source = getattr(result, "metadata", {}) or {}
-    data = dict(source) if isinstance(source, dict) else {name: getattr(source, name, None) for name in ("snapshot", "creator_owner", "backup_creator_label", "ownership_classification", "restored_metadata_proven", "owners")}
+    data = dict(source) if isinstance(source, dict) else {name: getattr(source, name, None) for name in ("snapshot", "creator_owner", "backup_creator_label", "ownership_classification", "restored_metadata_proven", "owners", "total_files", "files_truncated", "owners_truncated")}
     files = data.pop("files", getattr(source, "files", ()))
     if files: data["samples"] = [{name: (item.get(name) if isinstance(item, dict) else getattr(item, name, None)) for name in ("path", "mode", "uid", "gid", "size", "mtime")} for item in list(files)[:64]]
+    owners = data.get("owners")
+    if owners is not None:
+        owner_list = list(owners)
+        data["owners_truncated"] = bool(data.get("owners_truncated") or len(owner_list) > 64)
+        data["owners"] = owner_list[:64]
     return _restore_safe(data)
 
 def _restore_result_payload(result):

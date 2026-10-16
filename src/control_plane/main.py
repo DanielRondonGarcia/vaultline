@@ -265,6 +265,20 @@ def _parse_jobs_stats_query(query: str) -> int:
     return tz_offset
 
 
+def _parse_backup_report_query(query: str) -> dict[str, str]:
+    qs = parse_qs(query, keep_blank_values=True)
+    unexpected = sorted(set(qs) - {"start_date", "end_date"})
+    if unexpected:
+        raise ValueError(f"unsupported report query parameter: {unexpected[0]}")
+    values = {}
+    for name in ("start_date", "end_date"):
+        items = qs.get(name, [])
+        if len(items) != 1 or not items[0].strip():
+            raise ValueError(f"{name} is required exactly once")
+        values[name] = items[0].strip()
+    return values
+
+
 _KUBERNETES_CREDENTIAL_FIELDS = {
     "bearer_token",
     "cluster_credentials",
@@ -707,6 +721,26 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                 except ValueError as exc:
                     return self._write_json(400, {"error": str(exc)}, head_only=head_only)
                 return self._write_json(200, self._control_plane_service().job_stats(tz_offset_minutes=tz_offset), head_only=head_only)
+            if path == "/api/v1/reports/backups":
+                if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
+                    return
+                try:
+                    query = _parse_backup_report_query(urlparse(self.path).query)
+                    scheduler = self._scheduler()
+                    timezone_name = getattr(scheduler, "timezone_name", DEFAULT_SCHEDULER_TIMEZONE)
+                    report = self._control_plane_service().backup_audit_report(
+                        start_date=query["start_date"],
+                        end_date=query["end_date"],
+                        timezone_name=timezone_name,
+                    )
+                except ValueError as exc:
+                    return self._write_json(400, {"error": str(exc)}, head_only=head_only)
+                return self._write_json(
+                    200,
+                    report,
+                    head_only=head_only,
+                    extra_headers={"Cache-Control": "no-store"},
+                )
             if path == "/api/v1/targets":
                 if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
                     return

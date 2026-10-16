@@ -40,6 +40,7 @@ class NativeWorkerDocsTests(unittest.TestCase):
             "glibc >= 2.17",
             "SmartScreen",
             "Restic v0.19.1 and rclone v1.75.2 executables are bundled with native worker packages",
+            "The MSI installs them in `C:\\Program Files\\Vaultline` and the `.deb` in `/usr/lib/vaultline`",
             "Keep `rclone.conf` and repository credentials in their separate secrets",
             "Install the remaining external tools (`tar`, `gpg`, `aws`, `ssh`, and `scp`) separately",
             "In source/development mode, executables (`restic`,",
@@ -80,6 +81,7 @@ class NativeWorkerDocsTests(unittest.TestCase):
         self.assertIn("vaultline-worker service status", windows_block)
         self.assertIn("C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log", windows)
         self.assertIn("LocalSystem", windows)
+        self.assertIn("`restic.exe` y `rclone.exe`", windows)
         self.assertLess(windows_block.index("Invoke-WebRequest"), windows_block.index("msiexec.exe"))
         self.assertLess(windows_block.index("msiexec.exe"), windows_block.index("$env:Path ="))
         self.assertLess(windows_block.index("$env:Path ="), windows_block.index("enroll --control-plane-url"))
@@ -96,6 +98,7 @@ class NativeWorkerDocsTests(unittest.TestCase):
         self.assertIn("sudo vaultline-worker enroll --control-plane-url https://backups.example.com --bootstrap-token <token>", linux_block)
         self.assertIn("sudo systemctl status docker-volume-backup-worker.service --no-pager", linux_block)
         self.assertIn("journalctl -u docker-volume-backup-worker.service -f", linux)
+        self.assertIn("`restic` y `rclone`\nen `/usr/lib/vaultline`", linux)
         self.assertIn("`/etc/docker-volume-backup/worker.env` es **opcional**", linux)
         self.assertIn("worker.env.example", linux)
         self.assertLess(linux_block.index("curl -fsSL"), linux_block.index("dpkg -i"))
@@ -125,6 +128,7 @@ class NativeWorkerDocsTests(unittest.TestCase):
         self.assertNotIn("enter the secret at the hidden prompt", self.readme)
         self.assertIn("VaultlineWorker (Windows MSI) / docker-volume-backup-worker.service (Linux .deb)", self.readme)
         self.assertIn("Native packages include Restic v0.19.1 and rclone v1.75.2 executables", self.readme)
+        self.assertIn("(`C:\\Program Files\\Vaultline` or `/usr/lib/vaultline`)", self.readme)
         self.assertIn("keep `rclone.conf` and repository credentials in separate secrets", self.readme)
         self.assertNotIn("Task Scheduler", self.readme)
 

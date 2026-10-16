@@ -46,8 +46,27 @@ class WorkerDebPackageTests(unittest.TestCase):
         for tool in ("gpg", "aws", "ssh", "scp"):
             self.assertNotIn(tool, builder.lower())
         self.assertNotIn("/usr/bin/rclone", builder)
+        self.assertNotIn("/usr/bin/restic", builder)
         self.assertIn("restic-v0.19.1-LICENSE", builder)
         self.assertIn("rclone-v1.75.2-COPYING", builder)
+
+    def test_builder_installs_pinned_restic_and_rclone_under_usr_lib_vaultline(self):
+        # The frozen worker resolves both tools from /usr/lib/vaultline before its
+        # PyInstaller bundle, so the package must ship them there as executables
+        # and refuse to build without the verified binaries.
+        builder = self.read_text(BUILDER)
+
+        self.assertIn('install -d -m 0755 "${PACKAGE_ROOT}/usr/lib/vaultline"', builder)
+        self.assertIn('install -m 0755 "${RESTIC_BINARY}" "${PACKAGE_ROOT}/usr/lib/vaultline/restic"', builder)
+        self.assertIn('install -m 0755 "${RCLONE_BINARY}" "${PACKAGE_ROOT}/usr/lib/vaultline/rclone"', builder)
+        self.assertIn('test -x "${PACKAGE_ROOT}/usr/lib/vaultline/restic"', builder)
+        self.assertIn('test -x "${PACKAGE_ROOT}/usr/lib/vaultline/rclone"', builder)
+        self.assertIn('RESTIC_BINARY="${VAULTLINE_RESTIC_BINARY:-}"', builder)
+        self.assertIn('RCLONE_BINARY="${VAULTLINE_RCLONE_BINARY:-}"', builder)
+        self.assertRegex(builder, r'if \[\[ -z "\$\{RESTIC_BINARY\}" \|\| ! -f "\$\{RESTIC_BINARY\}" \|\| ! -x "\$\{RESTIC_BINARY\}" \]\]; then\n  printf .*\n  exit 2')
+        self.assertRegex(builder, r'if \[\[ -z "\$\{RCLONE_BINARY\}" \|\| ! -f "\$\{RCLONE_BINARY\}" \|\| ! -x "\$\{RCLONE_BINARY\}" \]\]; then\n  printf .*\n  exit 2')
+        self.assertLess(builder.index('exit 2\nfi\n\nif ! command -v dpkg-deb'), builder.index("dpkg-deb --build"))
+        self.assertIn("VAULTLINE_RESTIC_BINARY / VAULTLINE_RCLONE_BINARY (env)", builder)
 
     def test_package_service_preserves_identifiers_paths_and_binary_execstart(self):
         service = self.read_text(SERVICE)
@@ -146,6 +165,8 @@ class WorkerDebPackageTests(unittest.TestCase):
         self.assertRegex(builder, r'install -m 0755 "\$\{TEMPLATE_ROOT\}/prerm" "\$\{PACKAGE_ROOT\}/DEBIAN/prerm"')
         self.assertIn('test -x "${PACKAGE_ROOT}/DEBIAN/prerm"', builder)
         self.assertIn("usr/bin/vaultline-worker", builder)
+        self.assertIn("usr/lib/vaultline/restic", builder)
+        self.assertIn("usr/lib/vaultline/rclone", builder)
         self.assertIn("lib/systemd/system/docker-volume-backup-worker.service", builder)
         self.assertIn("usr/share/doc/vaultline-worker/worker.env.example", builder)
         self.assertIn("usr/share/doc/vaultline-worker/restic-v0.19.1-LICENSE", builder)

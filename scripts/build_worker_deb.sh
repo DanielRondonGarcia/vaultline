@@ -5,6 +5,8 @@ usage() {
   printf 'Usage: %s VERSION ARCH FROZEN_BINARY [OUTPUT_DIR]\n' "$0" >&2
   printf '  VERSION: bare semver such as 1.2.3\n' >&2
   printf '  ARCH: amd64 or arm64\n' >&2
+  printf '  VAULTLINE_RESTIC_BINARY / VAULTLINE_RCLONE_BINARY (env): verified Restic and rclone\n' >&2
+  printf '    executables, installed to /usr/lib/vaultline beside the worker\n' >&2
 }
 
 if [[ $# -lt 3 || $# -gt 4 ]]; then
@@ -33,6 +35,20 @@ esac
 
 if [[ ! -f "${FROZEN_BINARY}" || ! -x "${FROZEN_BINARY}" ]]; then
   printf 'error: FROZEN_BINARY must be an existing executable file\n' >&2
+  exit 2
+fi
+
+# The frozen worker resolves Restic and rclone from /usr/lib/vaultline before
+# the copies PyInstaller extracts to a temporary directory, so the package must
+# ship the same verified executables the spec bundled.
+RESTIC_BINARY="${VAULTLINE_RESTIC_BINARY:-}"
+RCLONE_BINARY="${VAULTLINE_RCLONE_BINARY:-}"
+if [[ -z "${RESTIC_BINARY}" || ! -f "${RESTIC_BINARY}" || ! -x "${RESTIC_BINARY}" ]]; then
+  printf 'error: VAULTLINE_RESTIC_BINARY must point to the verified Restic executable\n' >&2
+  exit 2
+fi
+if [[ -z "${RCLONE_BINARY}" || ! -f "${RCLONE_BINARY}" || ! -x "${RCLONE_BINARY}" ]]; then
+  printf 'error: VAULTLINE_RCLONE_BINARY must point to the verified rclone executable\n' >&2
   exit 2
 fi
 
@@ -65,6 +81,7 @@ fi
 
 install -d -m 0755 "${PACKAGE_ROOT}/DEBIAN"
 install -d -m 0755 "${PACKAGE_ROOT}/usr/bin"
+install -d -m 0755 "${PACKAGE_ROOT}/usr/lib/vaultline"
 install -d -m 0755 "${PACKAGE_ROOT}/lib/systemd/system"
 install -d -m 0755 "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker"
 
@@ -86,6 +103,8 @@ chmod 0644 "${PACKAGE_ROOT}/DEBIAN/control"
 install -m 0755 "${TEMPLATE_ROOT}/postinst" "${PACKAGE_ROOT}/DEBIAN/postinst"
 install -m 0755 "${TEMPLATE_ROOT}/prerm" "${PACKAGE_ROOT}/DEBIAN/prerm"
 install -m 0755 "${FROZEN_BINARY}" "${PACKAGE_ROOT}/usr/bin/vaultline-worker"
+install -m 0755 "${RESTIC_BINARY}" "${PACKAGE_ROOT}/usr/lib/vaultline/restic"
+install -m 0755 "${RCLONE_BINARY}" "${PACKAGE_ROOT}/usr/lib/vaultline/rclone"
 install -m 0644 "${TEMPLATE_ROOT}/lib/systemd/system/docker-volume-backup-worker.service" \
   "${PACKAGE_ROOT}/lib/systemd/system/docker-volume-backup-worker.service"
 install -m 0644 "${TEMPLATE_ROOT}/usr/share/doc/vaultline-worker/worker.env.example" \
@@ -99,6 +118,8 @@ test -f "${PACKAGE_ROOT}/DEBIAN/control"
 test -x "${PACKAGE_ROOT}/DEBIAN/postinst"
 test -x "${PACKAGE_ROOT}/DEBIAN/prerm"
 test -x "${PACKAGE_ROOT}/usr/bin/vaultline-worker"
+test -x "${PACKAGE_ROOT}/usr/lib/vaultline/restic"
+test -x "${PACKAGE_ROOT}/usr/lib/vaultline/rclone"
 test -f "${PACKAGE_ROOT}/lib/systemd/system/docker-volume-backup-worker.service"
 test -f "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/worker.env.example"
 test -f "${PACKAGE_ROOT}/usr/share/doc/vaultline-worker/restic-v0.19.1-LICENSE"

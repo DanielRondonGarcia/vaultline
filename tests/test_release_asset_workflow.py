@@ -45,6 +45,19 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
             self.workflow,
         )
 
+    def test_linux_debian_builder_receives_the_verified_restic_and_rclone_binaries(self):
+        # The download happens inside the manylinux container (/tmp is not shared),
+        # so the verified tools must be staged into the workspace before the
+        # native-host .deb step installs them under /usr/lib/vaultline.
+        linux_job = self.workflow.split("  native-linux:", 1)[1].split("  native-windows:", 1)[0]
+        self.assertIn('install -m 0755 "$VAULTLINE_RESTIC_BINARY" /workspace/dist/restic', linux_job)
+        self.assertIn('install -m 0755 "$VAULTLINE_RCLONE_BINARY" /workspace/dist/rclone', linux_job)
+        self.assertIn("export VAULTLINE_RESTIC_BINARY=dist/restic", linux_job)
+        self.assertIn("export VAULTLINE_RCLONE_BINARY=dist/rclone", linux_job)
+        self.assertLess(linux_job.index("python -m PyInstaller"), linux_job.index("/workspace/dist/restic"))
+        self.assertLess(linux_job.index("/workspace/dist/rclone"), linux_job.index("export VAULTLINE_RESTIC_BINARY=dist/restic"))
+        self.assertLess(linux_job.index("export VAULTLINE_RCLONE_BINARY=dist/rclone"), linux_job.index("bash scripts/build_worker_deb.sh"))
+
     def test_linux_pyinstaller_uses_shared_python_build_standalone_runtime(self):
         self.assertIn("pbs_url", self.workflow)
         self.assertIn("pbs_sha256", self.workflow)
@@ -105,6 +118,19 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertRegex(job, r"wix build .*-d Version=\$Version")
         self.assertRegex(job, r"wix build .*-d WorkerExe=dist[\\/]vaultline-worker\.exe")
         self.assertIn('vaultline-worker_${Version}_windows-amd64.msi', job)
+        # Both MSI builds (release and lower-version upgrade smoke) install the
+        # verified Restic and rclone beside the worker from the staged dist copies.
+        wix_builds = re.findall(r"(?m)^\s*wix build .*$", job)
+        self.assertEqual(len(wix_builds), 2)
+        for command in wix_builds:
+            with self.subTest(command=command.strip()[:60]):
+                self.assertRegex(command, r"-d ResticExe=dist[\\/]restic\.exe")
+                self.assertRegex(command, r"-d RcloneExe=dist[\\/]rclone\.exe")
+        self.assertIn("Copy-Item -LiteralPath $env:VAULTLINE_RESTIC_BINARY -Destination dist\\restic.exe", job)
+        self.assertIn("Copy-Item -LiteralPath $env:VAULTLINE_RCLONE_BINARY -Destination dist\\rclone.exe", job)
+        self.assertLess(job.index("python -m PyInstaller"), job.index("Copy-Item -LiteralPath $env:VAULTLINE_RESTIC_BINARY"))
+        self.assertLess(job.index("Copy-Item -LiteralPath $env:VAULTLINE_RCLONE_BINARY"), job.index("Remove-Item -LiteralPath $ResticOutput"))
+        self.assertLess(job.index("Copy-Item -LiteralPath $env:VAULTLINE_RCLONE_BINARY"), job.index("wix build"))
         # util:ServiceConfig (service recovery) needs the Util extension, pinned
         # to the same version as the wix CLI and added globally so the CLI finds it.
         self.assertIn("wix extension add -g WixToolset.Util.wixext/5.0.2", job)
@@ -133,6 +159,12 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertIn("VaultlineWorker", smoke)
         self.assertIn("'Running'", smoke)
         self.assertIn("C:\\Program Files\\Vaultline\\vaultline-worker.exe", smoke)
+        self.assertIn("C:\\Program Files\\Vaultline\\restic.exe", smoke)
+        self.assertIn("C:\\Program Files\\Vaultline\\rclone.exe", smoke)
+        self.assertIn("installed tool missing at $tool", smoke)
+        self.assertIn("installed tool still present after uninstall", smoke)
+        self.assertLess(smoke.index("installed tool missing at $tool"), smoke.index("'/x'"))
+        self.assertLess(smoke.index("'/x'"), smoke.index("installed tool still present after uninstall"))
         self.assertIn("service status", smoke)
         self.assertIn("C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log", smoke)
         self.assertIn("Waiting for enrollment", smoke)

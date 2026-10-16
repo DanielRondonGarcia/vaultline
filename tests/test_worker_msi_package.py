@@ -65,7 +65,7 @@ class WorkerMsiPackageTests(unittest.TestCase):
         self.assertEqual(install_dir.get("Name"), "Vaultline")
 
         files = {node.get("Id"): node for node in self.find_all("File")}
-        self.assertEqual(set(files), {"WorkerExe", "ResticLicenseFile", "RcloneLicenseFile"})
+        self.assertEqual(set(files), {"WorkerExe", "ResticExe", "RcloneExe", "ResticLicenseFile", "RcloneLicenseFile"})
         self.assertEqual(files["WorkerExe"].get("Source"), "$(var.WorkerExe)")
         self.assertIn("WorkerExe", self.source)
         self.assertRegex(self.source, r"\?define WorkerExe\s*=")
@@ -75,6 +75,39 @@ class WorkerMsiPackageTests(unittest.TestCase):
         self.assertEqual(files["RcloneLicenseFile"].get("Name"), "rclone-v1.75.2-COPYING")
         self.assertIn("ResticLicense", self.source)
         self.assertIn("RcloneLicense", self.source)
+
+    def test_installs_restic_and_rclone_beside_the_worker_as_stable_components(self):
+        # Defender's Behavior:Win32/SuspRclone.A kills rclone when it runs from the
+        # per-start %TEMP%\_MEIxxxx extraction; the tools need a stable, excludable
+        # path that the frozen worker prefers over its PyInstaller bundle.
+        standard_dirs = {node.get("Id"): node for node in self.find_all("StandardDirectory")}
+        install_dir = standard_dirs["ProgramFiles64Folder"].find(_tag("Directory"))
+        components = {node.get("Id"): node for node in install_dir.findall(_tag("Component"))}
+        self.assertEqual(set(components), {"WorkerExecutable", "ResticExecutable", "RcloneExecutable"})
+
+        expected = {
+            "ResticExecutable": ("ResticExe", "restic.exe", "$(var.ResticExe)"),
+            "RcloneExecutable": ("RcloneExe", "rclone.exe", "$(var.RcloneExe)"),
+        }
+        for component_id, (file_id, name, source) in expected.items():
+            with self.subTest(component=component_id):
+                component = components[component_id]
+                self.assertRegex(component.get("Guid", ""), GUID_RE)
+                self.assertIsNone(component.get("Permanent"), "tools must be removed on uninstall")
+                files = component.findall(_tag("File"))
+                self.assertEqual(len(files), 1)
+                self.assertEqual(files[0].get("Id"), file_id)
+                self.assertEqual(files[0].get("Name"), name)
+                self.assertEqual(files[0].get("Source"), source)
+                self.assertEqual(files[0].get("KeyPath"), "yes")
+                self.assertIsNone(component.find(_tag("ServiceInstall")))
+        guids = [component.get("Guid") for component in self.find_all("Component") if component.get("Guid")]
+        self.assertEqual(len(guids), len(set(guids)), "component GUIDs must be unique")
+        self.assertRegex(self.source, r"\?define ResticExe\s*=")
+        self.assertRegex(self.source, r"\?define RcloneExe\s*=")
+        self.assertIn("-d ResticExe=", self.source)
+        self.assertIn("-d RcloneExe=", self.source)
+        self.assertIn("SuspRclone", self.source)
 
     def test_registers_auto_start_local_system_service_hosting_service_run(self):
         installs = list(self.find_all("ServiceInstall"))
@@ -183,7 +216,7 @@ class WorkerMsiPackageTests(unittest.TestCase):
         lowered = self.source.lower()
         for forbidden in ("token", "secret", "credential", "password", "worker.env", "worker.json"):
             self.assertNotIn(forbidden, lowered)
-        self.assertEqual(len(list(self.find_all("File"))), 3)
+        self.assertEqual(len(list(self.find_all("File"))), 5)
         self.assertEqual(len(list(self.find_all("IniFile"))), 0)
         self.assertEqual(len(list(self.find_all("RegistryValue"))), 0)
 

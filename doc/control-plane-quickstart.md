@@ -214,7 +214,7 @@ Reglas que no cambian:
 - El bootstrap token es de un solo uso y expira según el TTL elegido en la UI (60 minutos por defecto). Pegarlo en el comando `enroll` es aceptable porque deja de servir en cuanto se consume o expira; si quieres, limpia el historial de la terminal después de enrolar. No lo guardes en archivos, scripts, unidades del servicio, variables de entorno persistentes ni logs.
 - Si `enroll` falla, el CLI imprime el motivo real ya redactado (por ejemplo `HTTP 400 (code=enrollment_expired)`), conserva el intento pendiente y nombra la salida: con el mismo token puedes reintentar; si el token expiró o ya se usó, genera uno nuevo en la UI y ejecuta antes `vaultline-worker enroll --reset-pending`.
 - Descarga el asset desde la UI o desde la [página canónica de releases de Vaultline](https://github.com/DanielRondonGarcia/vaultline/releases) y verifícalo con `SHA256SUMS` cuando esté disponible.
-- Restic v0.19.1 and rclone v1.75.2 executables are bundled with native worker packages. Keep `rclone.conf` and repository credentials in their separate secrets; they are never included in the package. Install the remaining external tools (`tar`, `gpg`, `aws`, `ssh`, and `scp`) separately as required by the backup or storage target.
+- Restic v0.19.1 and rclone v1.75.2 executables are bundled with native worker packages. The MSI installs them in `C:\Program Files\Vaultline` and the `.deb` in `/usr/lib/vaultline`; the worker uses those copies first and only falls back to the ones embedded in the portable `.exe`. Keep `rclone.conf` and repository credentials in their separate secrets; they are never included in the package. Install the remaining external tools (`tar`, `gpg`, `aws`, `ssh`, and `scp`) separately as required by the backup or storage target.
 - V2 seguro separa el bootstrap token de la credencial durable generada por el cliente. V1 legacy con variable de entorno de token sigue documentado solo para workers existentes o despliegues Compose heredados.
 
 | Plataforma | Paquete | Servicio | Estado y credenciales |
@@ -282,9 +282,9 @@ Configuración recomendada:
 #### Runner Linux con systemd
 
 El paquete `.deb` hace todo el trabajo de instalación: crea el usuario
-`dvb-worker`, instala `/usr/bin/vaultline-worker`, prepara
-`/var/lib/docker-volume-backup` y habilita y arranca
-`docker-volume-backup-worker.service`, que espera el enrolamiento.
+`dvb-worker`, instala `/usr/bin/vaultline-worker` junto con `restic` y `rclone`
+en `/usr/lib/vaultline`, prepara `/var/lib/docker-volume-backup` y habilita y
+arranca `docker-volume-backup-worker.service`, que espera el enrolamiento.
 
 La UI (**Workers → Agregar worker → Worker nativo**) genera este bloque con la
 URL del asset y el token ya rellenados; se pega completo como root y queda
@@ -335,8 +335,9 @@ sudo systemctl enable --now docker-volume-backup-worker.service
 
 #### Runner Windows como servicio (MSI)
 
-El MSI instala `C:\Program Files\Vaultline\vaultline-worker.exe`, añade esa
-carpeta al `PATH` del sistema, crea `C:\ProgramData\Vaultline\worker` y
+El MSI instala `C:\Program Files\Vaultline\vaultline-worker.exe` junto con
+`restic.exe` y `rclone.exe`, añade esa carpeta al `PATH` del sistema, crea
+`C:\ProgramData\Vaultline\worker` y
 registra y arranca el servicio `VaultlineWorker` (Windows SCM, cuenta
 `LocalSystem`, inicio automático). No usa wrappers de terceros. El servicio
 espera el enrolamiento escribiendo "Waiting for enrollment" en

@@ -1214,6 +1214,19 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
         self.assertNotIn("apiGet('/api/v1/jobs')", self.source)
         self.assertNotIn("apiGet(`/api/v1/jobs`)", self.source)
 
+    def test_dashboard_content_keeps_recent_tables_from_flex_shrinking(self):
+        dashboard = re.search(r"function renderDashboard\(content\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(dashboard)
+        markup = dashboard.group(0)
+        wrapper = markup.find('<div class="dashboard-content">')
+        workers = markup.find("Workers recientes")
+        jobs = markup.find("Jobs recientes")
+        self.assertGreaterEqual(wrapper, 0)
+        self.assertLess(wrapper, workers)
+        self.assertLess(workers, jobs)
+        self.assertLess(jobs, markup.rfind("</div>"))
+        self.assertRegex(self.app_css, r"\.dashboard-content\s*\{[^}]*flex:\s*0\s+0\s+auto;")
+
     def test_jobs_list_refresh_uses_metadata_and_preserves_loaded_detail_projection(self):
         refresh = re.search(r"async function refreshAll\(\) \{.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(refresh)

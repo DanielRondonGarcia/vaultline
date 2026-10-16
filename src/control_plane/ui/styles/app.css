@@ -266,6 +266,14 @@
   overflow-x: hidden;
 }
 
+.dashboard-content {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 20px;
+  min-width: 0;
+}
+
 .view { display: none; min-width: 0; }
 .view.active { display: flex; flex-direction: column; gap: 16px; }
 

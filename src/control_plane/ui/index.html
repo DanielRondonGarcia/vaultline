@@ -775,6 +775,7 @@
       const storageWithRclone = state.storageProfiles.filter(s => s.runtime_volumes && Object.keys(s.runtime_volumes).length > 0).length;
 
       content.innerHTML = `
+        <div class="dashboard-content">
         <div class="page-header"><div><h2>Resumen</h2><div class="subtitle">Estado general del Control Plane</div></div></div>
         <div class="stat-grid">
           ${statCard("Workers", "Online", onlineWorkers, `${state.workers.length} total`)}
@@ -838,6 +839,7 @@
           <thead><tr><th>ID</th><th>Target</th><th>Status</th><th>Inicio</th><th>Fin</th></tr></thead>
           <tbody>${state.jobs.length ? state.jobs.slice(0, 5).map(j => `<tr><td class="mono">${escapeHtml(String(j.id).slice(0,8))}</td><td>${escapeHtml(j.target_id || "—")}</td><td>${fmtStatus(j.status)}</td><td class="mono">${fmtDate(j.started_at)}</td><td class="mono">${fmtDate(j.finished_at)}</td></tr>`).join("") : `<tr><td colspan="5" class="empty-state">Sin jobs ejecutados</td></tr>`}</tbody>
         </table></div></div>
+        </div>
       `;
     }
 

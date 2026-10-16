@@ -99,7 +99,7 @@ def _retention_view(policy: Any | None) -> dict[str, Any] | None:
     }
 
 
-def _target_view(target: Any, workers: dict[str, Any], policies: dict[str, Any], jobs: list[Any], period: AuditPeriod, global_cron_expression: str | None) -> dict[str, Any]:
+def _target_view(target: Any, workers: dict[str, Any], policies: dict[str, Any], jobs: list[Any], period: AuditPeriod, global_cron_expression: str | None, storage_profiles: dict[str, Any]) -> dict[str, Any]:
     worker = workers.get(str(getattr(target, "worker_id", "")))
     target_cron = str(getattr(target, "cron_expression", None) or "").strip()
     global_cron = str(global_cron_expression or "").strip()
@@ -107,6 +107,9 @@ def _target_view(target: Any, workers: dict[str, Any], policies: dict[str, Any],
     cron_source = "target" if target_cron else "global" if global_cron else "manual"
     policy_id = str(getattr(target, "retention_policy_id", None) or "")
     counts = _job_counts(jobs)
+    storage_profile = storage_profiles.get(str(getattr(target, "storage_profile_id", None) or ""))
+    backend_type = str(getattr(storage_profile, "backend_type", "") or "") if storage_profile else ""
+    profile_name = str(getattr(storage_profile, "name", "") or "") if storage_profile else ""
     return {
         "target_id": str(getattr(target, "id", "")),
         "service": str(getattr(target, "name", "")),
@@ -134,6 +137,12 @@ def _target_view(target: Any, workers: dict[str, Any], policies: dict[str, Any],
         "job_counts": {key: counts[key] for key in ("total", "completed", "succeeded", "failed", "other", "other_statuses")},
         "succeeded_percent": counts["succeeded_percent"],
         "failed_percent": counts["failed_percent"],
+        "backup_size": None,
+        "storage_location": {
+            "backend_type": backend_type or None,
+            "storage_profile_name": profile_name or None,
+            "path_storage": getattr(target, "path_storage", None),
+        },
     }
 
 
@@ -144,6 +153,7 @@ def build_backup_audit_report(
     workers: Iterable[Any],
     retention_policies: Iterable[Any],
     jobs: Iterable[Any],
+    storage_profiles: Iterable[Any] = (),
     global_cron_expression: str | None = None,
     generated_at: datetime | None = None,
 ) -> dict[str, Any]:
@@ -155,6 +165,7 @@ def build_backup_audit_report(
     target_list = list(targets)
     worker_map = {str(worker.id): worker for worker in workers}
     policy_map = {str(policy.id): policy for policy in retention_policies}
+    storage_profile_map = {str(profile.id): profile for profile in storage_profiles}
     matrix = [
         _target_view(
             target,
@@ -163,6 +174,7 @@ def build_backup_audit_report(
             jobs_by_target.get(str(target.id), []),
             period,
             global_cron_expression,
+            storage_profile_map,
         )
         for target in sorted(target_list, key=lambda item: (str(item.name).casefold(), str(item.id)))
     ]
@@ -191,6 +203,22 @@ def build_backup_audit_report(
             "start_date": period.start_date,
             "end_date": period.end_date,
             "timezone": period.timezone_name,
+        },
+        "availability": {
+            "backup_size": {
+                "available": False,
+                "reason": (
+                    "backup.run job result_summary records only fractional progress "
+                    "(bytes_done/total_bytes in 0..1) and storage_context, not an absolute "
+                    "byte total; SnapshotRecord.summary carries restic snapshot size but is "
+                    "replaced wholesale per target with no reliable date-bound tie to the "
+                    "report period, so aggregating it would infer rather than report."
+                ),
+            },
+            "storage_location": {
+                "available": True,
+                "basis": "target.path_storage and linked storage profile backend_type/name",
+            },
         },
         "summary": summary_view,
         "matrix": matrix,

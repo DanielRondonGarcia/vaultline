@@ -21,6 +21,7 @@ except ImportError:
 
 from src.control_plane.auth import AuthService, ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER
 from src.control_plane.application.ports.ports import JOB_LISTING_SORT_KEYS
+from src.control_plane.application.services.backup_audit_exports import render_backup_audit_export
 from src.control_plane.application.services.control_plane_service import ControlPlaneService, WorkerDeletionConflict
 from src.control_plane.application.services.live_file_service import (
     LiveCursorError,
@@ -277,6 +278,9 @@ def _parse_backup_report_query(query: str) -> dict[str, str]:
             raise ValueError(f"{name} is required exactly once")
         values[name] = items[0].strip()
     return values
+
+
+_BACKUP_REPORT_EXPORT_FORMATS = ("json", "csv", "xlsx", "pdf")
 
 
 _KUBERNETES_CREDENTIAL_FIELDS = {
@@ -741,6 +745,29 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     head_only=head_only,
                     extra_headers={"Cache-Control": "no-store"},
                 )
+            if len(parts) == 6 and parts[:5] == ["api", "v1", "reports", "backups", "download"]:
+                if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
+                    return
+                export_format = parts[5].lower()
+                if export_format not in _BACKUP_REPORT_EXPORT_FORMATS:
+                    return self._write_json(
+                        400,
+                        {"error": f"unsupported report format: {parts[5]}"},
+                        head_only=head_only,
+                    )
+                try:
+                    query = _parse_backup_report_query(urlparse(self.path).query)
+                    scheduler = self._scheduler()
+                    timezone_name = getattr(scheduler, "timezone_name", DEFAULT_SCHEDULER_TIMEZONE)
+                    report = self._control_plane_service().backup_audit_report(
+                        start_date=query["start_date"],
+                        end_date=query["end_date"],
+                        timezone_name=timezone_name,
+                    )
+                    content_type, filename, body = render_backup_audit_export(export_format, report)
+                except ValueError as exc:
+                    return self._write_json(400, {"error": str(exc)}, head_only=head_only)
+                return self._write_download(200, content_type, filename, body, head_only=head_only)
             if path == "/api/v1/targets":
                 if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
                     return
@@ -1902,6 +1929,16 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             for header_name, header_value in extra_headers.items():
                 self.send_header(header_name, header_value)
         self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
+    def _write_download(self, status_code: int, content_type: str, filename: str, body: bytes, head_only: bool = False):
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if not head_only:
             self.wfile.write(body)

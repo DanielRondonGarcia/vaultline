@@ -9,6 +9,7 @@ from src.control_plane.domain.models import (
     JobStatus,
     RetentionPolicyRecord,
     SettingsRecord,
+    StorageProfileRecord,
     WorkerRecord,
 )
 from src.control_plane.infrastructure.repositories.in_memory import (
@@ -167,6 +168,49 @@ class BackupAuditReportTests(unittest.TestCase):
             )
 
         self.assertEqual([job.id for job in repository.list()], before)
+
+    def test_report_includes_safe_storage_location_and_marks_backup_size_unavailable(self):
+        repository = InMemoryJobRepository()
+        service = self._service(repository)
+        service.storage_profile_repository.save(StorageProfileRecord(
+            id="profile-a",
+            name="prod-s3",
+            backend_type="s3",
+            environment={"AWS_ACCESS_KEY_ID": "AKIATEST", "AWS_SECRET_ACCESS_KEY": "topsecret"},
+            secret_refs={"password": "secret-b"},
+        ))
+        service.target_repository.save(BackupTargetRecord(
+            id="target-a",
+            name="service-a",
+            worker_id="worker-a",
+            backup_strategy="restic",
+            storage_profile_id="profile-a",
+            path_storage="svc/backups",
+            retention_policy_id="retention-a",
+        ))
+
+        report = service.backup_audit_report(
+            start_date="2026-03-08",
+            end_date="2026-03-08",
+            timezone_name="America/New_York",
+        )
+
+        matrix = {row["target_id"]: row for row in report["matrix"]}
+        target_a = matrix["target-a"]
+        self.assertEqual(target_a["storage_location"], {
+            "backend_type": "s3",
+            "storage_profile_name": "prod-s3",
+            "path_storage": "svc/backups",
+        })
+        self.assertIsNone(target_a["backup_size"])
+        availability = report["availability"]
+        self.assertFalse(availability["backup_size"]["available"])
+        self.assertIn("progress", availability["backup_size"]["reason"])
+        self.assertTrue(availability["storage_location"]["available"])
+
+        serialized = json.dumps(report, ensure_ascii=False)
+        for forbidden in ("topsecret", "AKIATEST", "secret-b", "AWS_SECRET_ACCESS_KEY", "environment", "secret_refs"):
+            self.assertNotIn(forbidden, serialized)
 
     def test_started_job_query_is_half_open_and_consistent_across_repositories(self):
         start = datetime(2026, 3, 8, 5, 0, 0)

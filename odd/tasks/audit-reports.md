@@ -12,8 +12,8 @@ Delivery: `ask-on-risk`; chain strategy selected: `feature-branch-chain`. First 
 ## Tasks
 - T1 — S1, S2, S4 — route: date-bounded report matrix and calculation service — commit: `eebda88` (assessed medium; RDD off, no review due)
 - T2 — S1, S2, S4 — route: viewer-authenticated JSON report-data API — commit: `88ac86a` (assessed high; independent security verification passed; verifier default targets `actsis-litellm/oc/glm-5.2`)
-- T3a — S3 — route: pure JSON, CSV, Excel, and PDF renderers with spreadsheet formula-injection protection — commit: pending
-- T3b — S2–S3 — route: viewer-authenticated download endpoints and safe storage-location report fields — commit: pending (independent security verification passed)
+- T3a — S3 — route: pure JSON, CSV, Excel, and PDF renderers with spreadsheet formula-injection protection — commit: `19255d0`
+- T3b — S2–S3 — route: viewer-authenticated download endpoints and safe storage-location report fields — commit: pending (in progress; independent security verification passed)
 - T5 — S2 — route: persist source bytes processed and backend-reported stored bytes as separate historical report fields, unavailable where an exact metric is not provided — commit: pending (user selected both metrics; starts after T3b)
 - T4 — S1–S4 — route: reports navigation, monthly/quarterly or custom date-range controls, preview, downloads, and UI verification — commit: pending
 
@@ -39,3 +39,4 @@ Delivery: `ask-on-risk`; chain strategy selected: `feature-branch-chain`. First 
 - L19: User selected “Ambos, separados”: record source bytes processed and backend-reported stored bytes as distinct historical values, and report either value unavailable when an exact metric is not supplied.
 - L20: Parent review found spreadsheet formula injection for untrusted matrix strings in CSV/XLSX; added RED-first tests (2 failed), then prefixed formula-like text as a literal. Both regression tests passed. Parent focused report suites: 24 passed, 10 subtests; dispatch suite: 88 passed, 48 subtests; `git diff --check` clean. Differential comparison passed against `88ac86a` for four existing GET routes. Independent T3 security verification passed. Native assessment was unassessable because untracked files were undeclared; RDD is off, and the plan's independent verifier ran.
 - L21: Split T3 into renderer-only T3a and authenticated route/location T3b to keep format generation and the security-sensitive public download API reviewable separately; no specs changed.
+- L22: T3a committed as `19255d0`. Chain slice 1 remains the backend API (`eebda88`, `88ac86a`); slice 2 is renderer-only T3a; T3b starts the next review slice. The T3a commit contains 579 changed lines, so keep the remaining slices narrowly scoped. No push or PR was created.

@@ -3461,6 +3461,7 @@ class ControlPlaneService:
             workers=self.list_workers(),
             retention_policies=self.retention_policy_repository.list(),
             jobs=jobs,
+            storage_profiles=self.storage_profile_repository.list(),
             global_cron_expression=getattr(settings, "global_cron_expression", None),
         )
 

@@ -172,6 +172,41 @@ class _LeaseDiagnosticState:
             return {key: value for key, value in snapshot.items() if value is not None}
 
 
+def _restic_backup_size_metrics(logs: Any) -> Dict[str, int]:
+    """Extract exact Restic summary byte metrics from runtime output.
+
+    Restic emits a final JSON record with ``message_type == "summary"`` carrying
+    ``total_bytes_processed`` (source bytes processed) and ``data_added``
+    (backend-reported stored bytes). Only exact nonnegative integers are accepted;
+    bool, float, string, and missing values are dropped so each metric stays
+    unavailable independently. Non-Restic strategies and jobs without an exact
+    summary record therefore surface no size metric.
+    """
+    metrics: Dict[str, int] = {}
+    if not isinstance(logs, str) or not logs:
+        return metrics
+    for raw_line in logs.splitlines():
+        line = raw_line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get("message_type") != "summary":
+            continue
+        for source_field, target_key in (
+            ("total_bytes_processed", "backup_bytes_processed"),
+            ("data_added", "backup_bytes_added"),
+        ):
+            value = record.get(source_field)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                metrics[target_key] = value
+        # Restic emits a single authoritative summary record; stop after it.
+        break
+    return metrics
+
+
 def _phase_from_line(line: str) -> Optional[str]:
     text = " ".join(str(line or "").split())[:2048].casefold()
     phase_markers = (
@@ -243,6 +278,7 @@ class _JobProgressReporter:
         self.lease_diagnostics = lease_diagnostics
         self.sequence = 0
         self.latest_progress: Dict[str, Any] = {}
+        self._backup_size_metrics: Dict[str, int] = {}
         self._pending_lines: List[str] = []
         self._partial_line = ""
         self._last_inferred_phase: Optional[str] = None
@@ -264,6 +300,11 @@ class _JobProgressReporter:
     def callback(self) -> Optional[Callable[[str], None]]:
         return self.emit if self._send_method is not None else None
 
+    @property
+    def latest_backup_size_metrics(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._backup_size_metrics)
+
     def start(self) -> None:
         self.emit("", {"phase": "starting"}, force=True)
 
@@ -280,6 +321,12 @@ class _JobProgressReporter:
                     line = part.rstrip("\r\n")
                     if line:
                         self._pending_lines.append(line[:16 * 1024])
+                        self._backup_size_metrics.update(_restic_backup_size_metrics(line))
+                # Some runtimes do not terminate their final output line. The
+                # summary can still be complete JSON, so inspect the partial line
+                # without waiting for another callback or retaining raw output.
+                if self._partial_line:
+                    self._backup_size_metrics.update(_restic_backup_size_metrics(self._partial_line))
                 self._pending_lines = self._pending_lines[-self.MAX_PENDING_LINES :]
                 phase_changed = False
                 for line in parts:
@@ -2060,6 +2107,13 @@ class WorkerAgentService:
                     result_summary["storage_context"] = storage_context
                 if progress_reporter and progress_reporter.latest_progress:
                     result_summary["progress"] = dict(progress_reporter.latest_progress)
+                size_metrics: Dict[str, int] = {}
+                if str(payload.get("backup_strategy") or "").strip().lower() == "restic":
+                    size_metrics = _restic_backup_size_metrics(summary.get("logs"))
+                    if progress_reporter is not None:
+                        size_metrics.update(progress_reporter.latest_backup_size_metrics)
+                if size_metrics:
+                    result_summary.update(size_metrics)
                 stop_error = self._runtime_stop_error(payload, summary)
                 if stop_error:
                     result_summary["error"] = stop_error

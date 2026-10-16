@@ -1272,5 +1272,249 @@ class JobsListingRouteTests(unittest.TestCase):
         self.assertFalse(hasattr(ControlPlaneService, "list_jobs"))
 
 
+class BackupRunSizeMetricsCaptureTests(unittest.TestCase):
+    """T5 S2: capture Restic total_bytes_processed and data_added per backup.run job."""
+
+    @staticmethod
+    def _service(runtime_summary):
+        runtime = Mock()
+        runtime.run_runtime_job.return_value = runtime_summary
+        config = WorkerAgentConfig(
+            control_plane_url="http://control-plane",
+            name="worker-a",
+            host_name="host",
+            worker_id="worker-a",
+        )
+        client = Mock()
+        client.is_job_cancelled = None
+        service = WorkerAgentService(config, client, runtime)
+        return service, runtime
+
+    @staticmethod
+    def _backup_job(runtime_summary, *, payload_extra=None):
+        return {
+            "id": "job-a",
+            "command": "backup.run",
+            "payload": {
+                "target_id": "target-a",
+                "compose_project": "project-a",
+                "backup_strategy": "restic",
+                "image": "runtime-image",
+                "storage_context": {
+                    "repository_source": "target",
+                    "repository_kind": "local",
+                    "repository_display": "local:/repo",
+                },
+                **(payload_extra or {}),
+            },
+        }
+
+    def test_backup_run_captures_both_restic_summary_byte_metrics(self):
+        logs = (
+            '{"message_type":"status","percent_done":1.0}\n'
+            '{"message_type":"summary","total_bytes_processed":2048,"data_added":1024,"total_duration":4.5}\n'
+        )
+        service, _ = self._service({"success": True, "status_code": 0, "logs": logs, "stderr": ""})
+
+        execution = service.execute_job(self._backup_job({"success": True, "status_code": 0, "logs": logs, "stderr": ""}))
+
+        self.assertEqual(execution.status, JobStatus.SUCCEEDED)
+        self.assertEqual(execution.result_summary.get("backup_bytes_processed"), 2048)
+        self.assertEqual(execution.result_summary.get("backup_bytes_added"), 1024)
+
+    def test_backup_run_captures_metrics_from_stream_when_returned_logs_omit_summary(self):
+        summary_line = '{"message_type":"summary","total_bytes_processed":2048,"data_added":1024}'
+
+        class Client:
+            def update_job_progress(self, **kwargs):
+                return None
+
+        runtime = Mock()
+        runtime.run_runtime_job.side_effect = lambda **kwargs: (
+            kwargs["output_callback"](summary_line),
+            {"success": True, "status_code": 0, "logs": "truncated before final summary", "stderr": ""},
+        )[1]
+        config = WorkerAgentConfig(
+            control_plane_url="http://control-plane",
+            name="worker-a",
+            host_name="host",
+            worker_id="worker-a",
+        )
+        service = WorkerAgentService(config, Client(), runtime)
+        reporter = _JobProgressReporter(Client(), "worker-a", {"id": "job-a", "lease_token": "lease"})
+
+        try:
+            execution = service.execute_job(
+                self._backup_job({"success": True, "status_code": 0, "logs": "truncated before final summary", "stderr": ""}),
+                progress_reporter=reporter,
+            )
+        finally:
+            reporter.finish()
+
+        self.assertEqual(execution.result_summary.get("backup_bytes_processed"), 2048)
+        self.assertEqual(execution.result_summary.get("backup_bytes_added"), 1024)
+
+    def test_non_restic_backup_does_not_capture_restic_shaped_metrics(self):
+        logs = '{"message_type":"summary","total_bytes_processed":2048,"data_added":1024}\n'
+        service, _ = self._service({"success": True, "status_code": 0, "logs": logs, "stderr": ""})
+
+        execution = service.execute_job(
+            self._backup_job(
+                {"success": True, "status_code": 0, "logs": logs, "stderr": ""},
+                payload_extra={"backup_strategy": "tar"},
+            )
+        )
+
+        self.assertNotIn("backup_bytes_processed", execution.result_summary)
+        self.assertNotIn("backup_bytes_added", execution.result_summary)
+
+    def test_backup_run_without_summary_leaves_both_metrics_unavailable(self):
+        logs = '{"message_type":"status","percent_done":0.5}\nrestic output without summary\n'
+        service, _ = self._service({"success": True, "status_code": 0, "logs": logs, "stderr": ""})
+
+        execution = service.execute_job(self._backup_job({"success": True, "status_code": 0, "logs": logs, "stderr": ""}))
+
+        self.assertNotIn("backup_bytes_processed", execution.result_summary)
+        self.assertNotIn("backup_bytes_added", execution.result_summary)
+
+    def test_backup_run_rejects_non_integer_metrics_independently(self):
+        # bool and string values are not exact integers and must be dropped.
+        logs = (
+            '{"message_type":"summary","total_bytes_processed":true,'
+            '"data_added":"123","files_new":5}\n'
+        )
+        service, _ = self._service({"success": True, "status_code": 0, "logs": logs, "stderr": ""})
+
+        execution = service.execute_job(self._backup_job({"success": True, "status_code": 0, "logs": logs, "stderr": ""}))
+
+        self.assertNotIn("backup_bytes_processed", execution.result_summary)
+        self.assertNotIn("backup_bytes_added", execution.result_summary)
+
+    def test_backup_run_captures_only_one_metric_when_other_is_missing(self):
+        logs = '{"message_type":"summary","total_bytes_processed":4096}\n'
+        service, _ = self._service({"success": True, "status_code": 0, "logs": logs, "stderr": ""})
+
+        execution = service.execute_job(self._backup_job({"success": True, "status_code": 0, "logs": logs, "stderr": ""}))
+
+        self.assertEqual(execution.result_summary.get("backup_bytes_processed"), 4096)
+        self.assertNotIn("backup_bytes_added", execution.result_summary)
+
+    def test_backup_run_preserves_zero_byte_metrics_as_reported_values(self):
+        logs = '{"message_type":"summary","total_bytes_processed":0,"data_added":0}\n'
+        service, _ = self._service({"success": True, "status_code": 0, "logs": logs, "stderr": ""})
+
+        execution = service.execute_job(self._backup_job({"success": True, "status_code": 0, "logs": logs, "stderr": ""}))
+
+        self.assertIn("backup_bytes_processed", execution.result_summary)
+        self.assertEqual(execution.result_summary["backup_bytes_processed"], 0)
+        self.assertIn("backup_bytes_added", execution.result_summary)
+        self.assertEqual(execution.result_summary["backup_bytes_added"], 0)
+
+    def test_backup_run_rejects_float_metric_without_discarding_exact_sibling(self):
+        logs = '{"message_type":"summary","total_bytes_processed":4096.0,"data_added":10}\n'
+        service, _ = self._service({"success": True, "status_code": 0, "logs": logs, "stderr": ""})
+
+        execution = service.execute_job(self._backup_job({"success": True, "status_code": 0, "logs": logs, "stderr": ""}))
+
+        self.assertNotIn("backup_bytes_processed", execution.result_summary)
+        self.assertEqual(execution.result_summary.get("backup_bytes_added"), 10)
+
+    def test_backup_run_rejects_negative_byte_metric(self):
+        logs = '{"message_type":"summary","total_bytes_processed":-1,"data_added":10}\n'
+        service, _ = self._service({"success": True, "status_code": 0, "logs": logs, "stderr": ""})
+
+        execution = service.execute_job(self._backup_job({"success": True, "status_code": 0, "logs": logs, "stderr": ""}))
+
+        self.assertNotIn("backup_bytes_processed", execution.result_summary)
+        self.assertEqual(execution.result_summary.get("backup_bytes_added"), 10)
+
+    def test_non_backup_commands_do_not_gain_size_fields(self):
+        logs = '{"message_type":"summary","total_bytes_processed":2048,"data_added":1024}\n'
+        for command in ("retention.run", "restore.run", "snapshots.list", "snapshot.about", "stats.get"):
+            with self.subTest(command=command):
+                runtime = Mock()
+                if command == "snapshots.list":
+                    runtime.list_restic_snapshots.return_value = {
+                        "success": True,
+                        "status_code": 0,
+                        "logs": logs,
+                        "stderr": "",
+                        "snapshots": [],
+                    }
+                elif command == "snapshot.about":
+                    runtime.get_restic_snapshot_stats.return_value = {
+                        "success": True,
+                        "status_code": 0,
+                        "logs": "{}",
+                        "stderr": "",
+                        "stats": {},
+                    }
+                elif command == "stats.get":
+                    runtime.get_restic_stats.return_value = {
+                        "success": True,
+                        "status_code": 0,
+                        "logs": "{}",
+                        "stderr": "",
+                        "stats": {},
+                        "stats_by_mode": {},
+                    }
+                else:
+                    runtime.run_runtime_job.return_value = {
+                        "success": True,
+                        "status_code": 0,
+                        "logs": logs,
+                        "stderr": "",
+                    }
+                config = WorkerAgentConfig(
+                    control_plane_url="http://control-plane",
+                    name="worker-a",
+                    host_name="host",
+                    worker_id="worker-a",
+                )
+                service = WorkerAgentService(config, Mock(), runtime)
+                job = {
+                    "id": "job-x",
+                    "command": command,
+                    "payload": {
+                        "target_id": "target-a",
+                        "image": "runtime-image",
+                        "storage_context": {
+                            "repository_source": "target",
+                            "repository_kind": "local",
+                            "repository_display": "local:/repo",
+                        },
+                    },
+                }
+                if command == "restore.run":
+                    job["payload"]["_restore_result_transport"] = False
+                execution = service.execute_job(job)
+                self.assertNotIn(
+                    "backup_bytes_processed",
+                    execution.result_summary,
+                    f"{command} gained backup_bytes_processed",
+                )
+                self.assertNotIn(
+                    "backup_bytes_added",
+                    execution.result_summary,
+                    f"{command} gained backup_bytes_added",
+                )
+
+    def test_backup_run_preserves_status_progress_in_result_summary(self):
+        logs = '{"message_type":"summary","total_bytes_processed":2048,"data_added":1024}\n'
+        service, _ = self._service({"success": True, "status_code": 0, "logs": logs, "stderr": ""})
+        reporter = _JobProgressReporter(Mock(), "worker-a", {"id": "job-a", "lease_token": "lease"})
+        reporter.latest_progress = {"percent_done": 50.0, "phase": "backup"}
+
+        execution = service.execute_job(
+            self._backup_job({"success": True, "status_code": 0, "logs": logs, "stderr": ""}),
+            progress_reporter=reporter,
+        )
+
+        self.assertEqual(execution.result_summary["progress"]["percent_done"], 50.0)
+        self.assertEqual(execution.result_summary["progress"]["phase"], "backup")
+        self.assertEqual(execution.result_summary.get("backup_bytes_processed"), 2048)
+        self.assertEqual(execution.result_summary.get("backup_bytes_added"), 1024)
+
+
 if __name__ == "__main__":
     unittest.main()

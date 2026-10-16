@@ -207,6 +207,7 @@
       users: '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3 3-5 6-5s6 2 6 5"/></svg>',
       logout: '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M6 2H3v12h3M10 5l3 3-3 3M6 8h7"/></svg>',
       github: '<svg class="icon" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>',
+      reports: '<svg class="icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 1.5h5.5L13 5v9.5H4z"/><path d="M9.5 1.5V5H13"/><path d="M6.5 8h4M6.5 11h4"/></svg>',
     };
 
     const NAV_ITEMS = [
@@ -214,6 +215,7 @@
       { id: "workers", label: "Workers", icon: "workers", roles: ["admin", "operator", "viewer"] },
       { id: "targets", label: "Targets", icon: "targets", roles: ["admin", "operator", "viewer"] },
       { id: "jobs", label: "Jobs", icon: "jobs", roles: ["admin", "operator", "viewer"] },
+      { id: "reports", label: "Informes", icon: "reports", roles: ["admin", "operator", "viewer"] },
       { id: "storage", label: "Storage", icon: "storage", roles: ["admin", "operator"] },
       { id: "retention", label: "Retention", icon: "retention", roles: ["admin", "operator"] },
       { id: "secrets", label: "Secretos", icon: "secrets", roles: ["admin"] },
@@ -596,7 +598,7 @@
     function renderTopbar() {
       const topbar = document.getElementById("topbar");
       const titles = {
-        dashboard: "Dashboard", workers: "Workers", targets: "Targets", jobs: "Jobs",
+        dashboard: "Dashboard", workers: "Workers", targets: "Targets", jobs: "Jobs", reports: "Informes",
         storage: "Storage Profiles", retention: "Retention Policies", secrets: "Secretos", users: "Usuarios", settings: "Settings",
       };
       topbar.innerHTML = `
@@ -656,6 +658,7 @@
       const viewRenderers = {
         dashboard: renderDashboard, workers: renderWorkers, targets: renderTargets, jobs: renderJobs,
         storage: renderStorage, retention: renderRetention, secrets: renderSecrets, users: renderUsers, settings: renderSettings,
+        reports: renderReports,
       };
       const renderer = viewRenderers[view];
       if (renderer) renderer(content);
@@ -6907,6 +6910,220 @@ docker compose up -d
 
     let storageTableState = { sortKey: "name", sortDir: "asc", page: 1, pageSize: 25, filters: { name: "", backend: "" } };
     let storageAboutState = {};
+
+    // ------------------------------------------------------------------ Informes (auditoria) -------
+    // La ruta /api/v1/reports/backups acepta exactamente start_date y
+    // end_date; las fechas son inclusivas en la zona del scheduler (T1),
+    // asi que los presets se calculan con "hoy" en state.schedulerTimezone.
+    const REPORT_PRESETS = [
+      { id: "monthly", label: "Mes actual" },
+      { id: "quarterly", label: "Trimestre actual" },
+      { id: "custom", label: "Rango personalizado" },
+    ];
+    const REPORT_EXPORT_FORMATS = ["json", "csv", "xlsx", "pdf"];
+    let reportRangeState = { preset: "monthly", start: "", end: "" };
+    let reportLoadGeneration = 0;
+
+    function reportsSchedulerToday(now = new Date()) {
+      const timeZone = state.schedulerTimezone || "";
+      if (!timeZone) return null;
+      try {
+        const formatter = new Intl.DateTimeFormat("en-CA", {
+          timeZone,
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+        });
+        const parts = Object.fromEntries(formatter.formatToParts(now).map(({ type, value }) => [type, value]));
+        return `${parts.year}-${parts.month}-${parts.day}`;
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function reportsPresetRange(preset, today = reportsSchedulerToday()) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(today || "")) return null;
+      const month = Number(today.slice(5, 7));
+      const startMonth = preset === "monthly" ? month : preset === "quarterly" ? Math.floor((month - 1) / 3) * 3 + 1 : null;
+      if (!startMonth) return null;
+      return {
+        start_date: preset === "monthly" ? today.slice(0, 8) + "01" : `${today.slice(0, 4)}-${String(startMonth).padStart(2, "0")}-01`,
+        end_date: today,
+      };
+    }
+
+    function currentReportRange() {
+      if (reportRangeState.preset === "custom") {
+        return { start_date: reportRangeState.start, end_date: reportRangeState.end };
+      }
+      return reportsPresetRange(reportRangeState.preset);
+    }
+
+    function reportRangeIsValid(range) {
+      if (!range || !/^\d{4}-\d{2}-\d{2}$/.test(range.start_date || "") || !/^\d{4}-\d{2}-\d{2}$/.test(range.end_date || "")) return false;
+      const start = new Date(`${range.start_date}T00:00:00Z`);
+      const end = new Date(`${range.end_date}T00:00:00Z`);
+      return !Number.isNaN(start.getTime()) && !Number.isNaN(end.getTime()) && range.start_date <= range.end_date;
+    }
+
+    function reportDownloadUrl(range, format) {
+      const params = new URLSearchParams({ start_date: range.start_date, end_date: range.end_date });
+      return `/api/v1/reports/backups/download/${format}?${params.toString()}`;
+    }
+
+    function reportDownloadButtonsHtml(range) {
+      const valid = reportRangeIsValid(range);
+      const labels = { json: "JSON", csv: "CSV", xlsx: "Excel", pdf: "PDF" };
+      const buttons = REPORT_EXPORT_FORMATS.map(fmt => valid
+        ? `<a class="btn secondary sm" href="${escapeHtml(reportDownloadUrl(range, fmt))}" download="${fmt}" data-report-download="${fmt}" title="Descargar el informe en formato ${fmt}">Descargar ${labels[fmt]}</a>`
+        : `<button type="button" class="btn secondary sm" disabled title="Selecciona un rango valido para descargar">Descargar ${labels[fmt]}</button>`
+      ).join("");
+      return `<div class="btn-row" data-report-downloads>${buttons}</div>`;
+    }
+
+    function reportMatrixRowHtml(row) {
+      const server = row.server || {};
+      const schedule = row.schedule || {};
+      const retention = row.retention || {};
+      const hasRetention = row.retention !== null && row.retention !== undefined;
+      const counts = row.job_counts || {};
+      const size = row.backup_size || {};
+      const coverage = size.coverage || {};
+      const location = row.storage_location || {};
+      const orDash = value => escapeHtml(value === undefined || value === null || value === "" ? "—" : value);
+      const retentionValues = [
+        ["últimas", retention.keep_last],
+        ["por hora", retention.keep_hourly],
+        ["por día", retention.keep_daily],
+        ["por semana", retention.keep_weekly],
+        ["por mes", retention.keep_monthly],
+        ["por año", retention.keep_yearly],
+      ].map(([label, value]) => `${label} ${value === null || value === undefined ? "—" : String(value)}`);
+      retentionValues.push(`podar ${retention.prune === true ? "sí" : retention.prune === false ? "no" : "—"}`);
+      const percent = value => value === null || value === undefined ? "n/a" : `${Number(value).toLocaleString("es-CO", { maximumFractionDigits: 2 })}%`;
+      const bytesValue = value => {
+        if (value === null || value === undefined) return "n/a";
+        return formatJobBytes(value) || `${Number(value).toLocaleString("es-CO")} B`;
+      };
+      const sizeCell = metric => {
+        const metricCoverage = coverage[metric] || {};
+        const reported = Number(metricCoverage.reported_jobs) || 0;
+        const unavailable = Number(metricCoverage.unavailable_jobs) || 0;
+        return `<div class="mono">${escapeHtml(bytesValue(size[metric]))}</div><div class="helper">reportado en ${reported}/${reported + unavailable} jobs</div>`;
+      };
+      return `<tr data-report-target-id="${escapeHtml(row.target_id)}">
+        <td>${orDash(row.service)}</td>
+        <td>${orDash(server.name)}${server.host ? `<div class="helper mono">${escapeHtml(server.host)}</div>` : ""}</td>
+        <td>${schedule.cron_expression ? `<code class="mono">${escapeHtml(schedule.cron_expression)}</code><div class="helper">${orDash(schedule.timezone)}</div>` : `<div class="helper">${orDash(schedule.source || "manual")}</div>`}</td>
+        <td>${orDash(retention.name)}${hasRetention ? `<div class="helper mono">${escapeHtml(retentionValues.join(" · "))}</div>` : ""}</td>
+        <td class="mono">${orDash(counts.succeeded)} / ${orDash(counts.failed)}</td>
+        <td>${escapeHtml(percent(row.succeeded_percent))}</td>
+        <td>${escapeHtml(percent(row.failed_percent))}</td>
+        <td>${sizeCell("bytes_processed")}</td>
+        <td>${sizeCell("bytes_added")}</td>
+        <td>${orDash(location.backend_type)}${location.storage_profile_name ? `<div class="helper">${orDash(location.storage_profile_name)}</div>` : ""}${location.path_storage ? `<div class="helper mono">${escapeHtml(location.path_storage)}</div>` : ""}</td>
+      </tr>`;
+    }
+
+    function renderReportData(content, report, range) {
+      const region = content.querySelector("#reportPreviewRegion");
+      if (!region) return;
+      const summary = report.summary || {};
+      const size = summary.backup_size || {};
+      const availability = (report.availability || {}).backup_size || {};
+      const metrics = availability.metrics || {};
+      const period = report.period || {};
+      const orNA = value => value === null || value === undefined ? "n/a" : String(value);
+      const percentText = value => value === null || value === undefined ? "n/a" : `${Number(value).toLocaleString("es-CO", { maximumFractionDigits: 2 })}%`;
+      const bytesText = value => value === null || value === undefined ? "n/a" : (formatJobBytes(value) || `${Number(value).toLocaleString("es-CO")} B`);
+      const coverageText = metric => {
+        if (!metric || !metric.available) return "sin datos reportados en el periodo";
+        const jobs = (Number(metric.reported_jobs) || 0) + (Number(metric.unavailable_jobs) || 0);
+        return `${Number(metric.reported_jobs) || 0}/${jobs} jobs`;
+      };
+      region.innerHTML = `
+        <div class="stat-grid">
+          ${statCard("Servidores y servicios", "Targets", String(summary.target_count ?? 0), `periodo ${escapeHtml(period.start_date || range.start_date)} a ${escapeHtml(period.end_date || range.end_date)} · zona ${escapeHtml(period.timezone || "desconocida")}`)}
+          ${statCard("Jobs de backup", "Total", String(summary.backup_job_count ?? 0), `exitosos ${orNA(summary.succeeded_count)} · fallidos ${orNA(summary.failed_count)}`)}
+          ${statCard("Resultado", "Exitoso", percentText(summary.succeeded_percent), "sobre jobs completados")}
+          ${statCard("Resultado", "Fallido", percentText(summary.failed_percent), "sobre jobs completados")}
+          ${statCard("Tamaño", "Bytes procesados", bytesText(size.bytes_processed), coverageText(metrics.bytes_processed))}
+          ${statCard("Tamaño", "Bytes agregados al backend", bytesText(size.bytes_added), coverageText(metrics.bytes_added))}
+        </div>
+        ${availability && availability.complete === false ? `<div class="helper">Cobertura parcial: ${escapeHtml(availability.basis || "")}</div>` : ""}
+        <div class="table-wrap"><div class="sheet"><table class="table" aria-label="Matriz de backups por servidor y servicio">
+          <thead><tr><th>Servicio</th><th>Servidor</th><th>Periodicidad</th><th>Retenci&oacute;n</th><th>Exitosos / Fallidos</th><th>Exitoso %</th><th>Fallido %</th><th>Bytes procesados</th><th>Bytes agregados al backend</th><th>Ubicaci&oacute;n</th></tr></thead>
+          <tbody>${(report.matrix || []).map(reportMatrixRowHtml).join("") || `<tr><td colspan="10" class="empty-state">Sin targets configurados para el rango seleccionado</td></tr>`}</tbody>
+        </table></div></div>
+      `;
+    }
+
+    async function loadReportPreview() {
+      const content = document.getElementById("content");
+      if (!content || state.currentView !== "reports") return;
+      const range = currentReportRange();
+      const region = content.querySelector("#reportPreviewRegion");
+      if (!region) return;
+      const generation = ++reportLoadGeneration;
+      if (!reportRangeIsValid(range)) {
+        region.setAttribute("data-report-query", "");
+        const message = reportRangeState.preset !== "custom" && !range
+          ? "No se puede calcular el rango porque la zona horaria del scheduler no está disponible."
+          : "Selecciona un rango de fechas válido para generar el informe.";
+        region.innerHTML = `<div class="helper" role="status">${escapeHtml(message)}</div>`;
+        return;
+      }
+      const query = new URLSearchParams({ start_date: range.start_date, end_date: range.end_date }).toString();
+      region.setAttribute("data-report-query", query);
+      region.innerHTML = `<div class="helper" role="status">Generando informe...</div>`;
+      try {
+        const report = await apiGet(`/api/v1/reports/backups?${query}`);
+        if (generation !== reportLoadGeneration || state.currentView !== "reports") return;
+        renderReportData(content, report, range);
+      } catch (error) {
+        if (error.message === "auth") return;
+        if (generation !== reportLoadGeneration || state.currentView !== "reports") return;
+        region.innerHTML = `<div class="alert warning" role="alert"><strong>No se pudo generar el informe.</strong> ${escapeHtml(error.message)}</div>`;
+      }
+    }
+
+    function renderReports(content) {
+      const presetOptions = REPORT_PRESETS.map(item => `<option value="${escapeHtml(item.id)}" ${reportRangeState.preset === item.id ? "selected" : ""}>${escapeHtml(item.label)}</option>`).join("");
+      const isCustom = reportRangeState.preset === "custom";
+      const range = currentReportRange();
+      const timezoneLabel = state.schedulerTimezone ? escapeHtml(state.schedulerTimezone) : "zona del scheduler no disponible";
+      content.innerHTML = `
+        <div class="page-header"><div><h2>Informes</h2><div class="subtitle">Balance para auditoria: servidores, servicios, periodicidad, retencion, resultado y ubicacion de los backups</div></div></div>
+        <div class="card compact">
+          <div class="form-grid">
+            <div class="field"><label for="reportPreset">Rango</label><select id="reportPreset">${presetOptions}</select><div class="hint">Las fechas del informe se interpretan en la zona del scheduler: ${timezoneLabel}</div></div>
+            <div class="field" id="reportCustomStartField" ${isCustom ? "" : "hidden"}><label for="reportStartDate">Fecha inicial</label><input id="reportStartDate" type="date" value="${escapeHtml(reportRangeState.start)}" /></div>
+            <div class="field" id="reportCustomEndField" ${isCustom ? "" : "hidden"}><label for="reportEndDate">Fecha final</label><input id="reportEndDate" type="date" value="${escapeHtml(reportRangeState.end)}" /></div>
+          </div>
+          <div id="reportDownloads">${reportDownloadButtonsHtml(range)}</div>
+        </div>
+        <div id="reportPreviewRegion" role="status" aria-live="polite"></div>
+      `;
+      const downloads = content.querySelector("#reportDownloads");
+      const refreshDownloads = () => { downloads.innerHTML = reportDownloadButtonsHtml(currentReportRange()); };
+      content.querySelector("#reportPreset").addEventListener("change", (e) => {
+        reportRangeState.preset = e.target.value;
+        renderReports(content);
+      });
+      const startInput = content.querySelector("#reportStartDate");
+      const endInput = content.querySelector("#reportEndDate");
+      startInput.addEventListener("change", () => {
+        reportRangeState.start = startInput.value;
+        refreshDownloads();
+        void loadReportPreview();
+      });
+      endInput.addEventListener("change", () => {
+        reportRangeState.end = endInput.value;
+        refreshDownloads();
+        void loadReportPreview();
+      });
+      void loadReportPreview();
+    }
 
     function renderStorage(content) {
       const fileSecrets = state.secrets.filter(s => s.secret_type === "file");

@@ -162,6 +162,7 @@ class RestoreMetadataTests(unittest.TestCase):
         args, kwargs = process_factory.call_args
         self.assertEqual(args[0], ["restic", "ls", "--long", "snap-1"])
         self.assertNotIn("shell", kwargs)
+        self.assertNotIn("bufsize", kwargs)
         self.assertEqual(kwargs["stdout"], -1)
         self.assertEqual(kwargs["stderr"], -1)
         self.assertEqual(kwargs["env"]["RESTIC_REPOSITORY"], "local:/repo")
@@ -228,6 +229,20 @@ class RestoreMetadataTests(unittest.TestCase):
         self.assertEqual(result.owners, ("0:0", "1000:1000"))
         self.assertEqual(result.ownership_classification, "mixed")
         self.assertFalse(result.owners_truncated)
+        self.assertTrue(process.waited)
+        self.assertFalse(process.terminated)
+
+    def test_valid_header_uses_header_limit_independently_of_record_limit(self):
+        process = FakeProcess((header() + "\n" + line() + "\n").encode("utf-8"))
+        result = ResticMetadataInspectorAdapter(
+            process_factory=Mock(return_value=process),
+            max_record_bytes=64,
+            max_header_bytes=256,
+        ).inspect("073a90db")
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.total_files, 1)
+        self.assertEqual(len(result.files), 1)
         self.assertTrue(process.waited)
         self.assertFalse(process.terminated)
 

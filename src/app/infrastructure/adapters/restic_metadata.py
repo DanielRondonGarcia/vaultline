@@ -123,7 +123,6 @@ class ResticMetadataInspectorAdapter(ResticMetadataInspectorPort):
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                bufsize=0,
             )
             stderr_tail = bytearray()
             stderr_errors: list[Exception] = []
@@ -151,7 +150,7 @@ class ResticMetadataInspectorAdapter(ResticMetadataInspectorPort):
             if stdout is None:
                 raise ResticMetadataError("Restic metadata inspection output is incomplete")
             while True:
-                raw_line = stdout.readline(self.max_record_bytes + 2)
+                raw_line = stdout.readline(max(self.max_record_bytes, self.max_header_bytes) + 2)
                 if raw_line in (b"", ""):
                     break
                 parser.feed(raw_line)

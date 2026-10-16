@@ -679,49 +679,50 @@
       return `<article class="card compact"><span class="eyebrow">${escapeHtml(eyebrow)}</span><div class="title">${escapeHtml(title)}</div><div class="value">${escapeHtml(String(value))}</div><div class="meta">${escapeHtml(meta || "")}</div></article>`;
     }
 
-    function zonedDateKey(date, formatter) {
-      const parts = formatter.formatToParts(date);
-      const values = Object.fromEntries(parts.map(part => [part.type, part.value]));
-      return `${values.year}-${values.month}-${values.day}`;
+    function browserTimezoneOffsetMinutes(now = new Date()) {
+      return -now.getTimezoneOffset();
     }
 
-    function buildActivityDays(jobs, now = new Date()) {
-      const dateFormatter = new Intl.DateTimeFormat("en", {
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
+    function buildActivityDays(byDay) {
+      return (Array.isArray(byDay) ? byDay : []).map(day => {
+        const date = new Date(`${day.date}T00:00:00Z`);
+        return {
+          label: Number.isFinite(date.getTime()) ? date.toLocaleDateString("es", { timeZone: "UTC", weekday: "short" }) : String(day.date || ""),
+          total: Number(day.total) || 0,
+          success: Number(day.success) || 0,
+          failed: Number(day.failed) || 0,
+        };
       });
-      const [year, month, day] = zonedDateKey(now, dateFormatter).split("-").map(Number);
-      const currentDay = new Date(Date.UTC(year, month - 1, day));
-      const days = [];
-      for (let i = 6; i >= 0; i--) {
-        const date = new Date(currentDay);
-        date.setUTCDate(date.getUTCDate() - i);
-        const dateKey = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
-        const dayJobs = jobs.filter(job => {
-          if (!job.started_at) return false;
-          const timestamp = new Date(job.started_at);
-          return Number.isFinite(timestamp.getTime()) && zonedDateKey(timestamp, dateFormatter) === dateKey;
-        });
-        days.push({
-          label: date.toLocaleDateString("es", { timeZone: "UTC", weekday: "short" }),
-          total: dayJobs.length,
-          success: dayJobs.filter(job => job.status === "succeeded" || job.status === "success").length,
-          failed: dayJobs.filter(job => job.status === "failed").length,
-        });
-      }
-      return days;
+    }
+
+    const EMPTY_JOB_STATS = { total: 0, by_status: {}, by_day: [] };
+
+    async function fetchDashboardJobs() {
+      const [jobs, stats] = await Promise.all([
+        apiGet("/api/v1/jobs?limit=5"),
+        apiGet(`/api/v1/jobs/stats?tz_offset=${browserTimezoneOffsetMinutes()}`).catch(() => null),
+      ]);
+      return { jobs, stats };
+    }
+
+    function applyDashboardJobs(dashboard) {
+      if (!dashboard) return;
+      state.jobs = mergeJobList((dashboard.jobs && dashboard.jobs.items) || []);
+      if (dashboard.stats) state.jobStats = dashboard.stats;
     }
 
     function renderDashboard(content) {
       const onlineWorkers = state.workers.filter(w => w.status === "online").length;
-      const jobsSuccess = state.jobs.filter(j => j.status === "succeeded" || j.status === "success").length;
-      const jobsFailed = state.jobs.filter(j => j.status === "failed").length;
-      const jobsRunning = state.jobs.filter(j => j.status === "in_progress" || j.status === "running").length;
-      const jobsOther = state.jobs.length - jobsSuccess - jobsFailed - jobsRunning;
-      const successRate = state.jobs.length > 0 ? Math.round((jobsSuccess / state.jobs.length) * 100) : 0;
+      const stats = state.jobStats || EMPTY_JOB_STATS;
+      const byStatus = stats.by_status || {};
+      const jobsTotal = Number(stats.total) || 0;
+      const jobsSuccess = Number(byStatus.succeeded) || 0;
+      const jobsFailed = Number(byStatus.failed) || 0;
+      const jobsRunning = Number(byStatus.in_progress) || 0;
+      const jobsOther = Math.max(0, jobsTotal - jobsSuccess - jobsFailed - jobsRunning);
+      const successRate = jobsTotal > 0 ? Math.round((jobsSuccess / jobsTotal) * 100) : 0;
 
-      const days = buildActivityDays(state.jobs);
+      const days = buildActivityDays(stats.by_day);
       const maxDay = Math.max(1, ...days.map(d => d.total));
 
       const donutSegments = [
@@ -778,7 +779,7 @@
         <div class="stat-grid">
           ${statCard("Workers", "Online", onlineWorkers, `${state.workers.length} total`)}
           ${statCard("Targets", "Configurados", state.targets.length, "targets de backup")}
-          ${statCard("Jobs", "Total", state.jobs.length, "historico de jobs")}
+          ${statCard("Jobs", "Total", jobsTotal, "historico de jobs")}
           ${statCard("Storage", "Profiles", state.storageProfiles.length, "profiles configurados")}
         </div>
 
@@ -788,7 +789,7 @@
             <div class="donut-container">
               <svg viewBox="0 0 120 120" class="donut-svg">
                 ${donutPaths || `<circle cx="60" cy="60" r="36.5" fill="none" stroke="var(--border)" stroke-width="17" />`}
-                <text x="60" y="58" text-anchor="middle" font-size="20" font-weight="700" fill="var(--foreground)">${state.jobs.length}</text>
+                <text x="60" y="58" text-anchor="middle" font-size="20" font-weight="700" fill="var(--foreground)">${jobsTotal}</text>
                 <text x="60" y="72" text-anchor="middle" font-size="9" fill="var(--muted-foreground)">jobs</text>
               </svg>
               <div class="donut-legend">
@@ -2006,30 +2007,31 @@ docker compose up -d
       return `${visible.map(renderItem).join("")}<details class="vol-more"><summary>+${hidden.length} mas</summary>${hidden.map(renderItem).join("")}</details>`;
     }
 
-    function getLastJobForTarget(targetId, jobs = state.jobs || []) {
+    const TARGET_LOG_JOB_COMMANDS = ["backup.run", "restore.run", "restore.dry_run", "retention.run"];
+    const TARGET_LOG_JOB_LOOKUP_LIMIT = 25;
+
+    function getLastJobForTarget(targetId, jobs) {
       const targetJobs = (Array.isArray(jobs) ? jobs : []).filter(j => String(j.target_id) === String(targetId)
-        && ["backup.run", "restore.run", "restore.dry_run", "retention.run"].includes(j.command));
+        && TARGET_LOG_JOB_COMMANDS.includes(j.command));
       if (!targetJobs.length) return null;
       return targetJobs.sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""))[0];
     }
 
     async function openLatestTargetLogs(targetId) {
-      let latestJob = getLastJobForTarget(targetId);
-      if (!latestJob) {
-        try {
-          const jobs = await apiGet("/api/v1/jobs");
-          state.jobs = mergeJobList(Array.isArray(jobs.items) ? jobs.items : []);
-          latestJob = getLastJobForTarget(targetId);
-        } catch (error) {
-          const message = error && error.message ? String(error.message).slice(0, 240) : "No se pudo cargar el historial de jobs.";
-          alert(`No se pudieron cargar los jobs de este target: ${message}`);
-          return;
-        }
+      let latestJob = null;
+      try {
+        const jobs = await apiGet(`/api/v1/jobs?target_id=${encodeURIComponent(targetId)}&limit=${TARGET_LOG_JOB_LOOKUP_LIMIT}`);
+        latestJob = getLastJobForTarget(targetId, Array.isArray(jobs.items) ? jobs.items : []);
+      } catch (error) {
+        const message = error && error.message ? String(error.message).slice(0, 240) : "No se pudo cargar el historial de jobs.";
+        alert(`No se pudieron cargar los jobs de este target: ${message}`);
+        return;
       }
       if (!latestJob) {
         alert("No hay ejecuciones elegibles para mostrar en este target.");
         return;
       }
+      mergeJobProjection(latestJob);
       openLogPanel(latestJob.id, targetId);
     }
 
@@ -6281,11 +6283,103 @@ docker compose up -d
        updateCreateRuntimeOptions();
      }
 
-    let jobsTableState = { sortKey: "started_at", sortDir: "desc", page: 1, pageSize: 25, filters: { id: "", target: "", command: "", status: "", origin: "", started: "", finished: "" } };
+    let jobsTableState = { sortKey: "submitted_at", sortDir: "desc", page: 1, pageSize: 25, filters: { id: "", target: "", command: "", status: "", origin: "", started: "", finished: "" } };
+    const JOBS_POLL_BASE_MS = 3000;
+    const JOBS_POLL_MAX_MS = 30000;
+    const JOBS_POLL_SLOW_MS = 2000;
+    const JOBS_FILTER_DEBOUNCE_MS = 300;
+    const JOB_COMMAND_OPTIONS = ["backup.run", "restore.run", "restore.dry_run", "retention.run", "snapshots.list", "snapshot.ls", "snapshot.dump", "snapshot.about", "stats.get", "storage.about", "inventory.refresh"];
+    const JOB_TRIGGER_OPTIONS = ["manual", "schedule", "automatic", "interactive"];
+    const JOB_STATUS_OPTIONS = ["pending", "in_progress", "succeeded", "failed", "canceled"];
     let jobsPollTimer = null;
     let jobsPolling = false;
     let jobsPollFailures = 0;
     let jobsPollFirstFailureAt = 0;
+    let jobsPollDelayMs = JOBS_POLL_BASE_MS;
+    let jobsListRequest = null;
+    let jobsListLoaded = false;
+    let jobsListTotal = 0;
+
+    function jobsListQuery(tableState = jobsTableState) {
+      const params = new URLSearchParams();
+      params.set("limit", String(tableState.pageSize));
+      params.set("offset", String(Math.max(0, tableState.page - 1) * tableState.pageSize));
+      params.set("sort", tableState.sortKey);
+      params.set("order", tableState.sortDir === "asc" ? "asc" : "desc");
+      const filters = tableState.filters || {};
+      const toIso = value => {
+        const timestamp = new Date(value).getTime();
+        return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : "";
+      };
+      const mapping = [
+        ["id", filters.id],
+        ["target_id", filters.target],
+        ["command", filters.command],
+        ["status", filters.status],
+        ["trigger", filters.origin],
+        ["started_from", filters.started ? toIso(filters.started) : ""],
+        ["finished_to", filters.finished ? toIso(filters.finished) : ""],
+      ];
+      mapping.forEach(([name, value]) => {
+        const text = String(value || "").trim();
+        if (text) params.set(name, text);
+      });
+      return params.toString();
+    }
+
+    function applyJobsPage(jobsResp, query) {
+      if (query !== jobsListQuery()) return false;
+      const newJobs = Array.isArray(jobsResp.items) ? jobsResp.items : [];
+      const wasLoaded = jobsListLoaded;
+      const mergedJobs = mergeJobList(newJobs);
+      const jobFingerprint = j => JSON.stringify([j.id, j.command || "", j.trigger || "", normalizeJobStatus(j.status), j.updated_at || "", j.progress || (j.result_summary && j.result_summary.progress) || null, (j.log_lines || []).length]);
+      const hasChanged = JSON.stringify(mergedJobs.map(jobFingerprint)) !== JSON.stringify((state.jobs || []).map(jobFingerprint));
+      const total = Number.isFinite(Number(jobsResp.total)) ? Number(jobsResp.total) : newJobs.length;
+      const totalChanged = total !== jobsListTotal;
+      state.jobs = mergedJobs;
+      jobsListTotal = total;
+      jobsListLoaded = true;
+      return !wasLoaded || hasChanged || totalChanged;
+    }
+
+    function requestJobsPage() {
+      if (jobsListRequest) return jobsListRequest;
+      const query = jobsListQuery();
+      jobsListRequest = apiGet(`/api/v1/jobs?${query}`)
+        .then(jobsResp => ({ jobsResp, changed: applyJobsPage(jobsResp, query) }))
+        .finally(() => { jobsListRequest = null; });
+      return jobsListRequest;
+    }
+
+    function renderJobsTableIfVisible() {
+      const content = document.getElementById("content");
+      if (!content || state.currentView !== "jobs") return;
+      if (_jobsRenderTableBody) {
+        _jobsRenderTableBody();
+      } else {
+        renderJobs(content);
+      }
+    }
+
+    async function reloadJobs() {
+      jobsListLoaded = false;
+      const pending = requestJobsPage();
+      renderJobsTableIfVisible();
+      try {
+        let result = await pending;
+        if (!jobsListLoaded) result = await requestJobsPage();
+        jobsPollFailures = 0;
+        jobsPollFirstFailureAt = 0;
+        clearJobsRefreshNotice();
+        renderJobsTableIfVisible();
+        return result;
+      } catch (error) {
+        if (error && error.message === "auth") throw error;
+        renderJobsRefreshNotice("No se pudo cargar la pagina de Jobs.", () => { void reloadJobs(); });
+        renderJobsTableIfVisible();
+        return null;
+      }
+    }
     let accordionLogJobId = null;
     let accordionLogTimer = null;
     let accordionContentEl = null;
@@ -6489,21 +6583,14 @@ docker compose up -d
       (state.targets || []).forEach(t => { targetMap[t.id] = t.name; });
 
       const jobFilterValue = (value) => value === null || value === undefined ? "" : String(value);
-      const uniqueJobFilterValues = (jobs, getter) => {
-        const values = jobs.map(getter).filter(value => value !== "");
-        return Array.from(new Set(values)).sort((a, b) => a.localeCompare(b));
-      };
-      function parseJobTimestamp(value) {
-        if (value === null || value === undefined || value === "") return null;
-        const timestamp = new Date(value).getTime();
-        return Number.isFinite(timestamp) ? timestamp : null;
-      }
+      const uniqueJobFilterValues = (values) => Array.from(new Set(values.filter(value => value !== ""))).sort((a, b) => a.localeCompare(b));
       const renderJobFilterOptions = (values, labelForValue) => `<option value="">Todos</option>${values.map(value => `<option value="${escapeHtml(value)}">${escapeHtml(labelForValue(value))}</option>`).join("")}`;
-      const syncJobFilterOptions = (allJobs) => {
+      const syncJobFilterOptions = (pageJobs) => {
         const optionValues = {
-          command: uniqueJobFilterValues(allJobs, j => jobFilterValue(j.command)),
-          origin: uniqueJobFilterValues(allJobs, j => jobFilterValue(j.trigger)),
-          status: uniqueJobFilterValues(allJobs, j => normalizeJobStatus(j.status)),
+          command: uniqueJobFilterValues([...JOB_COMMAND_OPTIONS, ...pageJobs.map(j => jobFilterValue(j.command)), jobsTableState.filters.command]),
+          origin: uniqueJobFilterValues([...JOB_TRIGGER_OPTIONS, ...pageJobs.map(j => jobFilterValue(j.trigger)), jobsTableState.filters.origin]),
+          status: JOB_STATUS_OPTIONS.slice(),
+          target: (state.targets || []).slice().sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id))).map(t => String(t.id)),
         };
         Object.entries(optionValues).forEach(([column, values]) => {
           const select = content.querySelector(`select.dt-filter[data-col="${column}"]`);
@@ -6515,6 +6602,7 @@ docker compose up -d
           select.innerHTML = renderJobFilterOptions(values, value => {
             if (column === "origin") return jobTriggerLabel(value);
             if (column === "status") return jobStatusLabel(value);
+            if (column === "target") return targetMap[value] || value;
             return value;
           });
           select.value = valueSet.has(jobsTableState.filters[column]) ? jobsTableState.filters[column] : "";
@@ -6522,65 +6610,21 @@ docker compose up -d
       };
 
       const renderTableBody = () => {
-        const allJobs = state.jobs || [];
-        syncJobFilterOptions(allJobs);
-        const startedFilter = jobsTableState.filters.started;
-        const finishedFilter = jobsTableState.filters.finished;
-        const startedBound = startedFilter ? parseJobTimestamp(startedFilter) : null;
-        const finishedBound = finishedFilter ? parseJobTimestamp(finishedFilter) : null;
-        let jobs = allJobs.slice();
-        jobs = jobs.filter(j => {
-          const id = String(j.id || "").toLowerCase();
-          const target = (targetMap[j.target_id] || j.target_id || "").toLowerCase();
-          const cmd = jobFilterValue(j.command);
-          const status = normalizeJobStatus(j.status);
-          const origin = jobFilterValue(j.trigger);
-          const startedAt = parseJobTimestamp(j.started_at);
-          const finishedAt = parseJobTimestamp(j.finished_at);
-          if (jobsTableState.filters.id && !id.includes(jobsTableState.filters.id.toLowerCase())) return false;
-          if (jobsTableState.filters.target && !target.includes(jobsTableState.filters.target.toLowerCase())) return false;
-          if (jobsTableState.filters.command && cmd !== jobsTableState.filters.command) return false;
-          if (jobsTableState.filters.status && status !== jobsTableState.filters.status) return false;
-          if (jobsTableState.filters.origin && origin !== jobsTableState.filters.origin) return false;
-          if (startedFilter && (startedAt === null || startedBound === null || startedAt < startedBound)) return false;
-          if (finishedFilter && (finishedAt === null || finishedBound === null || finishedAt > finishedBound)) return false;
-          return true;
-        });
-        const dir = jobsTableState.sortDir === "asc" ? 1 : -1;
-        jobs.sort((a, b) => {
-          let va, vb;
-          if (jobsTableState.sortKey === "started_at") {
-            va = new Date(a.started_at || 0).getTime();
-            vb = new Date(b.started_at || 0).getTime();
-          } else if (jobsTableState.sortKey === "finished_at") {
-            va = new Date(a.finished_at || 0).getTime();
-            vb = new Date(b.finished_at || 0).getTime();
-          } else if (jobsTableState.sortKey === "status") {
-            va = a.status || ""; vb = b.status || "";
-          } else if (jobsTableState.sortKey === "target") {
-            va = targetMap[a.target_id] || a.target_id || "";
-            vb = targetMap[b.target_id] || b.target_id || "";
-          } else if (jobsTableState.sortKey === "command") {
-            va = a.command || ""; vb = b.command || "";
-          } else if (jobsTableState.sortKey === "origin") {
-            va = jobTriggerLabel(a.trigger); vb = jobTriggerLabel(b.trigger);
-          } else {
-            va = String(a.id || ""); vb = String(b.id || "");
-          }
-          if (va < vb) return -1 * dir;
-          if (va > vb) return 1 * dir;
-          return 0;
-        });
-
+        const pagedJobs = state.jobs || [];
+        syncJobFilterOptions(pagedJobs);
+        const isLoading = !jobsListLoaded && Boolean(jobsListRequest);
         const pageSize = jobsTableState.pageSize;
-        const totalFiltered = jobs.length;
+        const totalFiltered = jobsListLoaded ? jobsListTotal : 0;
         const totalPages = Math.max(1, Math.ceil(totalFiltered / pageSize));
-        if (jobsTableState.page > totalPages) jobsTableState.page = totalPages;
+        if (jobsListLoaded && jobsTableState.page > totalPages) {
+          jobsTableState.page = totalPages;
+          void reloadJobs();
+          return;
+        }
         if (jobsTableState.page < 1) jobsTableState.page = 1;
         const startIdx = (jobsTableState.page - 1) * pageSize;
-        const pagedJobs = jobs.slice(startIdx, startIdx + pageSize);
-        const showingFrom = totalFiltered === 0 ? 0 : startIdx + 1;
-        const showingTo = Math.min(startIdx + pageSize, totalFiltered);
+        const showingFrom = pagedJobs.length === 0 ? 0 : startIdx + 1;
+        const showingTo = startIdx + pagedJobs.length;
 
         const sortIcon = (key) => {
           if (jobsTableState.sortKey !== key) return " ↕";
@@ -6605,7 +6649,11 @@ docker compose up -d
 
         const tbody = content.querySelector("#jobsTbody");
         if (tbody) {
-          tbody.innerHTML = pagedJobs.length === 0 ? `<tr><td colspan="8" class="empty-state">Sin jobs que coincidan con los filtros</td></tr>` : pagedJobs.map(j => {
+          tbody.setAttribute("aria-busy", isLoading ? "true" : "false");
+          const skeletonRows = `<tr class="jobs-loading-row"><td colspan="8"><div class="snapshot-skeleton-list" aria-hidden="true">${Array.from({ length: Math.min(pageSize, 5) }, () => `<div class="snapshot-skeleton-row"></div>`).join("")}</div></td></tr>`;
+          const emptyRow = `<tr><td colspan="8" class="empty-state">Sin jobs que coincidan con los filtros</td></tr>`;
+          const unavailableRow = `<tr><td colspan="8" class="empty-state">No se pudo cargar la lista de jobs.</td></tr>`;
+          tbody.innerHTML = isLoading ? skeletonRows : !jobsListLoaded ? unavailableRow : pagedJobs.length === 0 ? emptyRow : pagedJobs.map(j => {
             const canCancel = normalizeJobStatus(j.status) === "pending" || normalizeJobStatus(j.status) === "in_progress";
             return `
             <tr id="job-row-${escapeHtml(j.id)}">
@@ -6631,10 +6679,10 @@ docker compose up -d
         }
 
         const subtitle = content.querySelector(".page-header .subtitle");
-        if (subtitle) subtitle.textContent = `Historico de jobs de backup/restore (${totalFiltered} de ${allJobs.length})`;
+        if (subtitle) subtitle.textContent = jobsListLoaded ? `Historico de jobs de backup/restore (${totalFiltered})` : "Historico de jobs de backup/restore";
 
         const pagInfo = content.querySelector(".pagination-info");
-        if (pagInfo) pagInfo.textContent = `Mostrando ${showingFrom}-${showingTo} de ${totalFiltered} jobs`;
+        if (pagInfo) pagInfo.textContent = isLoading ? "Cargando jobs..." : jobsListLoaded ? `Mostrando ${showingFrom}-${showingTo} de ${totalFiltered} jobs` : "";
 
         const pagControls = content.querySelector(".pagination-controls");
         if (pagControls) pagControls.innerHTML = pageButtons.join("");
@@ -6642,7 +6690,7 @@ docker compose up -d
         const sortThs = content.querySelectorAll("[data-sort]");
         sortThs.forEach(th => {
           const key = th.dataset.sort;
-          th.innerHTML = `${key === "id" ? "ID" : key === "target" ? "Target" : key === "command" ? "Comando" : key === "origin" ? "Origen" : key === "status" ? "Status" : key === "started_at" ? "Inicio" : "Fin"}${sortIcon(key)}`;
+          th.innerHTML = `${key === "id" ? "ID" : key === "target_id" ? "Target" : key === "command" ? "Comando" : key === "trigger" ? "Origen" : key === "status" ? "Status" : key === "started_at" ? "Inicio" : "Fin"}${sortIcon(key)}`;
         });
 
         bindJobsRowEvents();
@@ -6662,17 +6710,17 @@ docker compose up -d
             <thead>
               <tr>
                 <th ${sortAttrs("id")}>ID${sortIcon("id")}</th>
-                <th ${sortAttrs("target")}>Target${sortIcon("target")}</th>
+                <th ${sortAttrs("target_id")}>Target${sortIcon("target_id")}</th>
                 <th ${sortAttrs("command")}>Comando${sortIcon("command")}</th>
-                <th ${sortAttrs("origin")}>Origen${sortIcon("origin")}</th>
+                <th ${sortAttrs("trigger")}>Origen${sortIcon("trigger")}</th>
                 <th ${sortAttrs("status")}>Status${sortIcon("status")}</th>
                 <th ${sortAttrs("started_at")}>Inicio${sortIcon("started_at")}</th>
                 <th ${sortAttrs("finished_at")}>Fin${sortIcon("finished_at")}</th>
                 <th>Acciones</th>
               </tr>
               <tr class="filter-row">
-                <th><input type="text" class="dt-filter" data-col="id" aria-label="Filtrar ID" placeholder="Filtrar ID..." value="${escapeHtml(jobsTableState.filters.id)}" /></th>
-                <th><input type="text" class="dt-filter" data-col="target" aria-label="Filtrar target" placeholder="Filtrar target..." value="${escapeHtml(jobsTableState.filters.target)}" /></th>
+                <th><input type="text" class="dt-filter" data-col="id" aria-label="Filtrar ID" placeholder="ID empieza por..." value="${escapeHtml(jobsTableState.filters.id)}" /></th>
+                <th><select class="dt-filter" data-col="target" aria-label="Filtrar target"><option value="">Todos</option></select></th>
                 <th><select class="dt-filter" data-col="command" aria-label="Filtrar comando"><option value="">Todos</option></select></th>
                 <th><select class="dt-filter" data-col="origin" aria-label="Filtrar origen"><option value="">Todos</option></select></th>
                 <th><select class="dt-filter" data-col="status" aria-label="Filtrar status"><option value="">Todos</option></select></th>
@@ -6709,16 +6757,24 @@ docker compose up -d
               jobsTableState.sortKey = key;
               jobsTableState.sortDir = "desc";
             }
-            renderTableBody();
+            jobsTableState.page = 1;
+            void reloadJobs();
           });
         });
         const updateJobFilter = (control) => {
           jobsTableState.filters[control.dataset.col] = control.value;
           jobsTableState.page = 1;
-          renderTableBody();
+          void reloadJobs();
         };
+        let filterDebounceTimer = null;
         content.querySelectorAll("input.dt-filter").forEach(input => {
-          input.addEventListener("input", () => updateJobFilter(input));
+          input.addEventListener("input", () => {
+            if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
+            filterDebounceTimer = setTimeout(() => {
+              filterDebounceTimer = null;
+              updateJobFilter(input);
+            }, JOBS_FILTER_DEBOUNCE_MS);
+          });
         });
         content.querySelectorAll("select.dt-filter").forEach(select => {
           select.addEventListener("change", () => updateJobFilter(select));
@@ -6728,7 +6784,7 @@ docker compose up -d
           pageSizeSelect.addEventListener("change", () => {
             jobsTableState.pageSize = parseInt(pageSizeSelect.value, 10);
             jobsTableState.page = 1;
-            renderTableBody();
+            void reloadJobs();
           });
         }
         renderTableBody();
@@ -6739,7 +6795,7 @@ docker compose up -d
           btn.addEventListener("click", () => {
             if (btn.disabled) return;
             jobsTableState.page = parseInt(btn.dataset.page, 10);
-            renderTableBody();
+            void reloadJobs();
           });
         });
         content.querySelectorAll("[data-view-logs]").forEach(btn => {
@@ -6750,16 +6806,14 @@ docker compose up -d
             const jobId = btn.dataset.cancelJob;
             if (!confirm(`¿Cancelar el job ${jobId.slice(0,8)}?`)) return;
             await apiPost(`/api/v1/jobs/${jobId}/cancel`, {});
-            const jobsResp = await apiGet("/api/v1/jobs");
-            state.jobs = mergeJobList(jobsResp.items || []);
-            renderJobs(content);
+            await reloadJobs();
           }, "Cancelando...").catch(() => {}));
         });
       }
 
+      startJobsPolling();
       renderTable();
       _jobsRenderTableBody = renderTableBody;
-      startJobsPolling();
     }
 
     let _jobsRenderTableBody = null;
@@ -6795,31 +6849,27 @@ docker compose up -d
     function startJobsPolling() {
       if (jobsPolling) return;
       jobsPolling = true;
+      jobsPollDelayMs = JOBS_POLL_BASE_MS;
+      const scheduleNext = () => {
+        if (jobsPolling) jobsPollTimer = setTimeout(tick, jobsPollDelayMs);
+      };
       const tick = async () => {
         if (!jobsPolling) return;
+        if (jobsListRequest) {
+          scheduleNext();
+          return;
+        }
+        const startedAt = Date.now();
         try {
-          const jobsResp = await apiGet("/api/v1/jobs");
+          const { changed } = await requestJobsPage();
           jobsPollFailures = 0;
           jobsPollFirstFailureAt = 0;
           clearJobsRefreshNotice();
-          const newJobs = jobsResp.items || [];
-          const oldIds = new Set((state.jobs || []).map(j => j.id));
-          const hasNew = newJobs.some(j => !oldIds.has(j.id));
-          const mergedJobs = mergeJobList(newJobs);
-          const jobFingerprint = j => JSON.stringify([j.id, j.command || "", j.trigger || "", normalizeJobStatus(j.status), j.updated_at || "", j.progress || (j.result_summary && j.result_summary.progress) || null, (j.log_lines || []).length]);
-          const hasChanged = JSON.stringify(mergedJobs.map(jobFingerprint)) !== JSON.stringify((state.jobs || []).map(jobFingerprint));
-          state.jobs = mergedJobs;
-          if (hasNew || hasChanged) {
-            const content = document.getElementById("content");
-            if (content && state.currentView === "jobs") {
-              if (_jobsRenderTableBody) {
-                _jobsRenderTableBody();
-              } else {
-                renderJobs(content);
-              }
-            }
-          }
+          const elapsed = Date.now() - startedAt;
+          jobsPollDelayMs = elapsed > JOBS_POLL_SLOW_MS ? Math.min(jobsPollDelayMs * 2, JOBS_POLL_MAX_MS) : JOBS_POLL_BASE_MS;
+          if (changed) renderJobsTableIfVisible();
         } catch (e) {
+          jobsPollDelayMs = Math.min(jobsPollDelayMs * 2, JOBS_POLL_MAX_MS);
           jobsPollFailures += 1;
           if (!jobsPollFirstFailureAt) jobsPollFirstFailureAt = Date.now();
           const stopped = jobsPollFailures >= LOG_POLL_MAX_FAILURES || Date.now() - jobsPollFirstFailureAt >= LOG_POLL_FAILURE_WINDOW_MS;
@@ -6833,10 +6883,9 @@ docker compose up -d
             jobsPolling = false;
             jobsPollTimer = null;
           }
+          if (!jobsListLoaded) renderJobsTableIfVisible();
         }
-        if (jobsPolling) {
-          jobsPollTimer = setTimeout(tick, 3000);
-        }
+        scheduleNext();
       };
       tick();
     }
@@ -6844,12 +6893,14 @@ docker compose up -d
     function stopJobsPolling() {
       jobsPolling = false;
       _jobsRenderTableBody = null;
+      jobsListLoaded = false;
       if (jobsPollTimer) {
         clearTimeout(jobsPollTimer);
         jobsPollTimer = null;
       }
       jobsPollFailures = 0;
       jobsPollFirstFailureAt = 0;
+      jobsPollDelayMs = JOBS_POLL_BASE_MS;
     }
 
     let storageTableState = { sortKey: "name", sortDir: "asc", page: 1, pageSize: 25, filters: { name: "", backend: "" } };
@@ -7815,10 +7866,10 @@ docker compose up -d
         state.currentUser = me.username;
         state.currentRole = me.role;
         const routeView = currentRouteView();
-        const [workers, targets, jobs, storageProfiles, retentionPolicies, secrets, users, settings, schedulerConfig] = await Promise.all([
+        const [workers, targets, dashboardJobs, storageProfiles, retentionPolicies, secrets, users, settings, schedulerConfig] = await Promise.all([
           apiGet("/api/v1/workers"),
           apiGet("/api/v1/targets"),
-          shouldFetchJobsDuringRefresh(routeView) ? apiGet("/api/v1/jobs") : Promise.resolve(null),
+          shouldFetchJobsDuringRefresh(routeView) ? fetchDashboardJobs() : Promise.resolve(null),
           apiGet("/api/v1/storage-profiles"),
           apiGet("/api/v1/retention-policies"),
           apiGet("/api/v1/secrets").catch(() => ({ items: [] })),
@@ -7828,7 +7879,7 @@ docker compose up -d
         ]);
         state.workers = workers.items || [];
         state.targets = targets.items || [];
-        if (jobs) state.jobs = mergeJobList(jobs.items || []);
+        applyDashboardJobs(dashboardJobs);
         state.storageProfiles = storageProfiles.items || [];
         state.retentionPolicies = retentionPolicies.items || [];
         state.secrets = secrets.items || [];
@@ -7865,8 +7916,7 @@ docker compose up -d
 
     async function refreshDashboardJobs() {
       try {
-        const jobs = await apiGet("/api/v1/jobs");
-        state.jobs = mergeJobList(jobs.items || []);
+        applyDashboardJobs(await fetchDashboardJobs());
         const content = document.getElementById("content");
         if (content && state.currentView === "dashboard") renderDashboard(content);
       } catch (error) {

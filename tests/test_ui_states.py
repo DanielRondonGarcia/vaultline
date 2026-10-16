@@ -1174,8 +1174,10 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
         body_start = render_source.index("const renderTableBody = () => {")
         body_end = render_source.index("const renderTable = () => {", body_start)
         body_source = render_source[body_start:body_end]
-        self.assertIn("const allJobs = state.jobs || [];", body_source)
-        self.assertNotIn("const allJobs = state.jobs || [];", render_source.split("const renderTableBody", 1)[0])
+        self.assertIn("const pagedJobs = state.jobs || [];", body_source)
+        self.assertNotIn("const pagedJobs = state.jobs || [];", render_source.split("const renderTableBody", 1)[0])
+        for removed in ("jobs.filter(j => {", "jobs.sort((a, b) => {", "startedAt < startedBound", "jobs.slice(startIdx"):
+            self.assertNotIn(removed, body_source)
 
         polling = re.search(
             r"function startJobsPolling\(\) \{.*?\n    function stopJobsPolling",
@@ -1184,14 +1186,33 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
         )
         self.assertIsNotNone(polling)
         polling_source = polling.group(0)
-        state_index = polling_source.index("state.jobs = mergedJobs;")
-        renderer_index = polling_source.index("_jobsRenderTableBody();")
-        self.assertLess(state_index, renderer_index)
-        self.assertIn("if (_jobsRenderTableBody)", polling_source)
-        self.assertIn("renderJobs(content);", polling_source)
+        self.assertNotIn("apiGet(", polling_source)
+        for marker in (
+            "if (jobsListRequest) {",
+            "scheduleNext();",
+            "const { changed } = await requestJobsPage();",
+            "elapsed > JOBS_POLL_SLOW_MS ? Math.min(jobsPollDelayMs * 2, JOBS_POLL_MAX_MS) : JOBS_POLL_BASE_MS",
+            "jobsPollDelayMs = Math.min(jobsPollDelayMs * 2, JOBS_POLL_MAX_MS);",
+            "setTimeout(tick, jobsPollDelayMs)",
+            "if (changed) renderJobsTableIfVisible();",
+        ):
+            self.assertIn(marker, polling_source)
+        apply_page = re.search(r"function applyJobsPage\(jobsResp, query\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(apply_page)
+        self.assertIn("if (query !== jobsListQuery()) return false;", apply_page.group(0))
+        self.assertIn("state.jobs = mergedJobs;", apply_page.group(0))
+        self.assertIn("jobsListTotal = total;", apply_page.group(0))
+        self.assertIn("jobsListLoaded = true;", apply_page.group(0))
+        renderer = re.search(r"function renderJobsTableIfVisible\(\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(renderer)
+        self.assertIn("if (_jobsRenderTableBody)", renderer.group(0))
+        self.assertIn("renderJobs(content);", renderer.group(0))
         self.assertIn("renderJobLogs(job);", self.source)
         self.assertIn("await refreshAll();", self.source)
         self.assertIn('["succeeded", "failed", "canceled", "cancelled"]', self.source)
+        self.assertNotIn('apiGet("/api/v1/jobs")', self.source)
+        self.assertNotIn("apiGet('/api/v1/jobs')", self.source)
+        self.assertNotIn("apiGet(`/api/v1/jobs`)", self.source)
 
     def test_jobs_list_refresh_uses_metadata_and_preserves_loaded_detail_projection(self):
         refresh = re.search(r"async function refreshAll\(\) \{.*?\n    \}", self.source, re.S)
@@ -1199,8 +1220,20 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
         refresh_source = refresh.group(0)
         self.assertNotIn("include_logs=true", self.source)
         self.assertIn("const routeView = currentRouteView();", refresh_source)
-        self.assertIn('shouldFetchJobsDuringRefresh(routeView) ? apiGet("/api/v1/jobs") : Promise.resolve(null)', refresh_source)
-        self.assertIn("if (jobs) state.jobs = mergeJobList(jobs.items || []);", refresh_source)
+        self.assertIn("shouldFetchJobsDuringRefresh(routeView) ? fetchDashboardJobs() : Promise.resolve(null)", refresh_source)
+        self.assertIn("applyDashboardJobs(dashboardJobs);", refresh_source)
+        dashboard_fetch = re.search(r"async function fetchDashboardJobs\(\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(dashboard_fetch)
+        self.assertIn('apiGet("/api/v1/jobs?limit=5")', dashboard_fetch.group(0))
+        self.assertIn("apiGet(`/api/v1/jobs/stats?tz_offset=${browserTimezoneOffsetMinutes()}`)", dashboard_fetch.group(0))
+        self.assertIn("state.jobs = mergeJobList((dashboard.jobs && dashboard.jobs.items) || []);", self.source)
+        self.assertIn("if (dashboard.stats) state.jobStats = dashboard.stats;", self.source)
+        dashboard = re.search(r"function renderDashboard\(content\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(dashboard)
+        self.assertIn("const stats = state.jobStats || EMPTY_JOB_STATS;", dashboard.group(0))
+        self.assertIn("buildActivityDays(stats.by_day)", dashboard.group(0))
+        self.assertNotIn("state.jobs.filter(", dashboard.group(0))
+        self.assertNotIn("state.jobs.length", dashboard.group(0).split("Jobs recientes", 1)[0])
         self.assertIn("function mergeJobList(items)", self.source)
         self.assertIn("currentLogJobSnapshot", self.source)
         self.assertIn('for (const key of ["result_summary", "storage_context", "progress", "log_lines"])', self.source)
@@ -1227,24 +1260,37 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
             r"function currentRouteView\(\) \{.*?\n    \}",
             r"function route\(\) \{.*?\n    \}",
             r"function shouldFetchJobsDuringRefresh\(view\) \{.*?\n    \}",
+            r"function browserTimezoneOffsetMinutes\(now = new Date\(\)\) \{.*?\n    \}",
+            r"async function fetchDashboardJobs\(\) \{.*?\n    \}",
+            r"function applyDashboardJobs\(dashboard\) \{.*?\n    \}",
             r"async function refreshDashboardJobs\(\) \{.*?\n    \}",
-            r"function getLastJobForTarget\(targetId, jobs = state\.jobs \|\| \[\]\) \{.*?\n    \}",
+            r"    const TARGET_LOG_JOB_COMMANDS = .*?;\n    const TARGET_LOG_JOB_LOOKUP_LIMIT = .*?;",
+            r"function getLastJobForTarget\(targetId, jobs\) \{.*?\n    \}",
             r"async function openLatestTargetLogs\(targetId\) \{.*?\n    \}",
             r"async function refreshAll\(\) \{.*?\n    \}",
             r"async function withBtnLoading\(btn, asyncFn, loadingText\) \{.*?\n    \}",
-            r"function startJobsPolling\(\) \{.*?\n    \}",
-            r"function stopJobsPolling\(\) \{.*?\n    \}",
+            r"    let jobsTableState = .*?\n    async function reloadJobs\(\) \{.*?\n    \}",
+            r"    function clearJobsRefreshNotice\(\) \{.*?\n    function stopJobsPolling\(\) \{.*?\n    \}",
         ):
             match = re.search(pattern, self.source, re.S)
             self.assertIsNotNone(match, pattern)
             functions.append(match.group(0))
 
-        script = "\n\n".join(functions) + r'''
+        script = "\n\n".join(functions)
+        for original, scaled in (
+            ("const JOBS_POLL_BASE_MS = 3000;", "const JOBS_POLL_BASE_MS = 20;"),
+            ("const JOBS_POLL_MAX_MS = 30000;", "const JOBS_POLL_MAX_MS = 80;"),
+            ("const JOBS_POLL_SLOW_MS = 2000;", "const JOBS_POLL_SLOW_MS = 10;"),
+        ):
+            self.assertIn(original, script)
+            script = script.replace(original, scaled)
+        script += r'''
 const state = {
   currentUser: null,
   currentRole: null,
   currentView: "dashboard",
   jobs: [],
+  jobStats: null,
   workers: [],
   targets: [],
   storageProfiles: [],
@@ -1258,23 +1304,40 @@ const window = { location: { hash: "#/targets" } };
 const document = { getElementById: () => null };
 const escapeHtml = value => String(value);
 const LOG_POLL_MAX_FAILURES = 5;
-let jobsPolling = false;
-let jobsPollFailures = 0;
-let jobsPollFirstFailureAt = 0;
-let jobsPollTimer = null;
+const LOG_POLL_FAILURE_WINDOW_MS = 60000;
+let _jobsRenderTableBody = null;
 let holdJobsRequest = false;
 let failJobsRequest = false;
-let neverJobs;
+let slowJobsRequestMs = 0;
+let releaseJobs = null;
 let nextJobs = [];
+let nextTotal = null;
 const calls = [];
 const openedLogs = [];
 const alerts = [];
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function waitFor(predicate, label, timeout = 1000) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await sleep(5);
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+const jobCalls = () => calls.filter(path => path.startsWith("/api/v1/jobs?"));
+const statsCalls = () => calls.filter(path => path.startsWith("/api/v1/jobs/stats?"));
 const apiGet = async path => {
-  if (path === "/api/v1/jobs") {
+  if (path.startsWith("/api/v1/jobs/stats")) {
     calls.push(path);
-    if (holdJobsRequest) return neverJobs;
+    return { total: 42, by_status: { succeeded: 40, failed: 2 }, by_day: [] };
+  }
+  if (path.startsWith("/api/v1/jobs")) {
+    calls.push(path);
+    if (!path.includes("?") || !/[?&]limit=\d+/.test(path)) throw new Error(`unbounded jobs request: ${path}`);
+    if (holdJobsRequest) return new Promise(resolve => { releaseJobs = resolve; });
+    if (slowJobsRequestMs) await sleep(slowJobsRequestMs);
     if (failJobsRequest) throw new Error("jobs unavailable");
-    return { items: nextJobs };
+    return { items: nextJobs, total: nextTotal === null ? nextJobs.length : nextTotal };
   }
   if (path === "/api/v1/auth/me") return { username: "test", role: "admin" };
   if (path === "/api/v1/targets") return { items: [{ id: "target-1" }] };
@@ -1285,20 +1348,20 @@ const apiGet = async path => {
   return {};
 };
 const mergeJobList = items => items;
+const mergeJobProjection = job => job;
 const renderVersionBanner = () => {};
-const clearJobsRefreshNotice = () => {};
-const renderJobsRefreshNotice = () => {};
+const renderJobs = () => {};
 const normalizeJobStatus = status => status;
 const alert = message => alerts.push(message);
 const openLogPanel = (jobId, targetId) => openedLogs.push([jobId, targetId]);
 function setView(view) {
   state.currentView = view;
+  if (view !== "jobs") stopJobsPolling();
   if (view === "jobs") startJobsPolling();
 }
 
 async function main() {
   holdJobsRequest = true;
-  neverJobs = new Promise(() => {});
   const saveButton = { disabled: false, innerHTML: "Save target" };
   let deadline;
   const targetSaveResult = await Promise.race([
@@ -1308,7 +1371,7 @@ async function main() {
   clearTimeout(deadline);
   if (targetSaveResult !== "resolved") throw new Error("target save waited for the jobs request");
   if (saveButton.disabled || saveButton.innerHTML !== "Save target") throw new Error("target save button did not leave its loading state");
-  if (calls.includes("/api/v1/jobs")) throw new Error("Targets refresh requested job history");
+  if (calls.some(path => path.startsWith("/api/v1/jobs"))) throw new Error("Targets refresh requested job history");
 
   holdJobsRequest = false;
   calls.length = 0;
@@ -1319,14 +1382,9 @@ async function main() {
     { id: "latest-target-job", target_id: "target-1", command: "restore.dry_run", updated_at: "2026-03-01T00:00:00Z" },
   ];
   await openLatestTargetLogs("target-1");
-  if (calls.filter(path => path === "/api/v1/jobs").length !== 1) throw new Error("deliberate Logs action did not perform exactly one jobs lookup");
+  if (jobCalls().length !== 1 || jobCalls()[0] !== "/api/v1/jobs?target_id=target-1&limit=25") throw new Error(`deliberate Logs action did not perform exactly one bounded target lookup: ${JSON.stringify(calls)}`);
   if (openedLogs[0]?.[0] !== "latest-target-job" || openedLogs[0]?.[1] !== "target-1") throw new Error("deliberate Logs action did not open the latest eligible target job");
 
-  calls.length = 0;
-  await openLatestTargetLogs("target-1");
-  if (calls.includes("/api/v1/jobs")) throw new Error("cached target job was not reused");
-
-  state.jobs = [];
   calls.length = 0;
   nextJobs = [];
   await openLatestTargetLogs("target-1");
@@ -1343,8 +1401,10 @@ async function main() {
   window.location.hash = "#/dashboard";
   nextJobs = [{ id: "dashboard-initial" }];
   await refreshAll();
-  if (calls.filter(path => path === "/api/v1/jobs").length !== 1) throw new Error("initial Dashboard did not fetch exactly one jobs list");
+  if (jobCalls().length !== 1 || jobCalls()[0] !== "/api/v1/jobs?limit=5") throw new Error(`initial Dashboard did not fetch exactly one recent-jobs page: ${JSON.stringify(calls)}`);
+  if (statsCalls().length !== 1 || statsCalls()[0] !== `/api/v1/jobs/stats?tz_offset=${-new Date().getTimezoneOffset()}`) throw new Error(`initial Dashboard did not fetch stats once with the browser offset: ${JSON.stringify(calls)}`);
   if (state.jobs[0]?.id !== "dashboard-initial") throw new Error("initial Dashboard did not receive current jobs");
+  if (state.jobStats?.total !== 42) throw new Error("initial Dashboard did not store server stats");
 
   window.location.hash = "#/targets";
   route();
@@ -1352,19 +1412,53 @@ async function main() {
   nextJobs = [{ id: "dashboard-after-targets" }];
   window.location.hash = "#/dashboard";
   route();
-  await new Promise(resolve => setTimeout(resolve, 0));
-  if (calls.filter(path => path === "/api/v1/jobs").length !== 1) throw new Error("switching to Dashboard did not fetch exactly one current jobs list");
+  await sleep(0);
+  if (jobCalls().length !== 1 || statsCalls().length !== 1) throw new Error("switching to Dashboard did not fetch exactly one recent page and one stats call");
   if (state.jobs[0]?.id !== "dashboard-after-targets") throw new Error("switching to Dashboard did not refresh job data");
 
   calls.length = 0;
   state.jobs = [];
   nextJobs = [{ id: "jobs-screen-initial" }];
+  nextTotal = 9105;
   window.location.hash = "#/jobs";
   await refreshAll();
-  await new Promise(resolve => setTimeout(resolve, 0));
-  if (calls.filter(path => path === "/api/v1/jobs").length !== 1) throw new Error("Jobs screen duplicated or skipped its initial polling request");
-  if (state.jobs[0]?.id !== "jobs-screen-initial") throw new Error("Jobs polling did not populate the initial list");
+  await sleep(0);
+  if (jobCalls().length !== 1 || jobCalls()[0] !== "/api/v1/jobs?limit=25&offset=0&sort=submitted_at&order=desc") throw new Error(`Jobs screen did not issue exactly one bounded page request: ${JSON.stringify(calls)}`);
+  if (state.jobs[0]?.id !== "jobs-screen-initial") throw new Error("Jobs polling did not populate the initial page");
+  if (!jobsListLoaded || jobsListTotal !== 9105) throw new Error("Jobs page did not record the server total");
+
+  await waitFor(() => jobCalls().length >= 2, "a second poll tick");
+  if (jobsPollDelayMs !== JOBS_POLL_BASE_MS) throw new Error("fast poll did not keep the base interval");
+  holdJobsRequest = true;
+  await waitFor(() => releaseJobs !== null, "the held poll request");
+  const heldCalls = jobCalls().length;
+  await sleep(JOBS_POLL_BASE_MS * 4);
+  if (jobCalls().length !== heldCalls) throw new Error(`poll ticks overlapped an in-flight request: ${jobCalls().length - heldCalls} extra calls`);
+  if (requestJobsPage() !== jobsListRequest) throw new Error("manual page request did not reuse the in-flight request");
+  if (jobCalls().length !== heldCalls) throw new Error("manual page request started a second request while one was in flight");
+  holdJobsRequest = false;
+  nextJobs = [];
+  nextTotal = 0;
+  releaseJobs({ items: [], total: 0 });
+  releaseJobs = null;
+  await waitFor(() => jobsListTotal === 0, "the released response to apply");
+  if (state.jobs.length !== 0) throw new Error("released response did not replace the page");
+
+  slowJobsRequestMs = JOBS_POLL_SLOW_MS * 3;
+  await waitFor(() => jobsPollDelayMs === JOBS_POLL_BASE_MS * 2, "slow response backoff");
+  await waitFor(() => jobsPollDelayMs === JOBS_POLL_BASE_MS * 4, "second slow response backoff");
+  slowJobsRequestMs = 0;
+  await waitFor(() => jobsPollDelayMs === JOBS_POLL_BASE_MS, "fast response reset");
+  failJobsRequest = true;
+  await waitFor(() => jobsPollDelayMs === JOBS_POLL_BASE_MS * 2 && jobsPollFailures === 1, "failure backoff");
+  failJobsRequest = false;
+  await waitFor(() => jobsPollDelayMs === JOBS_POLL_BASE_MS, "recovery after failure");
+  if (jobsPollDelayMs > JOBS_POLL_MAX_MS) throw new Error("backoff exceeded its ceiling");
   stopJobsPolling();
+  await sleep(JOBS_POLL_BASE_MS * 3);
+  const afterStop = jobCalls().length;
+  await sleep(JOBS_POLL_BASE_MS * 3);
+  if (jobCalls().length !== afterStop) throw new Error("polling continued after stopJobsPolling");
   process.stdout.write("route-scoped jobs refresh passed");
 }
 
@@ -1379,7 +1473,7 @@ main().catch(error => {
             capture_output=True,
             text=True,
             check=False,
-            timeout=10,
+            timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "route-scoped jobs refresh passed")
@@ -1590,10 +1684,11 @@ main().catch(error => {
 
     def test_timestamps_and_activity_buckets_use_browser_timezone(self):
         helpers = []
-        for name in ("fmtDate", "fmtSchedulerDate", "zonedDateKey", "buildActivityDays"):
+        for name in ("fmtDate", "fmtSchedulerDate", "browserTimezoneOffsetMinutes", "buildActivityDays"):
             helper = re.search(rf"(    function {name}\(.*?\n    \}})", self.source, re.S)
             self.assertIsNotNone(helper, name)
             helpers.append(helper.group(1))
+        self.assertNotIn("function zonedDateKey", self.source)
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
         script = "\n".join(helpers) + r'''
@@ -1619,13 +1714,19 @@ if (fmtSchedulerDate(instant, state.schedulerTimezone) !== expectedScheduler) {
   throw new Error("scheduler timestamp did not retain its configured timezone");
 }
 
+if (browserTimezoneOffsetMinutes(new Date(instant)) !== 780) {
+  throw new Error(`activity buckets did not request the browser offset: ${browserTimezoneOffsetMinutes(new Date(instant))}`);
+}
 const days = buildActivityDays([
-  { started_at: "2024-01-01T04:30:00Z", status: "failed" },
-  { started_at: "2024-01-01T05:30:00Z", status: "succeeded" },
-], new Date("2024-01-01T04:45:00Z"));
+  { date: "2023-12-31", total: 0, success: 0, failed: 0 },
+  { date: "2024-01-01", total: 2, success: 1, failed: 1 },
+]);
 const lastDay = days[days.length - 1];
-if (lastDay.total !== 2 || lastDay.failed !== 1 || lastDay.success !== 1) {
-  throw new Error(`activity chart used the wrong calendar day: ${JSON.stringify(lastDay)}`);
+if (days.length !== 2 || lastDay.total !== 2 || lastDay.failed !== 1 || lastDay.success !== 1) {
+  throw new Error(`activity chart did not keep the server buckets: ${JSON.stringify(lastDay)}`);
+}
+if (lastDay.label !== new Date("2024-01-01T00:00:00Z").toLocaleDateString("es", { timeZone: "UTC", weekday: "short" })) {
+  throw new Error(`activity chart labelled the server day incorrectly: ${lastDay.label}`);
 }
 
 state.schedulerTimezone = "Invalid/Timezone";
@@ -1662,12 +1763,14 @@ if (fmtDate(instant) !== expectedBrowser) throw new Error("event timestamp fell 
             'interactive: { cls:',
             "Desconocido",
             'data-col="origin"',
-            'sortAttrs("origin")',
+            'sortAttrs("trigger")',
             "j.trigger",
-            'Origen${sortIcon("origin")}',
+            'Origen${sortIcon("trigger")}',
             'colspan="8"',
         ):
             self.assertIn(marker, self.source)
+        self.assertNotIn('sortAttrs("origin")', self.source)
+        self.assertNotIn('sortAttrs("target")', self.source)
         trigger_info = re.search(r"function jobTriggerInfo\(trigger\) \{.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(trigger_info)
         trigger_renderer = re.search(r"function fmtJobTrigger\(trigger\) \{.*?\n    \}", self.source, re.S)
@@ -1683,36 +1786,160 @@ if (fmtDate(instant) !== expectedBrowser) throw new Error("event timestamp fell 
         self.assertIsNotNone(render_jobs)
         render_source = render_jobs.group(0)
         for marker in (
+            '<input type="text" class="dt-filter" data-col="id"',
+            '<select class="dt-filter" data-col="target"',
             '<select class="dt-filter" data-col="command"',
             '<select class="dt-filter" data-col="origin"',
             '<select class="dt-filter" data-col="status"',
             '<input type="datetime-local" class="dt-filter" data-col="started"',
             '<input type="datetime-local" class="dt-filter" data-col="finished"',
+            'aria-label="Filtrar target"',
             'aria-label="Inicio desde"',
             'placeholder="Inicio desde"',
             'aria-label="Fin hasta"',
             'placeholder="Fin hasta"',
             '<option value="">Todos</option>',
             "const uniqueJobFilterValues =",
-            "new Set(values)",
-            "j => jobFilterValue(j.command)",
-            "j => jobFilterValue(j.trigger)",
-            "j => normalizeJobStatus(j.status)",
+            "new Set(values",
+            "...JOB_COMMAND_OPTIONS",
+            "...JOB_TRIGGER_OPTIONS",
+            "status: JOB_STATUS_OPTIONS.slice()",
+            "(state.targets || []).slice().sort(",
             "jobTriggerLabel(value)",
             "jobStatusLabel(value)",
+            "targetMap[value] || value",
             "escapeHtml(value)",
             "!valueSet.has(jobsTableState.filters[column])",
             "select.value = valueSet.has(jobsTableState.filters[column])",
-            "function parseJobTimestamp(value)",
-            "startedAt === null",
-            "finishedAt === null",
-            "startedAt < startedBound",
-            "finishedAt > finishedBound",
+            "JOBS_FILTER_DEBOUNCE_MS",
+            "clearTimeout(filterDebounceTimer)",
             'input.addEventListener("input"',
             'select.addEventListener("change"',
             "jobsTableState.page = 1;",
+            "void reloadJobs();",
         ):
             self.assertIn(marker, render_source)
+        for removed in (
+            "function parseJobTimestamp(value)",
+            "startedAt < startedBound",
+            "finishedAt > finishedBound",
+            '<input type="text" class="dt-filter" data-col="target"',
+        ):
+            self.assertNotIn(removed, render_source)
+
+    def test_jobs_table_builds_server_query_and_shows_loading_before_empty_state(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        functions = []
+        for pattern in (
+            r"    let jobsTableState = .*?\n    async function reloadJobs\(\) \{.*?\n    \}",
+            r"function renderJobs\(content\) \{.*?\n    let _jobsRenderTableBody = null;",
+            r"    function clearJobsRefreshNotice\(\) \{.*?\n    function stopJobsPolling\(\) \{.*?\n    \}",
+        ):
+            match = re.search(pattern, self.source, re.S)
+            self.assertIsNotNone(match, pattern)
+            functions.append(match.group(0))
+        script = "\n\n".join(functions) + r'''
+const state = { currentView: "jobs", jobs: [], targets: [{ id: "t-2", name: "Zeta" }, { id: "t-1", name: "Alpha" }] };
+const LOG_POLL_MAX_FAILURES = 5;
+const LOG_POLL_FAILURE_WINDOW_MS = 60000;
+const escapeHtml = value => String(value);
+const normalizeJobStatus = status => status;
+const jobTriggerLabel = value => value;
+const jobStatusLabel = value => value;
+const fmtJobCommand = value => String(value);
+const fmtJobTrigger = value => String(value);
+const fmtJobStatus = value => String(value);
+const fmtDate = value => String(value || "");
+const mergeJobList = items => items;
+const toggleJobLogAccordion = () => {};
+const withBtnLoading = async (btn, fn) => fn();
+const apiPost = async () => ({});
+const confirm = () => true;
+const tbody = { attributes: {}, innerHTML: "", setAttribute(name, value) { this.attributes[name] = value; } };
+const selects = {};
+const makeSelect = () => ({ innerHTML: "", value: "" });
+const content = {
+  innerHTML: "",
+  querySelector(selector) {
+    if (selector === "#jobsTbody") return tbody;
+    const match = /select\.dt-filter\[data-col="(\w+)"\]/.exec(selector);
+    if (match) return selects[match[1]] || (selects[match[1]] = makeSelect());
+    return null;
+  },
+  querySelectorAll() { return []; },
+};
+const document = { getElementById: id => (id === "content" ? content : null) };
+const calls = [];
+let pending = [];
+const apiGet = path => {
+  calls.push(path);
+  return new Promise((resolve, reject) => pending.push({ resolve, reject }));
+};
+const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+
+async function main() {
+  const query = jobsListQuery({ page: 3, pageSize: 50, sortKey: "started_at", sortDir: "asc", filters: { id: "ab", target: "t-1", command: "backup.run", status: "failed", origin: "schedule", started: "2026-01-10T07:00", finished: "" } });
+  const params = new URLSearchParams(query);
+  const expected = { limit: "50", offset: "100", sort: "started_at", order: "asc", id: "ab", target_id: "t-1", command: "backup.run", status: "failed", trigger: "schedule", started_from: new Date("2026-01-10T07:00").toISOString() };
+  for (const [key, value] of Object.entries(expected)) {
+    if (params.get(key) !== value) throw new Error(`query param ${key} was ${params.get(key)}, expected ${value}`);
+  }
+  if (params.has("finished_to")) throw new Error("empty filters must not be sent");
+
+  renderJobs(content);
+  if (calls.length !== 1 || calls[0] !== "/api/v1/jobs?limit=25&offset=0&sort=submitted_at&order=desc") throw new Error(`initial render did not request the first page: ${JSON.stringify(calls)}`);
+  if (tbody.attributes["aria-busy"] !== "true") throw new Error("tbody was not marked busy while loading");
+  if (!tbody.innerHTML.includes("snapshot-skeleton-row")) throw new Error("loading state did not render skeleton rows");
+  if (tbody.innerHTML.includes("Sin jobs que coincidan con los filtros")) throw new Error("empty message rendered before the response arrived");
+  if (!selects.target.innerHTML.includes('<option value="t-1">Alpha</option><option value="t-2">Zeta</option>')) throw new Error(`target filter did not list targets by name: ${selects.target.innerHTML}`);
+  if (!selects.status.innerHTML.includes('<option value="in_progress">')) throw new Error("status filter lost its fixed options");
+
+  pending.shift().resolve({ items: [], total: 0 });
+  await flush();
+  if (tbody.attributes["aria-busy"] !== "false") throw new Error("tbody stayed busy after the response");
+  if (!tbody.innerHTML.includes("Sin jobs que coincidan con los filtros")) throw new Error("empty response did not render the empty state");
+  if (tbody.innerHTML.includes("snapshot-skeleton-row")) throw new Error("skeleton remained after the response");
+
+  jobsTableState.filters.status = "failed";
+  const reload = reloadJobs();
+  await flush();
+  if (tbody.attributes["aria-busy"] !== "true" || !tbody.innerHTML.includes("snapshot-skeleton-row")) throw new Error("reload did not show the loading state");
+  if (calls.length !== 2 || !calls[1].includes("status=failed")) throw new Error(`reload did not send the new filter: ${JSON.stringify(calls)}`);
+  pending.shift().resolve({ items: [{ id: "job-1234abcd", target_id: "t-1", command: "backup.run", trigger: "manual", status: "failed", started_at: "2026-01-10T07:00:00Z" }], total: 77 });
+  await reload;
+  await flush();
+  if (!tbody.innerHTML.includes("job-row-job-1234abcd")) throw new Error("page rows were not rendered after reload");
+  if (jobsListTotal !== 77) throw new Error("server total was not stored");
+
+  jobsTableState.page = 1;
+  const failing = reloadJobs();
+  await flush();
+  pending.shift().reject(new Error("boom"));
+  await failing;
+  await flush();
+  if (tbody.attributes["aria-busy"] !== "false") throw new Error("failed reload left the table busy");
+  if (!tbody.innerHTML.includes("No se pudo cargar la lista de jobs.")) throw new Error("failed reload did not explain the missing data");
+  if (tbody.innerHTML.includes("Sin jobs que coincidan con los filtros")) throw new Error("failed reload rendered the empty state as if the server had answered");
+  stopJobsPolling();
+  process.stdout.write("jobs loading state passed");
+}
+
+main().catch(error => {
+  stopJobsPolling();
+  console.error(error);
+  process.exitCode = 1;
+});
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "jobs loading state passed")
 
     def test_open_job_logs_use_sse_with_bounded_polling_fallback_for_both_panels(self):
         for marker in (

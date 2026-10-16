@@ -17,10 +17,12 @@ def line(mode="-rw-r--r--", uid=0, gid=0, size=12, path="/data/file"):
     return f"{mode} {uid} {gid} {size} 2026-01-02 03:04:05 {path}"
 
 
-def header(snapshot="073a90db", variant="filtered-first"):
+def header(snapshot="073a90db", variant="restic-0.19.1"):
     if variant == "filtered-first":
         return f"snapshot {snapshot} of [/home/user/work.txt] filtered by [] at 2024-01-21 16:51:18.474558607 +0100 CET:"
-    return f"snapshot {snapshot} of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC filtered by []:"
+    if variant == "time-first-legacy":
+        return f"snapshot {snapshot} of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC filtered by []:"
+    return f"snapshot {snapshot} of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC by restic@backup-host filtered by []:"
 
 
 class FakeProcess:
@@ -122,12 +124,29 @@ class RestoreMetadataTests(unittest.TestCase):
                 parse_restic_ls_long(output)
 
     def test_documented_header_variants_precede_records(self):
-        for snapshot, variant in (("073a90db", "filtered-first"), ("711b0bb6", "time-first")):
+        for snapshot, variant in (
+            ("073a90db", "filtered-first"),
+            ("711b0bb6", "time-first-legacy"),
+            ("85ce8467", "restic-0.19.1"),
+        ):
             with self.subTest(variant=variant):
                 evidence = parse_restic_ls_long(
                     f"{header(snapshot, variant)}\n{line(path='/data/ni\u00f1o')}", snapshot=snapshot
                 )
                 self.assertEqual([item.path for item in evidence.files], ["/data/ni\u00f1o"])
+
+    def test_restic_0191_header_with_username_and_hostname_accepts_valid_record(self):
+        output = (
+            "snapshot 85ce8467 of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC "
+            "by restic@backup-host filtered by []:\n"
+            f"{line(path='/data/file')}"
+        )
+
+        evidence = parse_restic_ls_long(output, snapshot="85ce8467")
+
+        self.assertTrue(evidence.success)
+        self.assertEqual(evidence.snapshot, "85ce8467")
+        self.assertEqual([item.path for item in evidence.files], ["/data/file"])
 
     def test_restic_long_format_accepts_sticky_directory_mode(self):
         evidence = parse_restic_ls_long(line(mode="dtrwxrwxrwx", path="/tmp"))

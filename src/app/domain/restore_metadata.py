@@ -22,7 +22,8 @@ _HEADER_TIMESTAMP = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,9})? [+-](?:[
 _RESTIC_LS_HEADER = re.compile(
     r"^snapshot (?P<snapshot>[0-9a-fA-F]{8,64}) of \[[^\]\r\n]{0,4096}\] "
     r"(?:filtered by \[[^\]\r\n]{0,4096}\] at (?P<filtered_at>" + _HEADER_TIMESTAMP + r")|"
-    r"at (?P<listed_at>" + _HEADER_TIMESTAMP + r") filtered by \[[^\]\r\n]{0,4096}\])\:$"
+    r"at (?P<listed_at>" + _HEADER_TIMESTAMP + r")"
+    r"(?: by [^@\s:\[\]]+@[^@\s:\[\]]+)? filtered by \[[^\]\r\n]{0,4096}\])\:$"
 )
 
 

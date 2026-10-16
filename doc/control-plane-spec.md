@@ -422,9 +422,27 @@ Native filesystem targets use `runtime_type: "native"`, require at least one `fi
 #### Jobs
 
 - `GET /api/v1/jobs`
+- `GET /api/v1/jobs/stats`
 - `GET /api/v1/jobs/{jobId}`
 - `GET /api/v1/jobs/{jobId}/logs`
 - `POST /api/v1/jobs/{jobId}/cancel`
+
+`GET /api/v1/jobs` siempre devuelve una página acotada y filtrada en el servidor: `{"items", "total", "limit", "offset"}`, donde `total` es el conteo tras aplicar filtros. Parámetros de consulta:
+
+| Parámetro | Valor | Default |
+|-----------|-------|---------|
+| `limit` | entero `1..200` (valores mayores se recortan a 200) | `25` |
+| `offset` | entero `>= 0` | `0` |
+| `status` | `pending`, `in_progress`, `succeeded`, `failed`, `canceled` (se normalizan `running`/`cancelled`) | — |
+| `command`, `trigger`, `target_id` | coincidencia exacta | — |
+| `id` | prefijo del id del job (insensible a mayúsculas) | — |
+| `started_from`, `finished_to` | timestamp ISO-8601 (`started_at >= from`, `finished_at <= to`) | — |
+| `sort` | `submitted_at`, `started_at`, `finished_at`, `status`, `command`, `trigger`, `target_id`, `id` | `submitted_at` |
+| `order` | `asc`, `desc` (desempate siempre por `id DESC`) | `desc` |
+
+Un parámetro inválido responde `400 {"error": "invalid <param>: ..."}`.
+
+`GET /api/v1/jobs/stats` devuelve los agregados que usa el dashboard sin listar jobs: `{"total", "by_status": {status: count}, "by_day": [{"date", "total", "success", "failed"}]}` para los últimos 7 días calendario según `started_at`. El parámetro opcional `tz_offset` (minutos respecto a UTC, `-840..840`) desplaza el corte de día al huso del cliente.
 
 #### Policies
 

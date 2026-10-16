@@ -20,6 +20,9 @@ from src.control_plane.application.ports.ports import (
     TargetRepository,
     WorkerEnrollmentRepository,
     WorkerRepository,
+    JOB_LISTING_SORT_KEYS,
+    build_job_stats,
+    job_stats_day_keys,
 )
 from src.control_plane.domain.models import (
     BackupTargetRecord,
@@ -367,6 +370,14 @@ class SQLiteRepositoryBase:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_lease_expires_at "
                 "ON jobs (status, lease_expires_at)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_target_id_submitted_at_desc "
+                "ON jobs (target_id, submitted_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_status_submitted_at_desc "
+                "ON jobs (status, submitted_at DESC)"
             )
             connection.execute(
                 "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -736,24 +747,81 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             )
             return True
 
-    def list_for_listing(self, limit: Optional[int] = None, offset: int = 0) -> Tuple[List[JobRecord], int]:
+    @staticmethod
+    def _listing_where(filters: Optional[Dict[str, Any]]) -> Tuple[str, List[Any]]:
+        clauses: List[str] = []
+        parameters: List[Any] = []
+        active = {key: value for key, value in (filters or {}).items() if value}
+        for key in ("status", "command", "trigger", "target_id"):
+            if key in active:
+                clauses.append(f"{key} = ?")
+                parameters.append(active[key])
+        if "id_prefix" in active:
+            escaped = str(active["id_prefix"]).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append("id LIKE ? ESCAPE '\\'")
+            parameters.append(f"{escaped}%")
+        if "started_from" in active:
+            clauses.append("started_at >= ?")
+            parameters.append(active["started_from"].isoformat())
+        if "finished_to" in active:
+            clauses.append("finished_at <= ?")
+            parameters.append(active["finished_to"].isoformat())
+        return (" WHERE " + " AND ".join(clauses)) if clauses else "", parameters
+
+    def list_for_listing(
+        self,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+        sort: str = "submitted_at",
+        order: str = "desc",
+    ) -> Tuple[List[JobRecord], int]:
+        if sort not in JOB_LISTING_SORT_KEYS:
+            raise ValueError(f"unsupported sort key: {sort}")
+        if order not in ("asc", "desc"):
+            raise ValueError(f"unsupported sort order: {order}")
         start = max(0, offset)
         columns = """
             id, worker_id, command, requested_by, target_id, trigger, status,
             attempt_count, submitted_at, started_at, finished_at, updated_at
         """
-        query = f"SELECT {columns} FROM jobs ORDER BY submitted_at DESC, id DESC"
-        parameters: List[int] = []
+        where, parameters = self._listing_where(filters)
+        query = f"SELECT {columns} FROM jobs{where} ORDER BY {sort} {order.upper()}, id DESC"
+        page_parameters: List[Any] = list(parameters)
         if limit is not None and limit > 0:
             query += " LIMIT ? OFFSET ?"
-            parameters.extend((limit, start))
+            page_parameters.extend((limit, start))
         elif start > 0:
             query += " LIMIT -1 OFFSET ?"
-            parameters.append(start)
+            page_parameters.append(start)
         with self._connect() as connection:
-            total = connection.execute("SELECT COUNT(*) AS total FROM jobs").fetchone()["total"]
-            rows = connection.execute(query, parameters).fetchall()
+            total = connection.execute(f"SELECT COUNT(*) AS total FROM jobs{where}", parameters).fetchone()["total"]
+            rows = connection.execute(query, page_parameters).fetchall()
         return [self._row_to_listing_job(row) for row in rows], total
+
+    def job_stats(self, tz_offset_minutes: int = 0, now: Optional[datetime] = None) -> Dict[str, Any]:
+        day_keys = job_stats_day_keys(now or datetime.utcnow(), tz_offset_minutes)
+        window_start = datetime.fromisoformat(day_keys[0]) - timedelta(minutes=tz_offset_minutes)
+        with self._connect() as connection:
+            status_rows = connection.execute("SELECT status, COUNT(*) AS total FROM jobs GROUP BY status").fetchall()
+            day_rows = connection.execute(
+                """
+                SELECT date(started_at, ?) AS day, status, COUNT(*) AS total
+                FROM jobs
+                WHERE started_at IS NOT NULL AND started_at >= ?
+                GROUP BY day, status
+                """,
+                (f"{tz_offset_minutes:+d} minutes", window_start.isoformat()),
+            ).fetchall()
+        status_counts: Dict[str, int] = {}
+        for row in status_rows:
+            status = JobStatus.normalize(row["status"])
+            status_counts[status] = status_counts.get(status, 0) + row["total"]
+        day_status_counts: Dict[Tuple[str, str], int] = {}
+        for row in day_rows:
+            key = (row["day"], JobStatus.normalize(row["status"]))
+            day_status_counts[key] = day_status_counts.get(key, 0) + row["total"]
+        return build_job_stats(sum(status_counts.values()), status_counts, day_status_counts, day_keys)
 
     @staticmethod
     def _row_to_listing_job(row: sqlite3.Row) -> JobRecord:

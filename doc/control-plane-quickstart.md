@@ -782,8 +782,10 @@ curl -X POST http://127.0.0.1:8080/api/v1/workers/<worker_id>/jobs `
 
 ### Consultar jobs
 
+El listado siempre es paginado (25 por defecto, máximo 200) y acepta filtros y orden en el servidor:
+
 ```powershell
-curl http://127.0.0.1:8080/api/v1/jobs
+curl "http://127.0.0.1:8080/api/v1/jobs?limit=50&status=failed&sort=started_at&order=desc"
 ```
 
 ## 7. Enrolamiento HMAC y transporte

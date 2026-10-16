@@ -7,7 +7,7 @@ import ssl
 import threading
 from collections import deque
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from http import cookies
 from pathlib import Path
@@ -20,6 +20,7 @@ except ImportError:
     NativeThreadingHTTPSServer = None
 
 from src.control_plane.auth import AuthService, ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER
+from src.control_plane.application.ports.ports import JOB_LISTING_SORT_KEYS
 from src.control_plane.application.services.control_plane_service import ControlPlaneService, WorkerDeletionConflict
 from src.control_plane.application.services.live_file_service import (
     LiveCursorError,
@@ -187,6 +188,81 @@ def _secret_to_public(secret):
     payload = _to_jsonable(secret)
     payload.pop("ciphertext", None)
     return payload
+
+
+JOBS_LISTING_DEFAULT_LIMIT = 25
+JOBS_LISTING_MAX_LIMIT = 200
+JOBS_LISTING_ORDERS = ("asc", "desc")
+JOBS_LISTING_STATUSES = (JobStatus.PENDING, JobStatus.IN_PROGRESS, JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELED)
+JOBS_STATS_MAX_TZ_OFFSET_MINUTES = 14 * 60
+
+
+def _query_int(qs: dict, name: str, default: int, minimum: int) -> int:
+    raw = qs.get(name, [None])[0]
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"invalid {name}: must be an integer")
+    if value < minimum:
+        raise ValueError(f"invalid {name}: must be >= {minimum}")
+    return value
+
+
+def _query_datetime(qs: dict, name: str) -> datetime | None:
+    raw = (qs.get(name, [""])[0] or "").strip()
+    if not raw:
+        return None
+    try:
+        value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"invalid {name}: expected an ISO-8601 timestamp")
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _parse_jobs_listing_query(query: str) -> dict:
+    """Parse and validate `GET /api/v1/jobs` query parameters; raises ValueError on invalid input."""
+    qs = parse_qs(query)
+    limit = min(_query_int(qs, "limit", JOBS_LISTING_DEFAULT_LIMIT, 1), JOBS_LISTING_MAX_LIMIT)
+    offset = _query_int(qs, "offset", 0, 0)
+    sort = (qs.get("sort", ["submitted_at"])[0] or "submitted_at").strip().lower()
+    if sort not in JOB_LISTING_SORT_KEYS:
+        raise ValueError(f"invalid sort: expected one of {', '.join(JOB_LISTING_SORT_KEYS)}")
+    order = (qs.get("order", ["desc"])[0] or "desc").strip().lower()
+    if order not in JOBS_LISTING_ORDERS:
+        raise ValueError("invalid order: expected asc or desc")
+    filters: dict = {}
+    status = (qs.get("status", [""])[0] or "").strip().lower()
+    if status:
+        status = JobStatus.normalize("in_progress" if status == "running" else status)
+        if status not in JOBS_LISTING_STATUSES:
+            raise ValueError(f"invalid status: expected one of {', '.join(JOBS_LISTING_STATUSES)}")
+        filters["status"] = status
+    for name in ("command", "trigger", "target_id"):
+        value = (qs.get(name, [""])[0] or "").strip()
+        if value:
+            filters[name] = value
+    id_prefix = (qs.get("id", [""])[0] or "").strip()
+    if id_prefix:
+        filters["id_prefix"] = id_prefix
+    started_from = _query_datetime(qs, "started_from")
+    if started_from:
+        filters["started_from"] = started_from
+    finished_to = _query_datetime(qs, "finished_to")
+    if finished_to:
+        filters["finished_to"] = finished_to
+    return {"limit": limit, "offset": offset, "filters": filters, "sort": sort, "order": order}
+
+
+def _parse_jobs_stats_query(query: str) -> int:
+    qs = parse_qs(query)
+    tz_offset = _query_int(qs, "tz_offset", 0, -JOBS_STATS_MAX_TZ_OFFSET_MINUTES)
+    if tz_offset > JOBS_STATS_MAX_TZ_OFFSET_MINUTES:
+        raise ValueError(f"invalid tz_offset: must be <= {JOBS_STATS_MAX_TZ_OFFSET_MINUTES}")
+    return tz_offset
 
 
 _KUBERNETES_CREDENTIAL_FIELDS = {
@@ -613,18 +689,24 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/jobs":
                 if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
                     return
-                parsed = urlparse(self.path)
-                from urllib.parse import parse_qs
-                qs = parse_qs(parsed.query)
-                limit_str = qs.get("limit", [None])[0]
-                offset_str = qs.get("offset", ["0"])[0]
                 try:
-                    limit = int(limit_str) if limit_str else None
-                    offset = int(offset_str) if offset_str else 0
-                except ValueError:
-                    limit, offset = None, 0
-                jobs, total = self._control_plane_service().list_job_views(limit=limit, offset=offset)
-                return self._write_json(200, {"items": _to_jsonable(jobs), "total": total, "limit": limit, "offset": offset}, head_only=head_only)
+                    listing = _parse_jobs_listing_query(urlparse(self.path).query)
+                except ValueError as exc:
+                    return self._write_json(400, {"error": str(exc)}, head_only=head_only)
+                jobs, total = self._control_plane_service().list_job_views(**listing)
+                return self._write_json(
+                    200,
+                    {"items": _to_jsonable(jobs), "total": total, "limit": listing["limit"], "offset": listing["offset"]},
+                    head_only=head_only,
+                )
+            if path == "/api/v1/jobs/stats":
+                if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
+                    return
+                try:
+                    tz_offset = _parse_jobs_stats_query(urlparse(self.path).query)
+                except ValueError as exc:
+                    return self._write_json(400, {"error": str(exc)}, head_only=head_only)
+                return self._write_json(200, self._control_plane_service().job_stats(tz_offset_minutes=tz_offset), head_only=head_only)
             if path == "/api/v1/targets":
                 if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
                     return

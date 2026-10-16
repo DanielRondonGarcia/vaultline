@@ -18,6 +18,9 @@ from src.control_plane.application.ports.ports import (
     TargetRepository,
     WorkerEnrollmentRepository,
     WorkerRepository,
+    apply_job_listing_query,
+    compute_job_stats,
+    paginate_job_listing,
 )
 from src.control_plane.domain.models import (
     BackupTargetRecord,
@@ -232,14 +235,18 @@ class InMemoryJobRepository(JobRepository):
             job.result_summary = summary
             return True
 
-    def list_for_listing(self, limit: Optional[int] = None, offset: int = 0) -> Tuple[List[JobRecord], int]:
-        jobs = sorted(self._items.values(), key=lambda item: (item.submitted_at, item.id), reverse=True)
+    def list_for_listing(
+        self,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+        sort: str = "submitted_at",
+        order: str = "desc",
+    ) -> Tuple[List[JobRecord], int]:
+        with self._lock:
+            jobs = apply_job_listing_query(list(self._items.values()), filters, sort, order)
         total = len(jobs)
-        start = max(0, offset)
-        if limit is not None and limit > 0:
-            jobs = jobs[start : start + limit]
-        elif start > 0:
-            jobs = jobs[start:]
+        jobs = paginate_job_listing(jobs, limit, offset)
         return [
             JobRecord(
                 id=job.id,
@@ -257,6 +264,11 @@ class InMemoryJobRepository(JobRepository):
             )
             for job in jobs
         ], total
+
+    def job_stats(self, tz_offset_minutes: int = 0, now: Optional[datetime] = None) -> Dict[str, Any]:
+        with self._lock:
+            jobs = list(self._items.values())
+        return compute_job_stats(jobs, tz_offset_minutes, now)
 
     def _reconcile_expired_leases_locked(self, now) -> int:
         interruption_log = "Worker lease expired before terminal status was reported."

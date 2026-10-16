@@ -3438,20 +3438,21 @@ class ControlPlaneService:
             "updated_at": job.updated_at,
         }
 
-    def list_job_views(self, limit: Optional[int] = None, offset: int = 0) -> tuple:
+    def list_job_views(
+        self,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+        sort: str = "submitted_at",
+        order: str = "desc",
+    ) -> tuple:
         self._reconcile_expired_jobs()
-        list_for_listing = getattr(self.job_repository, "list_for_listing", None)
-        if callable(list_for_listing):
-            jobs, total = list_for_listing(limit=limit, offset=offset)
-        else:
-            jobs = self.job_repository.list()
-            total = len(jobs)
-            start = max(0, offset)
-            if limit is not None and limit > 0:
-                jobs = jobs[start : start + limit]
-            elif start > 0:
-                jobs = jobs[start:]
+        jobs, total = self.job_repository.list_for_listing(limit=limit, offset=offset, filters=filters, sort=sort, order=order)
         return [self._job_listing_view(job) for job in jobs], total
+
+    def job_stats(self, tz_offset_minutes: int = 0) -> Dict[str, Any]:
+        self._reconcile_expired_jobs()
+        return self.job_repository.job_stats(tz_offset_minutes=tz_offset_minutes)
 
     def update_job_progress(
         self,
@@ -3622,25 +3623,6 @@ class ControlPlaneService:
 
     def list_workers(self) -> List[WorkerRecord]:
         return [self._worker_view(worker) for worker in self.worker_repository.list()]
-
-    def list_jobs(self, limit: Optional[int] = None, offset: int = 0, include_logs: bool = False, include_payload: bool = False) -> tuple:
-        self._reconcile_expired_jobs()
-        jobs = self.job_repository.list()
-        total = len(jobs)
-        result = []
-        for j in jobs:
-            if not include_logs or not include_payload:
-                j = copy.copy(j)
-                if not include_logs:
-                    j.log_lines = []
-                if not include_payload:
-                    j.payload = {}
-            result.append(j)
-        if limit is not None and limit > 0:
-            return result[offset:offset + limit], total
-        if offset > 0:
-            return result[offset:], total
-        return result, total
 
     def cancel_job(self, job_id: str) -> JobRecord:
         job = self._require_job(job_id)

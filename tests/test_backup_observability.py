@@ -346,6 +346,76 @@ class BackupObservabilityServiceTests(unittest.TestCase):
                 self.assertIsNone(all_items[0].result_summary)
                 self.assertEqual(all_items[0].log_lines, [])
 
+    @staticmethod
+    def _listing_fixture_jobs():
+        base = datetime(2026, 1, 10, 12, 0, 0)
+        return [
+            JobRecord(id="a1-succeeded", worker_id="worker-a", command="backup.run", target_id="target-a", trigger="manual", status=JobStatus.SUCCEEDED, submitted_at=base, started_at=base, finished_at=base + timedelta(minutes=5)),
+            JobRecord(id="a2-failed", worker_id="worker-a", command="restore.run", target_id="target-b", trigger="schedule", status=JobStatus.FAILED, submitted_at=base + timedelta(hours=1), started_at=base + timedelta(hours=1), finished_at=base + timedelta(hours=1, minutes=5)),
+            JobRecord(id="b3-pending", worker_id="worker-a", command="backup.run", target_id="target-a", trigger="schedule", status=JobStatus.PENDING, submitted_at=base + timedelta(hours=2)),
+            JobRecord(id="b4-cancelled", worker_id="worker-a", command="backup.run", target_id=None, trigger="automatic", status="cancelled", submitted_at=base + timedelta(hours=3), started_at=base + timedelta(hours=3)),
+        ]
+
+    def test_listing_filters_and_sort_match_across_repositories(self):
+        base = datetime(2026, 1, 10, 12, 0, 0)
+        cases = [
+            ({}, "submitted_at", "desc", ["b4-cancelled", "b3-pending", "a2-failed", "a1-succeeded"]),
+            ({"status": "failed"}, "submitted_at", "desc", ["a2-failed"]),
+            ({"status": "canceled"}, "submitted_at", "desc", ["b4-cancelled"]),
+            ({"command": "backup.run"}, "submitted_at", "asc", ["a1-succeeded", "b3-pending", "b4-cancelled"]),
+            ({"trigger": "schedule"}, "id", "asc", ["a2-failed", "b3-pending"]),
+            ({"target_id": "target-a"}, "submitted_at", "desc", ["b3-pending", "a1-succeeded"]),
+            ({"id_prefix": "A"}, "id", "desc", ["a2-failed", "a1-succeeded"]),
+            ({"id_prefix": "%"}, "id", "desc", []),
+            ({"started_from": base + timedelta(minutes=30)}, "submitted_at", "desc", ["b4-cancelled", "a2-failed"]),
+            ({"finished_to": base + timedelta(minutes=10)}, "submitted_at", "desc", ["a1-succeeded"]),
+            ({"status": "succeeded", "command": "restore.run"}, "submitted_at", "desc", []),
+            ({}, "started_at", "asc", ["b3-pending", "a1-succeeded", "a2-failed", "b4-cancelled"]),
+            ({}, "started_at", "desc", ["b4-cancelled", "a2-failed", "a1-succeeded", "b3-pending"]),
+            ({}, "finished_at", "desc", ["a2-failed", "a1-succeeded", "b4-cancelled", "b3-pending"]),
+            ({}, "status", "asc", ["b4-cancelled", "a2-failed", "b3-pending", "a1-succeeded"]),
+            ({}, "target_id", "asc", ["b4-cancelled", "b3-pending", "a1-succeeded", "a2-failed"]),
+            ({}, "trigger", "desc", ["b3-pending", "a2-failed", "a1-succeeded", "b4-cancelled"]),
+        ]
+        repositories = [InMemoryJobRepository()]
+        with tempfile.TemporaryDirectory() as directory:
+            repositories.append(SQLiteJobRepository(f"{directory}/control-plane.db"))
+            for repository in repositories:
+                for job in self._listing_fixture_jobs():
+                    repository.save(job)
+                for filters, sort, order, expected in cases:
+                    with self.subTest(repository=type(repository).__name__, filters=filters, sort=sort, order=order):
+                        items, total = repository.list_for_listing(filters=filters, sort=sort, order=order)
+                        self.assertEqual([item.id for item in items], expected)
+                        self.assertEqual(total, len(expected))
+                page, total = repository.list_for_listing(limit=1, offset=1, filters={"command": "backup.run"}, sort="submitted_at", order="asc")
+                self.assertEqual(([item.id for item in page], total), (["b3-pending"], 3))
+                with self.assertRaises(ValueError):
+                    repository.list_for_listing(sort="payload_json; DROP TABLE jobs")
+                with self.assertRaises(ValueError):
+                    repository.list_for_listing(order="sideways")
+
+    def test_job_stats_shape_matches_across_repositories(self):
+        now = datetime(2026, 1, 11, 2, 0, 0)
+        repositories = [InMemoryJobRepository()]
+        with tempfile.TemporaryDirectory() as directory:
+            repositories.append(SQLiteJobRepository(f"{directory}/control-plane.db"))
+            results = []
+            for repository in repositories:
+                for job in self._listing_fixture_jobs():
+                    repository.save(job)
+                results.append((repository.job_stats(tz_offset_minutes=0, now=now), repository.job_stats(tz_offset_minutes=-300, now=now)))
+        self.assertEqual(results[0], results[1])
+        utc_stats, bogota_stats = results[0]
+        self.assertEqual(utc_stats["total"], 4)
+        self.assertEqual(utc_stats["by_status"], {"canceled": 1, "failed": 1, "pending": 1, "succeeded": 1})
+        self.assertEqual([day["date"] for day in utc_stats["by_day"]], [f"2026-01-{index:02d}" for index in range(5, 12)])
+        self.assertEqual(utc_stats["by_day"][-2], {"date": "2026-01-10", "total": 3, "success": 1, "failed": 1})
+        self.assertEqual(utc_stats["by_day"][-1]["total"], 0)
+        self.assertEqual([day["date"] for day in bogota_stats["by_day"]], [f"2026-01-{index:02d}" for index in range(4, 11)])
+        self.assertEqual(bogota_stats["by_day"][-1], {"date": "2026-01-10", "total": 3, "success": 1, "failed": 1})
+        self.assertEqual(set(utc_stats), {"total", "by_status", "by_day"})
+
     def test_sqlite_job_indexes_are_idempotent_without_schema_version_change(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = f"{directory}/control-plane.db"
@@ -363,6 +433,8 @@ class BackupObservabilityServiceTests(unittest.TestCase):
                 connection.close()
             self.assertIn("idx_jobs_submitted_at_id_desc", indexes)
             self.assertIn("idx_jobs_status_lease_expires_at", indexes)
+            self.assertIn("idx_jobs_target_id_submitted_at_desc", indexes)
+            self.assertIn("idx_jobs_status_submitted_at_desc", indexes)
             self.assertEqual(repository.get_schema_version(), 1)
 
     def test_progress_is_owned_monotonic_bounded_and_terminal_immutable_for_memory_and_sqlite(self):
@@ -916,6 +988,129 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
         )
 
         self.assertFalse(result.success)
+
+
+class _RecordingJobsService:
+    def __init__(self):
+        self.listing_calls = []
+        self.stats_calls = []
+
+    def list_job_views(self, **kwargs):
+        self.listing_calls.append(kwargs)
+        return [], 0
+
+    def job_stats(self, tz_offset_minutes=0):
+        self.stats_calls.append(tz_offset_minutes)
+        return {"total": 0, "by_status": {}, "by_day": []}
+
+
+class JobsListingRouteTests(unittest.TestCase):
+    @staticmethod
+    def handler(path, service=None):
+        from src.control_plane.auth import ROLE_VIEWER
+        from src.control_plane.main import ControlPlaneRequestHandler
+
+        handler = object.__new__(ControlPlaneRequestHandler)
+        handler.path = path
+        handler.headers = {}
+        handler.server = SimpleNamespace(application=SimpleNamespace(control_plane_service=service or _RecordingJobsService()))
+        handler._require_auth = Mock(return_value={"role": ROLE_VIEWER})
+        handler._write_json = Mock()
+        return handler
+
+    def listing(self, query):
+        service = _RecordingJobsService()
+        handler = self.handler(f"/api/v1/jobs?{query}" if query else "/api/v1/jobs", service)
+        handler._handle_get_request(head_only=False)
+        return service, handler._write_json
+
+    def test_listing_defaults_to_a_bounded_page_sorted_by_submitted_at_desc(self):
+        service, write_json = self.listing("")
+        self.assertEqual(
+            service.listing_calls,
+            [{"limit": 25, "offset": 0, "filters": {}, "sort": "submitted_at", "order": "desc"}],
+        )
+        write_json.assert_called_once_with(200, {"items": [], "total": 0, "limit": 25, "offset": 0}, head_only=False)
+
+    def test_listing_clamps_limit_and_forwards_normalized_filters(self):
+        service, write_json = self.listing(
+            "limit=5000&offset=50&status=Cancelled&command=backup.run&trigger=schedule&target_id=target-a"
+            "&id=ab&started_from=2026-01-10T07:00:00-05:00&finished_to=2026-01-10T13:00:00Z&sort=started_at&order=ASC"
+        )
+        self.assertEqual(
+            service.listing_calls,
+            [
+                {
+                    "limit": 200,
+                    "offset": 50,
+                    "filters": {
+                        "status": "canceled",
+                        "command": "backup.run",
+                        "trigger": "schedule",
+                        "target_id": "target-a",
+                        "id_prefix": "ab",
+                        "started_from": datetime(2026, 1, 10, 12, 0, 0),
+                        "finished_to": datetime(2026, 1, 10, 13, 0, 0),
+                    },
+                    "sort": "started_at",
+                    "order": "asc",
+                }
+            ],
+        )
+        self.assertEqual(write_json.call_args.args[1]["limit"], 200)
+
+    def test_listing_rejects_invalid_parameters_with_json_error(self):
+        for query in (
+            "limit=0",
+            "limit=abc",
+            "offset=-1",
+            "sort=payload_json",
+            "order=sideways",
+            "status=exploded",
+            "started_from=yesterday",
+            "finished_to=2026-13-45",
+        ):
+            with self.subTest(query=query):
+                service, write_json = self.listing(query)
+                self.assertEqual(service.listing_calls, [])
+                status_code, payload = write_json.call_args.args
+                self.assertEqual(status_code, 400)
+                self.assertEqual(set(payload), {"error"})
+                self.assertTrue(payload["error"].startswith("invalid "))
+
+    def test_listing_requires_viewer_auth(self):
+        service = _RecordingJobsService()
+        handler = self.handler("/api/v1/jobs", service)
+        handler._require_auth = Mock(return_value=None)
+        handler._handle_get_request(head_only=False)
+        self.assertEqual(service.listing_calls, [])
+        handler._write_json.assert_not_called()
+
+    def test_stats_route_accepts_bounded_timezone_offset(self):
+        service = _RecordingJobsService()
+        handler = self.handler("/api/v1/jobs/stats?tz_offset=-300", service)
+        handler._handle_get_request(head_only=False)
+        self.assertEqual(service.stats_calls, [-300])
+        handler._write_json.assert_called_once_with(200, {"total": 0, "by_status": {}, "by_day": []}, head_only=False)
+
+        for query in ("tz_offset=900", "tz_offset=-900", "tz_offset=soon"):
+            with self.subTest(query=query):
+                service = _RecordingJobsService()
+                handler = self.handler(f"/api/v1/jobs/stats?{query}", service)
+                handler._handle_get_request(head_only=False)
+                self.assertEqual(service.stats_calls, [])
+                self.assertEqual(handler._write_json.call_args.args[0], 400)
+
+    def test_stats_route_requires_viewer_auth(self):
+        service = _RecordingJobsService()
+        handler = self.handler("/api/v1/jobs/stats", service)
+        handler._require_auth = Mock(return_value=None)
+        handler._handle_get_request(head_only=False)
+        self.assertEqual(service.stats_calls, [])
+        handler._write_json.assert_not_called()
+
+    def test_service_has_no_unbounded_job_listing_helper(self):
+        self.assertFalse(hasattr(ControlPlaneService, "list_jobs"))
 
 
 if __name__ == "__main__":

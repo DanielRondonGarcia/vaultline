@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.control_plane.domain.models import (
@@ -7,6 +8,7 @@ from src.control_plane.domain.models import (
     IndexStatusRecord,
     InventorySnapshot,
     JobRecord,
+    JobStatus,
     RetentionPolicyRecord,
     SecretRecord,
     SettingsRecord,
@@ -92,6 +94,106 @@ class TargetRepository(ABC):
         raise NotImplementedError
 
 
+JOB_LISTING_SORT_KEYS = ("submitted_at", "started_at", "finished_at", "status", "command", "trigger", "target_id", "id")
+JOB_LISTING_FILTER_KEYS = ("status", "command", "trigger", "target_id", "id_prefix", "started_from", "finished_to")
+JOB_STATS_DAY_WINDOW = 7
+
+
+def _job_matches_listing_filters(job: JobRecord, filters: Dict[str, Any]) -> bool:
+    status = filters.get("status")
+    if status and JobStatus.normalize(job.status) != status:
+        return False
+    for key in ("command", "trigger", "target_id"):
+        value = filters.get(key)
+        if value and getattr(job, key) != value:
+            return False
+    id_prefix = filters.get("id_prefix")
+    if id_prefix and not str(job.id).lower().startswith(str(id_prefix).lower()):
+        return False
+    started_from = filters.get("started_from")
+    if started_from and (job.started_at is None or job.started_at < started_from):
+        return False
+    finished_to = filters.get("finished_to")
+    if finished_to and (job.finished_at is None or job.finished_at > finished_to):
+        return False
+    return True
+
+
+def apply_job_listing_query(
+    jobs: List[JobRecord],
+    filters: Optional[Dict[str, Any]] = None,
+    sort: str = "submitted_at",
+    order: str = "desc",
+) -> List[JobRecord]:
+    """Filter and sort jobs with the same semantics as the SQL listing.
+
+    Sort keys are whitelisted, ``id DESC`` is always the tiebreak and NULL values
+    sort first ascending / last descending exactly like SQLite does.
+    """
+    if sort not in JOB_LISTING_SORT_KEYS:
+        raise ValueError(f"unsupported sort key: {sort}")
+    if order not in ("asc", "desc"):
+        raise ValueError(f"unsupported sort order: {order}")
+    active = {key: value for key, value in (filters or {}).items() if value}
+    selected = [job for job in jobs if _job_matches_listing_filters(job, active)]
+    selected.sort(key=lambda item: item.id, reverse=True)
+
+    def sort_value(item: JobRecord):
+        value = JobStatus.normalize(item.status) if sort == "status" else getattr(item, sort)
+        return (value is not None, value)
+
+    selected.sort(key=sort_value, reverse=(order == "desc"))
+    return selected
+
+
+def paginate_job_listing(jobs: List[JobRecord], limit: Optional[int], offset: int) -> List[JobRecord]:
+    start = max(0, offset)
+    if limit is not None and limit > 0:
+        return jobs[start : start + limit]
+    return jobs[start:] if start > 0 else jobs
+
+
+def job_stats_day_keys(now: datetime, tz_offset_minutes: int, days: int = JOB_STATS_DAY_WINDOW) -> List[str]:
+    today = (now + timedelta(minutes=tz_offset_minutes)).date()
+    return [(today - timedelta(days=index)).isoformat() for index in range(days - 1, -1, -1)]
+
+
+def build_job_stats(
+    total: int,
+    status_counts: Dict[str, int],
+    day_status_counts: Dict[Tuple[str, str], int],
+    day_keys: List[str],
+) -> Dict[str, Any]:
+    by_day = []
+    for day in day_keys:
+        counts = {status: count for (row_day, status), count in day_status_counts.items() if row_day == day}
+        by_day.append(
+            {
+                "date": day,
+                "total": sum(counts.values()),
+                "success": counts.get(JobStatus.SUCCEEDED, 0),
+                "failed": counts.get(JobStatus.FAILED, 0),
+            }
+        )
+    return {"total": total, "by_status": dict(sorted(status_counts.items())), "by_day": by_day}
+
+
+def compute_job_stats(jobs: List[JobRecord], tz_offset_minutes: int = 0, now: Optional[datetime] = None) -> Dict[str, Any]:
+    reference = now or datetime.utcnow()
+    day_keys = job_stats_day_keys(reference, tz_offset_minutes)
+    shift = timedelta(minutes=tz_offset_minutes)
+    status_counts: Dict[str, int] = {}
+    day_status_counts: Dict[Tuple[str, str], int] = {}
+    for job in jobs:
+        status = JobStatus.normalize(job.status)
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if job.started_at is None:
+            continue
+        key = ((job.started_at + shift).date().isoformat(), status)
+        day_status_counts[key] = day_status_counts.get(key, 0) + 1
+    return build_job_stats(len(jobs), status_counts, day_status_counts, day_keys)
+
+
 class JobRepository(ABC):
     @abstractmethod
     def save(self, job: JobRecord) -> JobRecord:
@@ -105,15 +207,19 @@ class JobRepository(ABC):
     def list(self) -> List[JobRecord]:
         raise NotImplementedError
 
-    def list_for_listing(self, limit: Optional[int] = None, offset: int = 0) -> Tuple[List[JobRecord], int]:
-        jobs = sorted(self.list(), key=lambda item: (item.submitted_at, item.id), reverse=True)
-        total = len(jobs)
-        start = max(0, offset)
-        if limit is not None and limit > 0:
-            jobs = jobs[start : start + limit]
-        elif start > 0:
-            jobs = jobs[start:]
-        return jobs, total
+    def list_for_listing(
+        self,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        filters: Optional[Dict[str, Any]] = None,
+        sort: str = "submitted_at",
+        order: str = "desc",
+    ) -> Tuple[List[JobRecord], int]:
+        jobs = apply_job_listing_query(self.list(), filters, sort, order)
+        return paginate_job_listing(jobs, limit, offset), len(jobs)
+
+    def job_stats(self, tz_offset_minutes: int = 0, now: Optional[datetime] = None) -> Dict[str, Any]:
+        return compute_job_stats(self.list(), tz_offset_minutes, now)
 
     @abstractmethod
     def claim_pending_for_worker(self, worker_id: str, lease_duration_seconds: int = 300) -> List[JobRecord]:

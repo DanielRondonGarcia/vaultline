@@ -1,7 +1,9 @@
 import os
 import pathlib
+import queue
 import subprocess
 import sys
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -286,31 +288,160 @@ class NativeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(recorded["command"], ["restic", "snapshots", "--json"])
         self.assertEqual(result["snapshots"], [{"id": "abc"}])
 
-    def test_native_runtime_timeout_terminates_process_without_waiting_long(self):
-        adapter = NativeRuntimeAdapter(timeout_seconds=0.2, python_executable=sys.executable)
+    BACKUP_PAYLOAD = {"runtime_type": "native", "filesystem_paths": ["/srv/app"], "command": "/root/backup.sh"}
+
+    @staticmethod
+    def clock(start: float, step: float):
+        """Deterministic monotonic clock: the watchdog is the only caller, one tick per read."""
+        value = start - step
+
+        def read() -> float:
+            nonlocal value
+            value += step
+            return value
+
+        return read
+
+    @staticmethod
+    def long_running_process(polls: int, emit_output: bool):
+        """A child that stays alive for ``polls`` wait cycles, optionally printing one line per cycle.
+
+        Output is pushed from the wait side effect and acknowledged through the
+        output callback, so activity is recorded before the next verdict.
+        """
+        lines: queue.Queue = queue.Queue()
+        delivered = threading.Event()
+        remaining = {"polls": polls}
         process = Mock()
-        process.stdout.readline.side_effect = ["working\n", ""]
+        process.stdout.readline.side_effect = lines.get
         process.stderr.readline.side_effect = [""]
-        process.wait.return_value = 0
         process.returncode = None
 
+        def wait(timeout=None):
+            if remaining["polls"] <= 0:
+                lines.put("")
+                return 0
+            remaining["polls"] -= 1
+            if emit_output:
+                lines.put("working\n")
+                delivered.wait(5)
+                delivered.clear()
+            raise subprocess.TimeoutExpired(["python"], timeout or 0)
+
+        def terminate():
+            remaining["polls"] = 0
+            lines.put("")
+
+        process.wait.side_effect = wait
+        process.terminate.side_effect = terminate
+        return process, (lambda _chunk: delivered.set())
+
+    def run_backup(self, adapter, process, output_callback=None, payload=None):
         with patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value=sys.executable), patch(
             "src.worker_agent.infrastructure.adapters.native_runtime.subprocess.Popen", return_value=process
-        ), patch("src.worker_agent.infrastructure.adapters.native_runtime.time.monotonic", side_effect=[100.0, 100.3]):
-            result = adapter.run_runtime_job(
-                "unused-image",
-                {"runtime_type": "native", "filesystem_paths": ["/srv/app"], "command": "/root/backup.sh"},
-            )
+        ):
+            return adapter.run_runtime_job("unused-image", payload or dict(self.BACKUP_PAYLOAD), output_callback=output_callback)
+
+    def test_native_runtime_has_no_wall_clock_unless_configured(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WORKER_RUNTIME_TIMEOUT_SECONDS", None)
+            self.assertIsNone(NativeRuntimeAdapter().timeout_seconds)
+        for raw, expected in (("", None), ("   ", None), ("abc", None), ("0", None), ("-5", None), ("1200", 1200.0)):
+            with self.subTest(env=raw), patch.dict(os.environ, {"WORKER_RUNTIME_TIMEOUT_SECONDS": raw}):
+                self.assertEqual(NativeRuntimeAdapter().timeout_seconds, expected)
+        self.assertEqual(NativeRuntimeAdapter(timeout_seconds=0.2).timeout_seconds, 0.2)
+        adapter = NativeRuntimeAdapter(timeout_seconds=600)
+        self.assertEqual(adapter._runtime_timeout({"timeout_seconds": 7200}), 7200.0)
+        self.assertEqual(adapter._runtime_timeout({"timeout_seconds": "bogus"}), 600.0)
+        self.assertIsNone(NativeRuntimeAdapter()._runtime_timeout({"timeout_seconds": "bogus"}))
+
+    def test_native_runtime_keeps_a_slow_but_talking_job_alive_without_a_wall_clock(self):
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable)
+        self.assertIsNone(adapter.timeout_seconds)
+        self.assertEqual(adapter.idle_timeout_seconds, 900.0)
+        # Ten polls, ten minutes apart: 100 minutes of (patched) wall clock, well past the old 30-minute cap.
+        adapter._monotonic = self.clock(1000.0, 600.0)
+        process, acknowledge = self.long_running_process(polls=10, emit_output=True)
+
+        result = self.run_backup(adapter, process, output_callback=acknowledge)
+
+        self.assertTrue(result["success"], result)
+        self.assertNotIn("error", result)
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    def test_native_runtime_idle_watchdog_terminates_a_silent_job_with_an_honest_message(self):
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable)
+        adapter._monotonic = self.clock(1000.0, 600.0)
+        process, _acknowledge = self.long_running_process(polls=10, emit_output=False)
+
+        result = self.run_backup(adapter, process)
 
         self.assertFalse(result["success"])
         self.assertFalse(result["canceled"])
         self.assertEqual(result["status_code"], 124)
-        self.assertIn("timed out after 0.2 seconds", result["error"])
-        process.terminate.assert_called()
+        self.assertEqual(result["error"], "native runtime produced no output for 900 seconds")
+        self.assertTrue(result["process_terminated"])
+        process.terminate.assert_called_once()
         process.kill.assert_not_called()
+
+    def test_native_runtime_idle_watchdog_can_be_disabled_and_is_clamped(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WORKER_RUNTIME_IDLE_TIMEOUT_SECONDS", None)
+            self.assertEqual(NativeRuntimeAdapter().idle_timeout_seconds, 900.0)
+        for raw, expected in (
+            ("0", None),
+            ("", None),
+            ("abc", 900.0),
+            ("-1", 900.0),
+            ("5", 30.0),
+            ("1200", 1200.0),
+            ("999999999", 86400.0),
+        ):
+            with self.subTest(env=raw), patch.dict(os.environ, {"WORKER_RUNTIME_IDLE_TIMEOUT_SECONDS": raw}):
+                self.assertEqual(NativeRuntimeAdapter().idle_timeout_seconds, expected)
+
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable, idle_timeout_seconds=0)
+        self.assertIsNone(adapter.idle_timeout_seconds)
+        adapter._monotonic = self.clock(1000.0, 3600.0)
+        process, _acknowledge = self.long_running_process(polls=5, emit_output=False)
+
+        result = self.run_backup(adapter, process)
+
+        self.assertTrue(result["success"], result)
+        process.terminate.assert_not_called()
+
+    def test_native_runtime_explicit_timeout_terminates_process_without_waiting_long(self):
+        cases = (
+            ("constructor", {}, dict(timeout_seconds=0.2)),
+            ("environment", {"WORKER_RUNTIME_TIMEOUT_SECONDS": "0.2"}, {}),
+            ("payload", {}, {}),
+        )
+        for name, environ, kwargs in cases:
+            with self.subTest(source=name), patch.dict(os.environ, environ):
+                adapter = NativeRuntimeAdapter(python_executable=sys.executable, **kwargs)
+                adapter._monotonic = self.clock(100.0, 0.3)
+                process = Mock()
+                process.stdout.readline.side_effect = ["working\n", ""]
+                process.stderr.readline.side_effect = [""]
+                process.wait.return_value = 0
+                process.returncode = None
+                payload = dict(self.BACKUP_PAYLOAD)
+                if name == "payload":
+                    payload["timeout_seconds"] = 0.2
+
+                result = self.run_backup(adapter, process, payload=payload)
+
+                self.assertFalse(result["success"])
+                self.assertFalse(result["canceled"])
+                self.assertEqual(result["status_code"], 124)
+                self.assertEqual(result["error"], "native runtime timed out after 0.2 seconds")
+                process.terminate.assert_called()
+                process.kill.assert_not_called()
 
     def test_native_runtime_timeout_reports_cleanup_failure_when_kill_wait_does_not_finish(self):
         adapter = NativeRuntimeAdapter(timeout_seconds=0.2, python_executable=sys.executable)
+        adapter._monotonic = self.clock(100.0, 0.3)
         process = Mock()
         process.stdout.readline.side_effect = ["working\n", ""]
         process.stderr.readline.side_effect = [""]
@@ -320,13 +451,7 @@ class NativeRuntimeAdapterTests(unittest.TestCase):
         ]
         process.returncode = None
 
-        with patch("src.worker_agent.infrastructure.adapters.native_runtime.shutil.which", return_value=sys.executable), patch(
-            "src.worker_agent.infrastructure.adapters.native_runtime.subprocess.Popen", return_value=process
-        ), patch("src.worker_agent.infrastructure.adapters.native_runtime.time.monotonic", side_effect=[100.0, 100.3]):
-            result = adapter.run_runtime_job(
-                "unused-image",
-                {"runtime_type": "native", "filesystem_paths": ["/srv/app"], "command": "/root/backup.sh"},
-            )
+        result = self.run_backup(adapter, process)
 
         self.assertFalse(result["success"])
         self.assertFalse(result["canceled"])

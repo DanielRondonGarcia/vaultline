@@ -447,6 +447,7 @@ class _RemoteCancellationProbe:
 class WorkerAgentService:
     MAX_LOG_LINES = 1000
     MAX_LOG_CHARS = 4 * 1024 * 1024
+    MAX_RESULT_ERROR_CHARS = 2048
     MAX_SNAPSHOT_METADATA_LOG_CHARS = DockerRuntimeAdapter.MAX_SNAPSHOT_METADATA_LOG_BYTES
     MAX_SNAPSHOT_ENTRIES = 10_000
     MAX_LIVE_POLL_REQUESTS = 16
@@ -1754,6 +1755,13 @@ class WorkerAgentService:
         combined = self._safe_job_text(payload, combined)[: self.MAX_LOG_CHARS]
         return combined.strip().splitlines()[-self.MAX_LOG_LINES :]
 
+    def _runtime_stop_error(self, payload: Dict[str, Any], summary: Dict[str, Any]) -> str:
+        """The runtime's own stop reason (wall clock, silence, cleanup) when it is not already in the logs."""
+        error = summary.get("error")
+        if not isinstance(error, str) or not error or error in (summary.get("stderr"), summary.get("logs")):
+            return ""
+        return self._safe_job_text(payload, error)[: self.MAX_RESULT_ERROR_CHARS]
+
     def _cancel_probe_interval(self) -> float:
         raw = os.environ.get("WORKER_CANCEL_PROBE_INTERVAL_SECONDS")
         try:
@@ -2052,7 +2060,10 @@ class WorkerAgentService:
                     result_summary["storage_context"] = storage_context
                 if progress_reporter and progress_reporter.latest_progress:
                     result_summary["progress"] = dict(progress_reporter.latest_progress)
-                log_lines = self._bounded_log_lines(payload, summary.get("logs"), summary.get("stderr"))
+                stop_error = self._runtime_stop_error(payload, summary)
+                if stop_error:
+                    result_summary["error"] = stop_error
+                log_lines = self._bounded_log_lines(payload, summary.get("logs"), summary.get("stderr"), stop_error)
                 if context_line := self._storage_context_log_line(payload):
                     log_lines = [context_line] + log_lines
                 return WorkerJobExecutionResult(
@@ -2118,14 +2129,18 @@ class WorkerAgentService:
                     cancel_check,
                     progress_reporter.callback if progress_reporter else None,
                 )
+                retention_summary = {
+                    "status_code": summary.get("status_code"),
+                    "target_id": payload.get("target_id"),
+                    "retention_command": payload.get("command"),
+                }
+                stop_error = self._runtime_stop_error(payload, summary)
+                if stop_error:
+                    retention_summary["error"] = stop_error
                 return WorkerJobExecutionResult(
                     status=self._runtime_status(summary),
-                    result_summary={
-                        "status_code": summary.get("status_code"),
-                        "target_id": payload.get("target_id"),
-                        "retention_command": payload.get("command"),
-                    },
-                    log_lines=self._bounded_log_lines(payload, summary.get("logs"), summary.get("stderr")),
+                    result_summary=retention_summary,
+                    log_lines=self._bounded_log_lines(payload, summary.get("logs"), summary.get("stderr"), stop_error),
                 )
 
             if command in ("restore.dry_run", "restore.run"):

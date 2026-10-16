@@ -13,6 +13,7 @@ from typing import Any, Callable, Dict, Iterable, List
 from src.worker_agent.application.policies.runtime_command_policy import RuntimeCommandPolicy
 from src.worker_agent.application.ports.runtime_port import RuntimePort
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
+from src.worker_agent.infrastructure.adapters.runtime_watchdog import RuntimeWatchdog
 from src.restic_executable import resolve_restic_executable, restic_subprocess_environment
 from src.rclone_executable import resolve_rclone_executable
 
@@ -40,7 +41,9 @@ class NativeRuntimeAdapter(RuntimePort):
     """Run backup/runtime commands directly on the worker host."""
 
     runtime_kind = "native"
-    DEFAULT_RUNTIME_TIMEOUT_SECONDS = 1800.0
+    MAX_RUNTIME_TIMEOUT_SECONDS = DockerRuntimeAdapter.MAX_RUNTIME_TIMEOUT_SECONDS
+    DEFAULT_IDLE_TIMEOUT_SECONDS = DockerRuntimeAdapter.DEFAULT_IDLE_TIMEOUT_SECONDS
+    WAIT_POLL_INTERVAL_SECONDS = 0.1
     MAX_LOG_BYTES = DockerRuntimeAdapter.MAX_LOG_BYTES
     MAX_DUMP_BYTES = DockerRuntimeAdapter.MAX_DUMP_BYTES
     MAX_ZIP_BYTES = DockerRuntimeAdapter.MAX_ZIP_BYTES
@@ -51,28 +54,42 @@ class NativeRuntimeAdapter(RuntimePort):
     _STATS_FIELD_PATTERN = DockerRuntimeAdapter._STATS_FIELD_PATTERN
     _SECRET_ENV_MARKERS = DockerRuntimeAdapter._SECRET_ENV_MARKERS
 
-    def __init__(self, timeout_seconds: float | None = None, python_executable: str | None = None):
+    def __init__(
+        self,
+        timeout_seconds: float | None = None,
+        python_executable: str | None = None,
+        idle_timeout_seconds: float | None = None,
+    ):
         self.timeout_seconds = self._validated_timeout(
-            timeout_seconds if timeout_seconds is not None else os.environ.get(
-                "WORKER_RUNTIME_TIMEOUT_SECONDS", self.DEFAULT_RUNTIME_TIMEOUT_SECONDS
+            timeout_seconds if timeout_seconds is not None else DockerRuntimeAdapter._env_timeout(
+                "WORKER_RUNTIME_TIMEOUT_SECONDS"
             ),
-            self.DEFAULT_RUNTIME_TIMEOUT_SECONDS,
+            None,
+        )
+        self.idle_timeout_seconds = DockerRuntimeAdapter._validated_idle_timeout(
+            idle_timeout_seconds if idle_timeout_seconds is not None else os.environ.get(
+                "WORKER_RUNTIME_IDLE_TIMEOUT_SECONDS"
+            ),
+            self.DEFAULT_IDLE_TIMEOUT_SECONDS,
         )
         self.python_executable = python_executable or sys.executable
         self.no_lock = os.environ.get("SNAPSHOT_EXPLORER_NO_LOCK", "").strip().lower() in {"1", "true", "yes", "on"}
 
+    _monotonic = staticmethod(time.monotonic)
+
     @classmethod
-    def _validated_timeout(cls, value: Any, default: float) -> float:
+    def _validated_timeout(cls, value: Any, default: float | None) -> float | None:
+        """Explicit wall-clock values are validated; anything else falls back to ``default``."""
         try:
             timeout = float(value)
         except (TypeError, ValueError):
-            return float(default)
-        if not math.isfinite(timeout) or timeout <= 0 or timeout > 24 * 60 * 60:
-            return float(default)
+            return default
+        if not math.isfinite(timeout) or timeout <= 0 or timeout > cls.MAX_RUNTIME_TIMEOUT_SECONDS:
+            return default
         return timeout
 
-    def _runtime_timeout(self, payload: Dict[str, Any]) -> float:
-        return self._validated_timeout(payload.get("timeout_seconds"), float(self.timeout_seconds))
+    def _runtime_timeout(self, payload: Dict[str, Any]) -> float | None:
+        return self._validated_timeout(payload.get("timeout_seconds"), self.timeout_seconds)
 
     @classmethod
     def _payload_secrets(cls, payload: Dict[str, Any]) -> set[str]:
@@ -349,6 +366,9 @@ class NativeRuntimeAdapter(RuntimePort):
         )
         stdout_parts: list[Any] = []
         stderr_parts: list[Any] = []
+        watchdog = RuntimeWatchdog(
+            self._runtime_timeout(payload), self.idle_timeout_seconds, cancel_check, clock=self._monotonic
+        )
 
         def consume(stream, parts: list[Any], emit: bool) -> None:
             if stream is None:
@@ -357,6 +377,7 @@ class NativeRuntimeAdapter(RuntimePort):
                 chunk = stream.readline()
                 if chunk in ("", b""):
                     break
+                watchdog.record_activity()
                 parts.append(chunk)
                 if emit and output_callback is not None:
                     safe = self._redact(chunk, secrets)
@@ -366,34 +387,24 @@ class NativeRuntimeAdapter(RuntimePort):
         stdout_thread = threading.Thread(target=consume, args=(process.stdout, stdout_parts, not binary), daemon=True)
         stderr_thread = threading.Thread(target=consume, args=(process.stderr, stderr_parts, not binary), daemon=True)
         stdout_thread.start(); stderr_thread.start()
-        canceled = False
-        timed_out = False
         process_terminated = True
         cleanup_error = ""
-        timeout = self._runtime_timeout(payload)
-        deadline = time.monotonic() + timeout
         while True:
-            if self._callback_is_true(cancel_check):
-                canceled = True
-                try:
-                    process.terminate()
-                except Exception:
-                    pass
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
+            stop_reason = watchdog.verdict()
+            if stop_reason:
                 try:
                     process.terminate()
                 except Exception:
                     pass
                 break
             try:
-                return_code = process.wait(timeout=min(0.1, remaining))
+                return_code = process.wait(timeout=watchdog.poll_interval(self.WAIT_POLL_INTERVAL_SECONDS))
                 break
             except subprocess.TimeoutExpired:
                 continue
-        if canceled or timed_out:
+        canceled = stop_reason == RuntimeWatchdog.CANCELED
+        timed_out = bool(stop_reason) and not canceled
+        if stop_reason:
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -414,7 +425,7 @@ class NativeRuntimeAdapter(RuntimePort):
                 cleanup_error = f"could not confirm process termination: {exc}"
             return_code = 130 if canceled else 124
         stdout_thread.join(timeout=2); stderr_thread.join(timeout=2)
-        timeout_error = f"native runtime timed out after {timeout:g} seconds" if timed_out else ""
+        timeout_error = watchdog.describe(stop_reason, "native runtime") if timed_out else ""
         if cleanup_error:
             timeout_error = f"{timeout_error}; {cleanup_error}" if timeout_error else cleanup_error
         if binary:

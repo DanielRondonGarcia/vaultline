@@ -59,12 +59,14 @@ class RuntimeProcessBoundaryTests(unittest.TestCase):
         payload = self.secret_payload()
         payload["command"] = "/root/backup.sh"
         payload["timeout_seconds"] = 1
+        clock = iter((100.0, 100.5, 101.0))
+        runtime._monotonic = lambda: next(clock)
         with patch("src.worker_agent.infrastructure.adapters.docker_runtime.os.path.exists", return_value=False):
             result = runtime.run_runtime_job("runtime", payload)
         self.assertFalse(result["success"])
         self.assertEqual(result["status_code"], 124)
         self.assertIn("timed out", result["error"])
-        container.wait.assert_called_once_with(timeout=1.0)
+        container.wait.assert_called_once_with(timeout=0.5)
         container.remove.assert_called_once_with(force=True)
         self.assertEqual(len(observed_sources), 2)
         self.assertTrue(all(not os.path.exists(source) for source in observed_sources))

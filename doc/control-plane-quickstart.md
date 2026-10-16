@@ -198,6 +198,8 @@ Variables útiles del Worker:
 - `WORKER_HEALTH_PORT`
 - `WORKER_CREDENTIAL_FILE`
 - `CONTROL_PLANE_CA_FILE`
+- `WORKER_RUNTIME_IDLE_TIMEOUT_SECONDS`: watchdog de inactividad para los runtimes Docker y nativo. Si el proceso de backup no emite ninguna salida (stdout/stderr) durante este tiempo, el worker lo termina y el job falla con `runtime produced no output for N seconds`. Por defecto `900`; se acota entre `30` y `86400`; `0` o vacío lo desactiva. Restic emite una línea de estado por segundo, así que un backup lento pero vivo nunca lo dispara.
+- `WORKER_RUNTIME_TIMEOUT_SECONDS`: límite opcional de duración total (wall clock) por job. **Sin valor por defecto**: un backup de varias horas se mantiene `in_progress` mientras siga produciendo salida. Defínelo solo si necesitas un tope absoluto (máximo `86400`); el job falla con `runtime timed out after N seconds`. Los restores conservan su propio límite (`timeout_seconds` en el payload, 6 h por defecto).
 
 ### Worker nativo empaquetado (V2 seguro)
 

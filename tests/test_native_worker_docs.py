@@ -146,6 +146,28 @@ class NativeWorkerDocsTests(unittest.TestCase):
         # The install section links to the entry instead of repeating it.
         self.assertIn("(#defender-termina-rclone-a-mitad-del-backup)", self.quickstart)
 
+    def test_docs_describe_idle_watchdog_and_optional_wall_clock_consistently(self):
+        from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
+        from src.worker_agent.infrastructure.adapters.native_runtime import NativeRuntimeAdapter
+
+        self.assertEqual(NativeRuntimeAdapter.DEFAULT_IDLE_TIMEOUT_SECONDS, 900.0)
+        self.assertEqual(DockerRuntimeAdapter.DEFAULT_IDLE_TIMEOUT_SECONDS, 900.0)
+        self.assertFalse(hasattr(NativeRuntimeAdapter, "DEFAULT_RUNTIME_TIMEOUT_SECONDS"))
+        self.assertFalse(hasattr(DockerRuntimeAdapter, "DEFAULT_RUNTIME_TIMEOUT_SECONDS"))
+
+        env_example = (ROOT / "packaging" / "debian" / "usr" / "share" / "doc" / "vaultline-worker" / "worker.env.example").read_text(encoding="utf-8")
+        for document, name in ((self.quickstart, "quickstart"), (self.readme, "readme"), (env_example, "worker.env.example")):
+            with self.subTest(document=name):
+                self.assertIn("WORKER_RUNTIME_IDLE_TIMEOUT_SECONDS", document)
+                self.assertIn("WORKER_RUNTIME_TIMEOUT_SECONDS", document)
+                self.assertIn("900", document)
+        self.assertIn("runtime produced no output for N seconds", self.quickstart)
+        self.assertIn("runtime timed out after N seconds", self.quickstart)
+        self.assertIn("**Sin valor por defecto**", self.quickstart)
+        self.assertIn("backups are not capped by a wall clock", self.readme)
+        self.assertIn("#WORKER_RUNTIME_TIMEOUT_SECONDS=", env_example)
+        self.assertNotIn("1800", self.quickstart)
+
     def test_readme_links_to_native_worker_package_guidance_concisely(self):
         self.assertIn("packaged native worker guide", self.readme)
         self.assertIn("doc/control-plane-quickstart.md#worker-nativo-empaquetado-v2-seguro", self.readme)

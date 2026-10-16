@@ -475,10 +475,22 @@ class DockerRuntimeSafetyTests(unittest.TestCase):
             with self.subTest(command=command), self.assertRaises(ValueError):
                 DockerRuntimeAdapter._runtime_command_argv(command)
 
+    @staticmethod
+    def clock(start: float, step: float):
+        value = start - step
+
+        def read() -> float:
+            nonlocal value
+            value += step
+            return value
+
+        return read
+
     def test_timeout_stops_then_removes_only_the_request_container(self):
         container = self.container()
         container.wait.side_effect = TimeoutError("container wait timed out")
         runtime = self.runtime(container)
+        runtime._monotonic = self.clock(100.0, 0.6)
 
         result = runtime.run_runtime_job(
             "runtime",
@@ -487,46 +499,123 @@ class DockerRuntimeSafetyTests(unittest.TestCase):
 
         self.assertFalse(result["success"])
         self.assertEqual(result["status_code"], 124)
+        self.assertEqual(result["error"], "runtime timed out after 1 seconds")
         container.stop.assert_called_once_with(timeout=1)
         container.remove.assert_called_once_with(force=True)
 
-    def test_restore_uses_operation_timeout_without_changing_backup_default(self):
-        restore_container = self.container()
-        restore_runtime = self.runtime(restore_container)
+    def test_restore_keeps_its_default_wall_clock_while_backups_have_none(self):
+        runtime = self.runtime(self.container())
+        runtime.timeout_seconds = None
+        restore_timeout = runtime._prepare_runtime(
+            {"command": "/root/backup.sh", "environment": {"RESTORE_MODE": "true"}}, binary=False
+        )[4]
+        backup_timeout = runtime._prepare_runtime({"command": "/root/backup.sh"}, binary=False)[4]
 
-        restore_result = restore_runtime.run_runtime_job(
-            "runtime",
-            {
-                "command": "/root/backup.sh",
-                "environment": {"RESTORE_MODE": "true"},
-            },
-        )
+        self.assertEqual(restore_timeout, DockerRuntimeAdapter.DEFAULT_RESTORE_RUNTIME_TIMEOUT_SECONDS)
+        self.assertIsNone(backup_timeout)
 
-        self.assertTrue(restore_result["success"])
-        restore_container.wait.assert_called_once_with(
-            timeout=DockerRuntimeAdapter.DEFAULT_RESTORE_RUNTIME_TIMEOUT_SECONDS
-        )
+        with patch.dict(os.environ, {"WORKER_RUNTIME_TIMEOUT_SECONDS": "", "WORKER_RUNTIME_IDLE_TIMEOUT_SECONDS": "0"}), patch(
+            "src.worker_agent.infrastructure.adapters.docker_runtime.docker", None
+        ):
+            adapter = DockerRuntimeAdapter()
+        self.assertIsNone(adapter.timeout_seconds)
+        self.assertIsNone(adapter.idle_timeout_seconds)
+        with patch.dict(os.environ, {"WORKER_RUNTIME_TIMEOUT_SECONDS": "1200", "WORKER_RUNTIME_IDLE_TIMEOUT_SECONDS": "5"}), patch(
+            "src.worker_agent.infrastructure.adapters.docker_runtime.docker", None
+        ):
+            adapter = DockerRuntimeAdapter()
+        self.assertEqual(adapter.timeout_seconds, "1200")
+        self.assertEqual(adapter._prepare_runtime({"command": "/root/backup.sh"}, binary=False)[4], 1200.0)
+        self.assertEqual(adapter.idle_timeout_seconds, DockerRuntimeAdapter.MIN_IDLE_TIMEOUT_SECONDS)
 
-        backup_container = self.container()
-        backup_runtime = self.runtime(backup_container)
-        backup_result = backup_runtime.run_runtime_job("runtime", {"command": "/root/backup.sh"})
+    def test_streaming_container_outlives_the_old_wall_clock_without_an_explicit_timeout(self):
+        polls = {"remaining": 10}
+        delivered = threading.Event()
+        released = threading.Event()
 
-        self.assertTrue(backup_result["success"])
-        backup_container.wait.assert_called_once_with(timeout=30.0)
+        class Stream:
+            def __iter__(self):
+                while polls["remaining"] > 0:
+                    yield b"status\n"
+                    delivered.set()
+                    released.wait(5)
+                    released.clear()
+
+        container = self.container()
+        container.logs.return_value = Stream()
+
+        def wait(timeout=None):
+            if polls["remaining"] <= 0:
+                return {"StatusCode": 0}
+            self.assertTrue(delivered.wait(5))
+            delivered.clear()
+            polls["remaining"] -= 1
+            released.set()
+            raise TimeoutError("container wait timed out")
+
+        container.wait.side_effect = wait
+        runtime = self.runtime(container)
+        runtime.timeout_seconds = None
+        runtime._monotonic = self.clock(1000.0, 600.0)
+
+        result = runtime.run_runtime_job("runtime", {"command": "/root/backup.sh"})
+
+        self.assertTrue(result["success"], result)
+        container.stop.assert_not_called()
+        container.remove.assert_called_once_with(force=True)
+
+    def test_silent_container_is_stopped_by_the_idle_watchdog_with_an_honest_message(self):
+        container = self.container()
+        container.logs.return_value = iter([])
+        container.wait.side_effect = TimeoutError("container wait timed out")
+        runtime = self.runtime(container)
+        runtime.timeout_seconds = None
+        runtime._monotonic = self.clock(1000.0, 600.0)
+
+        result = runtime.run_runtime_job("runtime", {"command": "/root/backup.sh"})
+
+        self.assertFalse(result["success"])
+        self.assertEqual(result["status_code"], 124)
+        self.assertEqual(result["error"], "runtime produced no output for 900 seconds")
+        container.stop.assert_called_once_with(timeout=1)
+        container.remove.assert_called_once_with(force=True)
+
+    def test_binary_jobs_have_no_idle_watchdog_but_honor_explicit_timeouts(self):
+        container = self.container(attach_output=(b"payload", b""))
+        container.wait.side_effect = TimeoutError("container wait timed out")
+        runtime = self.runtime(container)
+        runtime.timeout_seconds = None
+        runtime._monotonic = self.clock(1000.0, 1800.0)
+        polls = iter(range(3))
+
+        def wait(timeout=None):
+            if next(polls, None) is None:
+                return {"StatusCode": 0}
+            raise TimeoutError("container wait timed out")
+
+        container.wait.side_effect = wait
+        result = runtime.run_runtime_job_binary("runtime", {"command": "restic dump abcdef12 /file"})
+        self.assertTrue(result["success"], result)
+
+        bounded = self.container(attach_output=(b"payload", b""))
+        bounded.wait.side_effect = TimeoutError("container wait timed out")
+        bounded_runtime = self.runtime(bounded)
+        bounded_runtime._monotonic = self.clock(1000.0, 30.0)
+        result = bounded_runtime.run_runtime_job_binary("runtime", {"command": "restic dump abcdef12 /file", "timeout_seconds": 20})
+        self.assertFalse(result["success"])
+        self.assertEqual(result["error"], "runtime timed out after 20 seconds")
 
     def test_restore_timeout_can_be_overridden_but_remains_bounded(self):
         runtime = self.runtime(self.container())
-        result = runtime.run_runtime_job(
-            "runtime",
-            {
-                "command": "/root/backup.sh",
-                "environment": {"RESTORE_MODE": "true"},
-                "timeout_seconds": 7200,
-            },
-        )
+        payload = {
+            "command": "/root/backup.sh",
+            "environment": {"RESTORE_MODE": "true"},
+            "timeout_seconds": 7200,
+        }
+        result = runtime.run_runtime_job("runtime", payload)
 
         self.assertTrue(result["success"])
-        self.assertEqual(runtime.client.containers.run.return_value.wait.call_args.kwargs["timeout"], 7200.0)
+        self.assertEqual(runtime._prepare_runtime(payload, binary=False)[4], 7200.0)
 
         for invalid in (True, 0, DockerRuntimeAdapter.MAX_RUNTIME_TIMEOUT_SECONDS + 1):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
@@ -1094,6 +1183,45 @@ class WorkerReadPathTests(unittest.TestCase):
         result = service.execute_job({"command": "restore.run", "payload": {}})
 
         self.assertEqual(result.log_lines, ["Restore runtime failed without logs."])
+
+    def test_backup_result_carries_the_runtime_stop_reason_without_duplicating_stderr(self):
+        runtime = Mock()
+        service = WorkerAgentService(
+            WorkerAgentConfig("http://control-plane", "worker", "host", worker_id="worker"),
+            Mock(),
+            runtime,
+        )
+        payload = {"target_id": "target-1", "command": "/root/backup.sh"}
+
+        runtime.run_runtime_job.return_value = {
+            "success": False,
+            "status_code": 124,
+            "logs": '{"message_type":"status","percent_done":0.4}',
+            "stderr": "",
+            "canceled": False,
+            "process_terminated": True,
+            "error": "native runtime produced no output for 900 seconds",
+        }
+        for command in ("backup.run", "retention.run"):
+            with self.subTest(command=command):
+                result = service.execute_job({"id": "job-1", "command": command, "payload": payload})
+                self.assertEqual(result.status, JobStatus.FAILED)
+                self.assertEqual(result.result_summary["status_code"], 124)
+                self.assertEqual(result.result_summary["error"], "native runtime produced no output for 900 seconds")
+                self.assertEqual(result.log_lines[-1], "native runtime produced no output for 900 seconds")
+
+        runtime.run_runtime_job.return_value = {
+            "success": False,
+            "status_code": 1,
+            "logs": "",
+            "stderr": "Fatal: repository does not exist",
+            "canceled": False,
+            "error": "Fatal: repository does not exist",
+        }
+        result = service.execute_job({"id": "job-2", "command": "backup.run", "payload": payload})
+        self.assertEqual(result.status, JobStatus.FAILED)
+        self.assertNotIn("error", result.result_summary)
+        self.assertEqual(result.log_lines, ["Fatal: repository does not exist"])
 
     def test_worker_renews_long_running_job_when_client_supports_it(self):
         class Client:

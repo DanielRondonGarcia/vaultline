@@ -12,6 +12,7 @@ import logging
 
 from src.worker_agent.application.policies.runtime_command_policy import RuntimeCommandPolicy
 from src.worker_agent.application.ports.runtime_port import RuntimePort
+from src.worker_agent.infrastructure.adapters.runtime_watchdog import RuntimeWatchdog
 
 try:
     import docker
@@ -23,9 +24,12 @@ logger = logging.getLogger(__name__)
 
 class DockerRuntimeAdapter(RuntimePort):
     runtime_kind = "docker"
-    DEFAULT_RUNTIME_TIMEOUT_SECONDS = 1800.0
     DEFAULT_RESTORE_RUNTIME_TIMEOUT_SECONDS = 6 * 60 * 60
     MAX_RUNTIME_TIMEOUT_SECONDS = 24 * 60 * 60
+    DEFAULT_IDLE_TIMEOUT_SECONDS = 900.0
+    MIN_IDLE_TIMEOUT_SECONDS = 30.0
+    MAX_IDLE_TIMEOUT_SECONDS = MAX_RUNTIME_TIMEOUT_SECONDS
+    WAIT_POLL_INTERVAL_SECONDS = 0.5
     DEFAULT_CACHE_DIR = "/var/cache/restic-explorer"
     CACHE_MOUNT_PATH = "/root/.cache/restic"
     RUNTIME_TEMPORARY_LABEL = "docker-volume-backup.runtime.temporary"
@@ -63,12 +67,18 @@ class DockerRuntimeAdapter(RuntimePort):
         r"(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
     )
 
-    def __init__(self, timeout_seconds: float | None = None):
-        self.timeout_seconds = timeout_seconds if timeout_seconds is not None else os.environ.get(
-            "WORKER_RUNTIME_TIMEOUT_SECONDS", str(self.DEFAULT_RUNTIME_TIMEOUT_SECONDS)
+    def __init__(self, timeout_seconds: float | None = None, idle_timeout_seconds: float | None = None):
+        self.timeout_seconds = timeout_seconds if timeout_seconds is not None else self._env_timeout(
+            "WORKER_RUNTIME_TIMEOUT_SECONDS"
         )
         self.restore_timeout_seconds = os.environ.get(
             "WORKER_RESTORE_RUNTIME_TIMEOUT_SECONDS", str(self.DEFAULT_RESTORE_RUNTIME_TIMEOUT_SECONDS)
+        )
+        self.idle_timeout_seconds = self._validated_idle_timeout(
+            idle_timeout_seconds if idle_timeout_seconds is not None else os.environ.get(
+                "WORKER_RUNTIME_IDLE_TIMEOUT_SECONDS"
+            ),
+            self.DEFAULT_IDLE_TIMEOUT_SECONDS,
         )
         self.no_lock = self._env_flag("SNAPSHOT_EXPLORER_NO_LOCK")
         self.cache_dir = os.environ.get("SNAPSHOT_EXPLORER_CACHE_DIR") or None
@@ -87,8 +97,18 @@ class DockerRuntimeAdapter(RuntimePort):
             return default
         return raw.strip().lower() in {"1", "true", "yes", "on"}
 
+    @staticmethod
+    def _env_timeout(name: str) -> str | None:
+        """An unset or empty timeout variable means the job has no wall-clock limit."""
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return None
+        return raw
+
     @classmethod
-    def _timeout_seconds(cls, value: Any) -> float:
+    def _timeout_seconds(cls, value: Any) -> float | None:
+        if value is None:
+            return None
         if isinstance(value, bool):
             raise ValueError("runtime timeout_seconds must be a finite positive number")
         try:
@@ -98,6 +118,30 @@ class DockerRuntimeAdapter(RuntimePort):
         if not math.isfinite(timeout) or timeout <= 0 or timeout > cls.MAX_RUNTIME_TIMEOUT_SECONDS:
             raise ValueError("runtime timeout_seconds is outside the permitted bounds")
         return timeout
+
+    @classmethod
+    def _validated_idle_timeout(cls, value: Any, default: float | None) -> float | None:
+        """Idle timeout: ``None`` keeps the default, ``0`` or empty disables, others are clamped."""
+        if value is None:
+            return default
+        if isinstance(value, str) and not value.strip():
+            return None
+        if isinstance(value, bool):
+            return default
+        try:
+            idle = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(idle) or idle < 0:
+            return default
+        if idle == 0:
+            return None
+        return min(cls.MAX_IDLE_TIMEOUT_SECONDS, max(cls.MIN_IDLE_TIMEOUT_SECONDS, idle))
+
+    def _idle_timeout(self) -> float | None:
+        return getattr(self, "idle_timeout_seconds", self.DEFAULT_IDLE_TIMEOUT_SECONDS)
+
+    _monotonic = staticmethod(time.monotonic)
 
     @classmethod
     def _is_restore_payload(cls, payload: Dict[str, Any], command: List[str]) -> bool:
@@ -111,7 +155,7 @@ class DockerRuntimeAdapter(RuntimePort):
     def _default_runtime_timeout(self, payload: Dict[str, Any], command: List[str]) -> Any:
         if self._is_restore_payload(payload, command):
             return getattr(self, "restore_timeout_seconds", self.DEFAULT_RESTORE_RUNTIME_TIMEOUT_SECONDS)
-        return getattr(self, "timeout_seconds", self.DEFAULT_RUNTIME_TIMEOUT_SECONDS)
+        return getattr(self, "timeout_seconds", None)
 
     @classmethod
     def _runtime_command_argv(cls, command: Any) -> List[str]:
@@ -701,26 +745,20 @@ class DockerRuntimeAdapter(RuntimePort):
     def _wait_for_container(
         self,
         container: Any,
-        timeout: float,
-        cancel_check: Callable[[], bool] | None = None,
-    ) -> tuple[Dict[str, Any] | None, bool]:
-        if cancel_check is None:
-            return container.wait(timeout=timeout), False
-
-        deadline = time.monotonic() + timeout
+        watchdog: RuntimeWatchdog,
+    ) -> tuple[Dict[str, Any] | None, str | None]:
+        """Poll the container until it exits or the watchdog names a stop reason."""
         while True:
-            if self._callback_is_true(cancel_check):
-                return None, True
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("container wait timed out")
+            stop_reason = watchdog.verdict()
+            if stop_reason:
+                return None, stop_reason
             try:
-                result = container.wait(timeout=min(0.5, remaining))
+                result = container.wait(timeout=watchdog.poll_interval(self.WAIT_POLL_INTERVAL_SECONDS))
             except Exception as exc:
                 if self._is_timeout_error(exc):
                     continue
                 raise
-            return result, False
+            return result, None
 
     @staticmethod
     def _iter_output_chunks(stream: Any):
@@ -742,6 +780,7 @@ class DockerRuntimeAdapter(RuntimePort):
         secrets: set[str],
         limit: int,
         output_callback: Callable[[str], None] | None,
+        on_activity: Callable[[], None] | None = None,
     ) -> tuple[Dict[str, Any], threading.Thread]:
         state: Dict[str, Any] = {
             "started": False,
@@ -791,6 +830,8 @@ class DockerRuntimeAdapter(RuntimePort):
                 state["stream"] = stream
                 state["started"] = True
                 for chunk in self._iter_output_chunks(stream):
+                    if on_activity is not None:
+                        on_activity()
                     raw = chunk if isinstance(chunk, bytes) else str(chunk or "").encode("utf-8", errors="replace")
                     if raw_size >= limit:
                         state["exceeded"] = True
@@ -1304,23 +1345,20 @@ class DockerRuntimeAdapter(RuntimePort):
                 remove=False,
                 labels=self._runtime_container_labels(payload),
             )
+            watchdog = RuntimeWatchdog(timeout, self._idle_timeout(), cancel_check, clock=self._monotonic)
             stream_state, stream_thread = self._start_log_stream(
                 container,
                 secrets,
                 output_limit,
                 output_callback,
+                on_activity=watchdog.record_activity,
             )
-            try:
-                result, canceled = self._wait_for_container(container, timeout, cancel_check)
-            except Exception as exc:
-                if not self._is_timeout_error(exc):
-                    raise
+            result, stop_reason = self._wait_for_container(container, watchdog)
+            container_exited = stop_reason is None
+            if stop_reason:
                 self._finish_log_stream(stream_state, stream_thread)
-                return self._failure_result(f"runtime timed out after {timeout:g} seconds", False, secrets, 124)
-            container_exited = not canceled
-            if canceled:
-                self._finish_log_stream(stream_state, stream_thread)
-                return self._failure_result("runtime canceled", False, secrets, 130)
+                status_code = 130 if stop_reason == RuntimeWatchdog.CANCELED else 124
+                return self._failure_result(watchdog.describe(stop_reason, "runtime"), False, secrets, status_code)
             self._finish_log_stream(stream_state, stream_thread)
             if stream_state and stream_state.get("started") and not stream_state.get("error"):
                 combined = stream_state.get("logs", "")
@@ -1557,15 +1595,14 @@ class DockerRuntimeAdapter(RuntimePort):
                 remove=False,
                 labels=self._runtime_container_labels(payload),
             )
-            try:
-                result, canceled = self._wait_for_container(container, timeout, cancel_check)
-            except Exception as exc:
-                if not self._is_timeout_error(exc):
-                    raise
-                return self._failure_result(f"runtime timed out after {timeout:g} seconds", True, secrets, 124)
-            container_exited = not canceled
-            if canceled:
-                return self._failure_result("runtime canceled", True, secrets, 130)
+            # Binary output is attached only after exit, so there is no liveness
+            # signal to watch: only cancellation and an explicit wall clock apply.
+            watchdog = RuntimeWatchdog(timeout, None, cancel_check, clock=self._monotonic)
+            result, stop_reason = self._wait_for_container(container, watchdog)
+            container_exited = stop_reason is None
+            if stop_reason:
+                status_code = 130 if stop_reason == RuntimeWatchdog.CANCELED else 124
+                return self._failure_result(watchdog.describe(stop_reason, "runtime"), True, secrets, status_code)
             operation_index = 3 if len(command) > 2 and command[1] == "--cache-dir" else 1
             is_zip = len(command) > operation_index and command[operation_index] == "dump" and "zip" in command
             default_limit = self.MAX_ZIP_BYTES if is_zip else self.MAX_DUMP_BYTES

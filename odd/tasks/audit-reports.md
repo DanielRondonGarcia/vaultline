@@ -5,15 +5,17 @@ Delivery: `ask-on-risk`; chain strategy selected: `feature-branch-chain`. First 
 
 ## Specs
 - S1: “un apartado de informes o reportes, utiles para pasarlo a una auditoria”
-- S2: “una matriz de backups, que servidores que servicios tiene, periodicidad de backups, su retención, su porcentaje exitoso y porcentaje fallido, etc.”
-- S3: “Y que sea en varios formatos, excel, csv, json, pdf”
-- S4: “Rango seleccionable (recomendado)”
+- S2: “una matriz de backups, que servidores que servicios tiene, periodicidad de backups, su retención, su porcentaje exitoso y porcentaje fallido, etc.”; “de los servidores y sus servicios a los que se le hacen backup, su periodicidad, su politica de retención, tamaño, porentaje fallido, ubicación, etc.”; “Ambos, separados”
+- S3: “Y que sea en varios formatos, excel, csv, json, pdf” / “Que sirva para excel, csv, pdf, json...”
+- S4: “Rango seleccionable (recomendado)” / “un balance mensual, trimestral, etc”
 
 ## Tasks
 - T1 — S1, S2, S4 — route: date-bounded report matrix and calculation service — commit: `eebda88` (assessed medium; RDD off, no review due)
-- T2 — S1, S2, S4 — route: viewer-authenticated JSON report-data API — commit: pending
-- T3 — S3 — route: downloadable JSON, CSV, Excel, and PDF formats — commit: pending
-- T4 — S1–S4 — route: reports navigation, date-range controls, preview, downloads, and UI verification — commit: pending
+- T2 — S1, S2, S4 — route: viewer-authenticated JSON report-data API — commit: `88ac86a` (assessed high; independent security verification passed; verifier default targets `actsis-litellm/oc/glm-5.2`)
+- T3a — S3 — route: pure JSON, CSV, Excel, and PDF renderers with spreadsheet formula-injection protection — commit: pending
+- T3b — S2–S3 — route: viewer-authenticated download endpoints and safe storage-location report fields — commit: pending (independent security verification passed)
+- T5 — S2 — route: persist source bytes processed and backend-reported stored bytes as separate historical report fields, unavailable where an exact metric is not provided — commit: pending (user selected both metrics; starts after T3b)
+- T4 — S1–S4 — route: reports navigation, monthly/quarterly or custom date-range controls, preview, downloads, and UI verification — commit: pending
 
 ## Log
 - L1: vale, necesito que implementes un apartado de informes o reportes, utiles para pasarlo a una auditoria, y pregunten tipo, una matriz de backups, que servidores que servicios tiene, periodicidad de backups, su retención, su porcentaje exitoso y porcentaje fallido, etc. Y que sea en varios formatos, excel, csv, json, pdf
@@ -24,4 +26,16 @@ Delivery: `ask-on-risk`; chain strategy selected: `feature-branch-chain`. First 
 - L6: Plan refinement: split the report data layer and viewer API into separate reviewable work units before adding the four file downloads and UI.
 - L7: T1 verified: `python -m pytest tests/test_audit_reports.py -q` passed (3 tests, 2 subtests); related observability/dispatch suites passed (47 and 88 tests). Commit `eebda88` contains the report matrix/date aggregation. Native assessment was medium; RDD is off, so no review was due.
 - L8: T2 route tests observed RED before implementation, then passed (4 tests); `tests/test_control_plane_dispatch.py` passed (88 tests, 48 subtests). The latest commit summary reports 485 authored changed lines across 3 commits since `origin/master`; this triggered the oversized-delivery decision.
-- L9: User selected `feature-branch-chain`; this shapes future review slices only and does not authorize push or PR creation. T2 is unblocked; implementation remains uncommitted pending assessment and independent security verification.
+- L9: User selected `feature-branch-chain`; this shapes future review slices only and does not authorize push or PR creation. T2 work-unit commit `88ac86a` was assessed high after an item-2 security escalation; RDD is off and no native review was due.
+- L10: Planned chain slice 1 contains `eebda88` and `88ac86a` as a coherent backend API (589 authored changed lines); slice 2 starts with T3 exports. No PR was created or pushed.
+- L11: T2's verifier failed before any tool call. Session error: “Codex error: The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.” The task record shows `openai-codex/gpt-5.5`, 0 tokens, and 0 tool calls; `C:\Users\daniel.rondon\.pi\agent\settings.json` selects that default, while `agents/gentle-ai-verify.md` has no model pin. This is a model/config incompatibility, not a code finding. No verifier retry or fallback was attempted.
+- L12: Considered pinning a model only for `gentle-ai-verify`, but the installed Pi docs do not document per-agent model overrides and the agent definition has no model field. No config was changed; the verifier may not be re-invoked under the current task policy.
+- L13: Pi documents `defaultProvider` and `defaultModel` as global startup settings. The local catalog lists `openai-codex/gpt-5.3-codex-spark`, but support with this account is unverified. Changing the global default affects all new sessions and requires explicit authorization; none had been given at this point.
+- L14: User authorized changing the global model default. Updated `C:\Users\daniel.rondon\.pi\agent\settings.json` to `defaultModel: gpt-5.3-codex-spark`, preserving `defaultProvider: openai-codex`. `python -m json.tool` passed and the model is present in the local catalog. Runtime account compatibility and the required independent security proof remain unverified; the verifier was not re-invoked.
+- L15: User correction: “oc/glm-5.2 [actsis-litellm] es este”. Updated the same settings file to `defaultProvider: actsis-litellm` and `defaultModel: oc/glm-5.2`. JSON parsing passed and the model is present in the local catalog. Runtime account compatibility and the independent security proof remain unverified; the verifier was not re-invoked.
+- L16: Necesito que implementes un feat de poder generar reportes  tipo para auditoria, donde pidan un balance mensual, trimestral, etc de los servidores y sus servicios a los que se le hacen backup, su periodicidad, su politica de retención, tamaño, porentaje fallido, ubicación, etc. Que sirva para excel, csv, pdf, json
+- L17: `gentle-ai-verify` independently reviewed T2 (`88ac86a`) read-only and passed: authenticated viewer access, report-only date inputs, read-only `backup.run` query scoping, and exclusion of secrets/runtime fields. Tests passed in scratch copy: `tests/test_audit_report_routes.py tests/test_audit_reports.py` (8 passed, 2 subtests) and `tests/test_control_plane_dispatch.py` (88 passed, 48 subtests). The verifier noted size/location are intentionally in T3 and one pre-existing generic 500 exception-text advisory; no T2 blockers.
+- L18: T3 implementation reports four export formats and safe location. No trustworthy date-bounded historical size source exists: `backup.run` result summaries contain fractional progress only, while the latest per-target snapshot summary is replaced and cannot be tied reliably to the selected period. The implementation reports size unavailable rather than inventing a value. T5 will capture the two metrics selected in L19.
+- L19: User selected “Ambos, separados”: record source bytes processed and backend-reported stored bytes as distinct historical values, and report either value unavailable when an exact metric is not supplied.
+- L20: Parent review found spreadsheet formula injection for untrusted matrix strings in CSV/XLSX; added RED-first tests (2 failed), then prefixed formula-like text as a literal. Both regression tests passed. Parent focused report suites: 24 passed, 10 subtests; dispatch suite: 88 passed, 48 subtests; `git diff --check` clean. Differential comparison passed against `88ac86a` for four existing GET routes. Independent T3 security verification passed. Native assessment was unassessable because untracked files were undeclared; RDD is off, and the plan's independent verifier ran.
+- L21: Split T3 into renderer-only T3a and authenticated route/location T3b to keep format generation and the security-sensitive public download API reviewable separately; no specs changed.

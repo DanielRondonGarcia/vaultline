@@ -6,12 +6,14 @@ These functions turn the already-sanitized report dictionary produced by
 the job history; they only serialize the report they are given, so the T2
 no-secrets invariant is preserved by construction.
 
-Backup size is intentionally surfaced as ``None``/unavailable: the persisted
-``backup.run`` job ``result_summary`` records only a fractional progress value
-and a sanitized ``storage_context``, not an absolute byte total, and
-``SnapshotRecord.summary`` is replaced wholesale per target with no reliable
-date-bound tie to the report period. Aggregating either would be inference, so
-the report leaves size unavailable and documents the gap instead.
+Backup size is surfaced as two distinct per-metric aggregates captured from
+the Restic JSON summary emitted at the end of each ``backup.run`` job:
+``bytes_processed`` (source ``total_bytes_processed``) and ``bytes_added``
+(source ``data_added``). Each metric is summed across in-period jobs that
+reported an exact nonnegative integer value, and is ``None`` (never zero) when
+no job reported it; per-metric ``reported_jobs``/``unavailable_jobs`` coverage
+makes partial totals explicit. Metrics stay unavailable independently for
+non-Restic strategies or jobs without an exact Restic summary.
 
 The storage location is derived only from safe, non-credential-bearing
 fields: ``BackupTargetRecord.path_storage`` (a relative POSIX sub-path) and the
@@ -53,7 +55,12 @@ BACKUP_AUDIT_MATRIX_COLUMNS: Tuple[str, ...] = (
     "other",
     "succeeded_percent",
     "failed_percent",
-    "backup_size_bytes",
+    "backup_bytes_processed",
+    "backup_bytes_added",
+    "backup_bytes_processed_reported_jobs",
+    "backup_bytes_processed_unavailable_jobs",
+    "backup_bytes_added_reported_jobs",
+    "backup_bytes_added_unavailable_jobs",
     "storage_backend_type",
     "storage_profile_name",
     "path_storage",
@@ -82,6 +89,10 @@ def _flatten_target(row: Dict[str, Any]) -> list:
     server = row.get("server") or {}
     counts = row.get("job_counts") or {}
     location = row.get("storage_location") or {}
+    backup_size = row.get("backup_size") or {}
+    coverage = backup_size.get("coverage") or {}
+    processed_coverage = coverage.get("bytes_processed") or {}
+    added_coverage = coverage.get("bytes_added") or {}
     return [
         row.get("target_id"),
         row.get("service"),
@@ -109,7 +120,12 @@ def _flatten_target(row: Dict[str, Any]) -> list:
         counts.get("other"),
         row.get("succeeded_percent"),
         row.get("failed_percent"),
-        row.get("backup_size"),
+        backup_size.get("bytes_processed"),
+        backup_size.get("bytes_added"),
+        processed_coverage.get("reported_jobs"),
+        processed_coverage.get("unavailable_jobs"),
+        added_coverage.get("reported_jobs"),
+        added_coverage.get("unavailable_jobs"),
         location.get("backend_type"),
         location.get("storage_profile_name"),
         location.get("path_storage"),
@@ -149,11 +165,33 @@ def export_backup_audit_xlsx(report: Dict[str, Any]) -> bytes:
         ]
     )
     if size_availability.get("available"):
-        sheet.append(["Backup size: available"])
+        availability_status = "complete" if size_availability.get("complete") else "partial"
+        sheet.append([f"Backup size: {availability_status} - {size_availability.get('basis', '')}"])
     else:
         sheet.append(
-            [f"Backup size: unavailable - {size_availability.get('reason', '')}"]
+            [f"Backup size: unavailable - {size_availability.get('reason', size_availability.get('basis', ''))}"]
         )
+    size_summary = (report.get("summary") or {}).get("backup_size") or {}
+    size_coverage = size_summary.get("coverage") or {}
+    size_metrics = size_availability.get("metrics") or {}
+    for metric_key, label in (
+        ("bytes_processed", "Source bytes processed"),
+        ("bytes_added", "Backend stored bytes"),
+    ):
+        metric = size_metrics.get(metric_key) or {}
+        coverage = size_coverage.get(metric_key) or {}
+        reported_jobs = coverage.get("reported_jobs", metric.get("reported_jobs", 0))
+        unavailable_jobs = coverage.get("unavailable_jobs", metric.get("unavailable_jobs", 0))
+        total_jobs = reported_jobs + unavailable_jobs
+        if metric.get("complete"):
+            status = "complete"
+        elif metric.get("available", size_summary.get(metric_key) is not None):
+            status = "partial"
+        else:
+            status = "unavailable"
+        value = size_summary.get(metric_key)
+        value_text = str(value) if value is not None else "n/a"
+        sheet.append([f"{label}: {status}; total={value_text} bytes; reported for {reported_jobs}/{total_jobs} jobs"])
     sheet.append(
         [
             "Storage location: "
@@ -199,12 +237,28 @@ def _pdf_text_lines(report: Dict[str, Any]) -> list[str]:
     )
     size_availability = availability.get("backup_size") or {}
     if size_availability.get("available"):
-        lines.append("Backup size: available")
+        availability_status = "complete" if size_availability.get("complete") else "partial"
+        lines.append(f"Backup size: {availability_status} - {size_availability.get('basis', '')}")
     else:
         lines.append(
             f"Backup size: unavailable - "
-            f"{size_availability.get('reason', 'no trustworthy historical size source')}"
+            f"{size_availability.get('reason', size_availability.get('basis', 'no trustworthy historical size source'))}"
         )
+    size_summary = summary.get("backup_size") or {}
+    size_coverage = size_summary.get("coverage") or {}
+    size_metrics = size_availability.get("metrics") or {}
+    for metric_key, label in (
+        ("bytes_processed", "Source bytes processed"),
+        ("bytes_added", "Backend stored bytes"),
+    ):
+        metric = size_metrics.get(metric_key) or {}
+        coverage = size_coverage.get(metric_key) or {}
+        reported_jobs = coverage.get("reported_jobs", metric.get("reported_jobs", 0))
+        unavailable_jobs = coverage.get("unavailable_jobs", metric.get("unavailable_jobs", 0))
+        total_jobs = reported_jobs + unavailable_jobs
+        value = size_summary.get(metric_key)
+        value_text = str(value) if value is not None else "n/a"
+        lines.append(f"{label}: {value_text} bytes; reported for {reported_jobs}/{total_jobs} jobs")
     location_availability = availability.get("storage_location") or {}
     lines.append(
         "Storage location: "
@@ -216,6 +270,22 @@ def _pdf_text_lines(report: Dict[str, Any]) -> list[str]:
         server = row.get("server") or {}
         schedule = row.get("schedule") or {}
         location = row.get("storage_location") or {}
+        backup_size = row.get("backup_size") or {}
+        size_coverage = backup_size.get("coverage") or {}
+        processed_coverage = size_coverage.get("bytes_processed") or {}
+        added_coverage = size_coverage.get("bytes_added") or {}
+        bytes_processed = backup_size.get("bytes_processed")
+        bytes_added = backup_size.get("bytes_added")
+        processed_total = processed_coverage.get("reported_jobs", 0) + processed_coverage.get("unavailable_jobs", 0)
+        added_total = added_coverage.get("reported_jobs", 0) + added_coverage.get("unavailable_jobs", 0)
+        processed_text = (
+            f"{bytes_processed} ({processed_coverage.get('reported_jobs', 0)}/{processed_total} jobs)"
+            if bytes_processed is not None else f"n/a ({processed_coverage.get('reported_jobs', 0)}/{processed_total} jobs)"
+        )
+        added_text = (
+            f"{bytes_added} ({added_coverage.get('reported_jobs', 0)}/{added_total} jobs)"
+            if bytes_added is not None else f"n/a ({added_coverage.get('reported_jobs', 0)}/{added_total} jobs)"
+        )
         cron = schedule.get("cron_expression") or "manual"
         location_text = location.get("backend_type") or "n/a"
         if location.get("storage_profile_name"):
@@ -228,7 +298,7 @@ def _pdf_text_lines(report: Dict[str, Any]) -> list[str]:
         )
         lines.append(
             f"  succeeded={pct(row.get('succeeded_percent'))} failed={pct(row.get('failed_percent'))} "
-            f"size=unavailable location={location_text}"
+            f"size: processed={processed_text} added={added_text} location={location_text}"
         )
     return lines
 

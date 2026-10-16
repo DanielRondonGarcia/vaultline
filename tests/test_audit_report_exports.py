@@ -1,3 +1,4 @@
+import csv
 import io
 import json
 import unittest
@@ -25,8 +26,32 @@ def _sample_report() -> dict:
         },
         "availability": {
             "backup_size": {
-                "available": False,
-                "reason": "backup.run result_summary records only fractional progress, not absolute bytes",
+                "available": True,
+                "complete": False,
+                "basis": (
+                    "Restic JSON summary total_bytes_processed (source bytes processed) "
+                    "and data_added (backend-reported stored bytes) captured per "
+                    "backup.run job; each metric is unavailable independently when a "
+                    "job has no exact Restic summary or uses a non-Restic strategy."
+                ),
+                "metrics": {
+                    "bytes_processed": {
+                        "source_field": "total_bytes_processed",
+                        "label": "source bytes processed",
+                        "available": True,
+                        "complete": False,
+                        "reported_jobs": 1,
+                        "unavailable_jobs": 1,
+                    },
+                    "bytes_added": {
+                        "source_field": "data_added",
+                        "label": "backend stored bytes",
+                        "available": True,
+                        "complete": False,
+                        "reported_jobs": 1,
+                        "unavailable_jobs": 1,
+                    },
+                },
             },
             "storage_location": {
                 "available": True,
@@ -43,6 +68,14 @@ def _sample_report() -> dict:
             "unmapped_target_job_count": 0,
             "succeeded_percent": 50.0,
             "failed_percent": 50.0,
+            "backup_size": {
+                "bytes_processed": 2048,
+                "bytes_added": 1024,
+                "coverage": {
+                    "bytes_processed": {"reported_jobs": 1, "unavailable_jobs": 1},
+                    "bytes_added": {"reported_jobs": 1, "unavailable_jobs": 1},
+                },
+            },
         },
         "matrix": [
             {
@@ -85,7 +118,14 @@ def _sample_report() -> dict:
                 },
                 "succeeded_percent": 50.0,
                 "failed_percent": 50.0,
-                "backup_size": None,
+                "backup_size": {
+                    "bytes_processed": 2048,
+                    "bytes_added": 1024,
+                    "coverage": {
+                        "bytes_processed": {"reported_jobs": 1, "unavailable_jobs": 1},
+                        "bytes_added": {"reported_jobs": 1, "unavailable_jobs": 1},
+                    },
+                },
                 "storage_location": {
                     "backend_type": "s3",
                     "storage_profile_name": "prod-s3",
@@ -104,19 +144,27 @@ class BackupAuditJsonExportTests(unittest.TestCase):
 
 
 class BackupAuditCsvExportTests(unittest.TestCase):
-    def test_csv_has_header_and_one_row_per_target_with_safe_fields(self):
+    def test_csv_has_header_and_one_row_per_target_with_safe_fields_and_size_coverage(self):
         report = _sample_report()
         text = export_backup_audit_csv(report).decode("utf-8")
-        lines = text.splitlines()
-        self.assertEqual(lines[0], ",".join(BACKUP_AUDIT_MATRIX_COLUMNS))
-        self.assertEqual(len(lines), 1 + len(report["matrix"]))
-        data_line = lines[1]
-        self.assertIn("service-a", data_line)
-        self.assertIn("server-a", data_line)
-        self.assertIn("prod-s3", data_line)
-        self.assertIn("svc/backups", data_line)
-        # backup size is unavailable, so no invented byte value leaks into CSV.
-        self.assertNotIn("bytes", data_line.lower().split(",")[-4])
+        rows = list(csv.reader(io.StringIO(text)))
+        self.assertEqual(rows[0], list(BACKUP_AUDIT_MATRIX_COLUMNS))
+        self.assertEqual(len(rows), 1 + len(report["matrix"]))
+        data_row = rows[1]
+        self.assertIn("service-a", data_row)
+        self.assertIn("server-a", data_row)
+        self.assertIn("prod-s3", data_row)
+        self.assertIn("svc/backups", data_row)
+        # both size metrics and their coverage counts are exposed as columns
+        self.assertIn("2048", data_row)
+        self.assertIn("1024", data_row)
+        columns = dict(zip(BACKUP_AUDIT_MATRIX_COLUMNS, data_row))
+        self.assertEqual(columns["backup_bytes_processed"], "2048")
+        self.assertEqual(columns["backup_bytes_added"], "1024")
+        self.assertEqual(columns["backup_bytes_processed_reported_jobs"], "1")
+        self.assertEqual(columns["backup_bytes_processed_unavailable_jobs"], "1")
+        self.assertEqual(columns["backup_bytes_added_reported_jobs"], "1")
+        self.assertEqual(columns["backup_bytes_added_unavailable_jobs"], "1")
 
 
 class BackupAuditXlsxExportTests(unittest.TestCase):
@@ -137,6 +185,10 @@ class BackupAuditXlsxExportTests(unittest.TestCase):
         self.assertIsNotNone(header_row)
         self.assertEqual(header_row, BACKUP_AUDIT_MATRIX_COLUMNS)
 
+        summary_lines = [row[0] for row in ws.iter_rows(values_only=True) if row and isinstance(row[0], str)]
+        self.assertIn("Source bytes processed: partial; total=2048 bytes; reported for 1/2 jobs", summary_lines)
+        self.assertIn("Backend stored bytes: partial; total=1024 bytes; reported for 1/2 jobs", summary_lines)
+
         data_rows = [
             row
             for row in ws.iter_rows(values_only=True)
@@ -149,8 +201,10 @@ class BackupAuditXlsxExportTests(unittest.TestCase):
         self.assertEqual(columns["storage_backend_type"], "s3")
         self.assertEqual(columns["storage_profile_name"], "prod-s3")
         self.assertEqual(columns["path_storage"], "svc/backups")
-        self.assertIsNone(columns["backup_size_bytes"])
-        self.assertEqual(columns["succeeded_percent"], 50.0)
+        self.assertEqual(columns["backup_bytes_processed"], 2048)
+        self.assertEqual(columns["backup_bytes_added"], 1024)
+        self.assertEqual(columns["backup_bytes_processed_reported_jobs"], 1)
+        self.assertEqual(columns["backup_bytes_added_unavailable_jobs"], 1)
 
 
 class BackupAuditPdfExportTests(unittest.TestCase):
@@ -165,8 +219,12 @@ class BackupAuditPdfExportTests(unittest.TestCase):
         self.assertIn(b"(Backup Audit Report)", body)
         self.assertIn(b"service-a", body)
         self.assertIn(b"server-a", body)
-        # the availability gap is communicated in the PDF text
-        self.assertIn(b"backup size", body.lower())
+        # both size metrics are communicated in the PDF text
+        self.assertIn(b"backup size: partial", body.lower())
+        self.assertIn(b"Source bytes processed: 2048 bytes; reported for 1/2 jobs", body)
+        self.assertIn(b"Backend stored bytes: 1024 bytes; reported for 1/2 jobs", body)
+        self.assertIn(b"processed=2048 \\(1/2 jobs\\)", body)
+        self.assertIn(b"added=1024 \\(1/2 jobs\\)", body)
 
 
 class BackupAuditRenderDispatchTests(unittest.TestCase):

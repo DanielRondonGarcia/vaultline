@@ -16,7 +16,10 @@ def _sample_download_report() -> dict:
             "timezone": "America/New_York",
         },
         "availability": {
-            "backup_size": {"available": False, "reason": "no trustworthy historical size"},
+            "backup_size": {
+                "available": True,
+                "basis": "Restic summary total_bytes_processed and data_added captured per backup.run job",
+            },
             "storage_location": {"available": True, "basis": "path_storage and storage profile"},
         },
         "summary": {
@@ -29,6 +32,14 @@ def _sample_download_report() -> dict:
             "unmapped_target_job_count": 0,
             "succeeded_percent": None,
             "failed_percent": None,
+            "backup_size": {
+                "bytes_processed": None,
+                "bytes_added": None,
+                "coverage": {
+                    "bytes_processed": {"reported_jobs": 0, "unavailable_jobs": 0},
+                    "bytes_added": {"reported_jobs": 0, "unavailable_jobs": 0},
+                },
+            },
         },
         "matrix": [
             {
@@ -45,7 +56,14 @@ def _sample_download_report() -> dict:
                 "job_counts": {"total": 0, "completed": 0, "succeeded": 0, "failed": 0, "other": 0, "other_statuses": {}},
                 "succeeded_percent": None,
                 "failed_percent": None,
-                "backup_size": None,
+                "backup_size": {
+                    "bytes_processed": None,
+                    "bytes_added": None,
+                    "coverage": {
+                        "bytes_processed": {"reported_jobs": 0, "unavailable_jobs": 0},
+                        "bytes_added": {"reported_jobs": 0, "unavailable_jobs": 0},
+                    },
+                },
                 "storage_location": {"backend_type": None, "storage_profile_name": None, "path_storage": None},
             }
         ],

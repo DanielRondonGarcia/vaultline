@@ -804,9 +804,15 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
         end_utc = end.astimezone(timezone.utc).replace(tzinfo=None) if end.tzinfo else end
         if end_utc <= start_utc:
             return []
+        # The audit report aggregates per-job result_summary metrics (T5 S2), so
+        # the date-bounded report query selects the existing result_summary_json
+        # column (no schema migration) and hydrates it onto the record. The public
+        # list_for_listing query stays lightweight; only this report query returns
+        # the result-summary mapping, in a single bounded query (no N+1 reads).
         columns = """
             id, worker_id, command, requested_by, target_id, trigger, status,
-            attempt_count, submitted_at, started_at, finished_at, updated_at
+            attempt_count, submitted_at, started_at, finished_at, updated_at,
+            result_summary_json
         """
         with self._connect() as connection:
             rows = connection.execute(
@@ -814,7 +820,12 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 "ORDER BY started_at ASC, id ASC",
                 (command, start_utc.isoformat(), end_utc.isoformat()),
             ).fetchall()
-        return [self._row_to_listing_job(row) for row in rows]
+        jobs: List[JobRecord] = []
+        for row in rows:
+            job = self._row_to_listing_job(row)
+            job.result_summary = _json_load(row["result_summary_json"], None)
+            jobs.append(job)
+        return jobs
 
     def job_stats(self, tz_offset_minutes: int = 0, now: Optional[datetime] = None) -> Dict[str, Any]:
         day_keys = job_stats_day_keys(now or datetime.utcnow(), tz_offset_minutes)

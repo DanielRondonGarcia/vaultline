@@ -223,7 +223,12 @@ class JobRepository(ABC):
         end_utc = end.astimezone(timezone.utc).replace(tzinfo=None) if end.tzinfo else end
         if end_utc <= start_utc:
             return []
-        jobs, _ = self.list_for_listing(limit=None, filters={"command": command}, sort="started_at", order="asc")
+        # The audit report aggregates per-job result_summary metrics (T5 S2), so
+        # the date-bounded report query returns full records (with result_summary)
+        # rather than the lightweight listing projection. list_for_listing stays
+        # lightweight for UI/listing callers; apply_job_listing_query preserves the
+        # same command filter and started_at-asc ordering on the full record set.
+        jobs = apply_job_listing_query(self.list(), filters={"command": command}, sort="started_at", order="asc")
         selected = []
         for job in jobs:
             started_at = job.started_at

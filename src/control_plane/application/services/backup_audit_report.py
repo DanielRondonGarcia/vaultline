@@ -21,6 +21,18 @@ _RETENTION_FIELDS = (
     "keep_yearly",
     "prune",
 )
+# Per-job Restic summary byte metrics captured by the worker (T5 S2). The keys
+# are the additive result_summary fields; the labels are the report-facing names.
+_BACKUP_SIZE_METRIC_SOURCES = (
+    ("backup_bytes_processed", "bytes_processed"),
+    ("backup_bytes_added", "bytes_added"),
+)
+_BACKUP_SIZE_AVAILABILITY_BASIS = (
+    "Restic JSON summary total_bytes_processed (source bytes processed) and "
+    "data_added (backend-reported stored bytes) captured per backup.run job; "
+    "each metric is unavailable independently when a job has no exact Restic "
+    "summary or uses a non-Restic strategy."
+)
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,54 @@ def _retention_view(policy: Any | None) -> dict[str, Any] | None:
     }
 
 
+def _job_backup_size_metrics(job: Any) -> dict[str, int]:
+    """Return the exact nonnegative integer size metrics stored on a job.
+
+    Only ``backup_bytes_processed`` / ``backup_bytes_added`` keys that hold an
+    exact nonnegative integer (not bool/float/string) are returned, so a missing
+    or invalid metric stays unavailable independently of its sibling.
+    """
+    summary = getattr(job, "result_summary", None)
+    if not isinstance(summary, dict):
+        return {}
+    metrics: dict[str, int] = {}
+    for source_key, _label in _BACKUP_SIZE_METRIC_SOURCES:
+        value = summary.get(source_key)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            metrics[source_key] = value
+    return metrics
+
+
+def _aggregate_backup_size(jobs: list[Any]) -> dict[str, Any]:
+    """Aggregate per-job Restic byte metrics with explicit per-metric coverage.
+
+    Exact values are summed across in-period ``backup.run`` jobs that reported a
+    metric; a metric is ``None`` (never zero) when no job reported it. Coverage
+    reports ``reported_jobs`` and ``unavailable_jobs`` per metric so partial
+    totals are explicit.
+    """
+    total_jobs = len(jobs)
+    sums: dict[str, int] = {source_key: 0 for source_key, _ in _BACKUP_SIZE_METRIC_SOURCES}
+    reported: dict[str, int] = {source_key: 0 for source_key, _ in _BACKUP_SIZE_METRIC_SOURCES}
+    for job in jobs:
+        metrics = _job_backup_size_metrics(job)
+        for source_key, _label in _BACKUP_SIZE_METRIC_SOURCES:
+            if source_key in metrics:
+                sums[source_key] += metrics[source_key]
+                reported[source_key] += 1
+    coverage = {
+        label: {
+            "reported_jobs": reported[source_key],
+            "unavailable_jobs": total_jobs - reported[source_key],
+        }
+        for source_key, label in _BACKUP_SIZE_METRIC_SOURCES
+    }
+    return {
+        label: (sums[source_key] if reported[source_key] else None)
+        for source_key, label in _BACKUP_SIZE_METRIC_SOURCES
+    } | {"coverage": coverage}
+
+
 def _target_view(target: Any, workers: dict[str, Any], policies: dict[str, Any], jobs: list[Any], period: AuditPeriod, global_cron_expression: str | None, storage_profiles: dict[str, Any]) -> dict[str, Any]:
     worker = workers.get(str(getattr(target, "worker_id", "")))
     target_cron = str(getattr(target, "cron_expression", None) or "").strip()
@@ -137,7 +197,7 @@ def _target_view(target: Any, workers: dict[str, Any], policies: dict[str, Any],
         "job_counts": {key: counts[key] for key in ("total", "completed", "succeeded", "failed", "other", "other_statuses")},
         "succeeded_percent": counts["succeeded_percent"],
         "failed_percent": counts["failed_percent"],
-        "backup_size": None,
+        "backup_size": _aggregate_backup_size(jobs),
         "storage_location": {
             "backend_type": backend_type or None,
             "storage_profile_name": profile_name or None,
@@ -179,6 +239,30 @@ def build_backup_audit_report(
         for target in sorted(target_list, key=lambda item: (str(item.name).casefold(), str(item.id)))
     ]
     summary = _job_counts(backup_jobs)
+    backup_size_summary = _aggregate_backup_size(backup_jobs)
+    backup_size_metrics_availability: dict[str, Any] = {}
+    for source_key, label in _BACKUP_SIZE_METRIC_SOURCES:
+        coverage = backup_size_summary["coverage"][label]
+        reported_jobs = coverage["reported_jobs"]
+        unavailable_jobs = coverage["unavailable_jobs"]
+        available = reported_jobs > 0
+        metric = {
+            "source_field": (
+                "total_bytes_processed"
+                if source_key == "backup_bytes_processed"
+                else "data_added"
+            ),
+            "label": (
+                "source bytes processed"
+                if source_key == "backup_bytes_processed"
+                else "backend stored bytes"
+            ),
+            "available": available,
+            "complete": available and unavailable_jobs == 0,
+            "reported_jobs": reported_jobs,
+            "unavailable_jobs": unavailable_jobs,
+        }
+        backup_size_metrics_availability[label] = metric
     configured_ids = {str(target.id) for target in target_list}
     summary_view = {
         "target_count": len(target_list),
@@ -192,6 +276,7 @@ def build_backup_audit_report(
         ),
         "succeeded_percent": summary["succeeded_percent"],
         "failed_percent": summary["failed_percent"],
+        "backup_size": backup_size_summary,
     }
     current_time = generated_at or datetime.now(timezone.utc)
     if current_time.tzinfo is None:
@@ -206,14 +291,11 @@ def build_backup_audit_report(
         },
         "availability": {
             "backup_size": {
-                "available": False,
-                "reason": (
-                    "backup.run job result_summary records only fractional progress "
-                    "(bytes_done/total_bytes in 0..1) and storage_context, not an absolute "
-                    "byte total; SnapshotRecord.summary carries restic snapshot size but is "
-                    "replaced wholesale per target with no reliable date-bound tie to the "
-                    "report period, so aggregating it would infer rather than report."
-                ),
+                "available": any(metric["available"] for metric in backup_size_metrics_availability.values()),
+                "complete": bool(backup_size_metrics_availability)
+                and all(metric["complete"] for metric in backup_size_metrics_availability.values()),
+                "basis": _BACKUP_SIZE_AVAILABILITY_BASIS,
+                "metrics": backup_size_metrics_availability,
             },
             "storage_location": {
                 "available": True,

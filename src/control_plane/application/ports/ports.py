@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.control_plane.domain.models import (
@@ -217,6 +217,23 @@ class JobRepository(ABC):
     ) -> Tuple[List[JobRecord], int]:
         jobs = apply_job_listing_query(self.list(), filters, sort, order)
         return paginate_job_listing(jobs, limit, offset), len(jobs)
+
+    def list_started_between(self, command: str, start: datetime, end: datetime) -> List[JobRecord]:
+        start_utc = start.astimezone(timezone.utc).replace(tzinfo=None) if start.tzinfo else start
+        end_utc = end.astimezone(timezone.utc).replace(tzinfo=None) if end.tzinfo else end
+        if end_utc <= start_utc:
+            return []
+        jobs, _ = self.list_for_listing(limit=None, filters={"command": command}, sort="started_at", order="asc")
+        selected = []
+        for job in jobs:
+            started_at = job.started_at
+            if started_at is None:
+                continue
+            if started_at.tzinfo:
+                started_at = started_at.astimezone(timezone.utc).replace(tzinfo=None)
+            if start_utc <= started_at < end_utc:
+                selected.append(job)
+        return selected
 
     def job_stats(self, tz_offset_minutes: int = 0, now: Optional[datetime] = None) -> Dict[str, Any]:
         return compute_job_stats(self.list(), tz_offset_minutes, now)

@@ -799,6 +799,23 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             rows = connection.execute(query, page_parameters).fetchall()
         return [self._row_to_listing_job(row) for row in rows], total
 
+    def list_started_between(self, command: str, start: datetime, end: datetime) -> List[JobRecord]:
+        start_utc = start.astimezone(timezone.utc).replace(tzinfo=None) if start.tzinfo else start
+        end_utc = end.astimezone(timezone.utc).replace(tzinfo=None) if end.tzinfo else end
+        if end_utc <= start_utc:
+            return []
+        columns = """
+            id, worker_id, command, requested_by, target_id, trigger, status,
+            attempt_count, submitted_at, started_at, finished_at, updated_at
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"SELECT {columns} FROM jobs WHERE command = ? AND started_at >= ? AND started_at < ? "
+                "ORDER BY started_at ASC, id ASC",
+                (command, start_utc.isoformat(), end_utc.isoformat()),
+            ).fetchall()
+        return [self._row_to_listing_job(row) for row in rows]
+
     def job_stats(self, tz_offset_minutes: int = 0, now: Optional[datetime] = None) -> Dict[str, Any]:
         day_keys = job_stats_day_keys(now or datetime.utcnow(), tz_offset_minutes)
         window_start = datetime.fromisoformat(day_keys[0]) - timedelta(minutes=tz_offset_minutes)

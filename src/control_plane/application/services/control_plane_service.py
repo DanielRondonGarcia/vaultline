@@ -43,6 +43,7 @@ from src.control_plane.domain.models import (
     WorkerStatus,
     utcnow,
 )
+from src.control_plane.application.services.backup_audit_report import build_backup_audit_report, parse_audit_period
 from src.restic_retention import apply_target_retention_policy, build_restic_forget_command
 
 logger = logging.getLogger(__name__)
@@ -3449,6 +3450,19 @@ class ControlPlaneService:
         self._reconcile_expired_jobs()
         jobs, total = self.job_repository.list_for_listing(limit=limit, offset=offset, filters=filters, sort=sort, order=order)
         return [self._job_listing_view(job) for job in jobs], total
+
+    def backup_audit_report(self, start_date: str, end_date: str, timezone_name: str) -> Dict[str, Any]:
+        period = parse_audit_period(start_date, end_date, timezone_name)
+        jobs = self.job_repository.list_started_between("backup.run", period.start_utc, period.end_utc)
+        settings = self.get_settings()
+        return build_backup_audit_report(
+            period=period,
+            targets=self.target_repository.list(),
+            workers=self.list_workers(),
+            retention_policies=self.retention_policy_repository.list(),
+            jobs=jobs,
+            global_cron_expression=getattr(settings, "global_cron_expression", None),
+        )
 
     def job_stats(self, tz_offset_minutes: int = 0) -> Dict[str, Any]:
         self._reconcile_expired_jobs()

@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, Mock, patch
 from cryptography.fernet import Fernet
 
 from src.app.domain.models import BackupConfig, RestoreResult
-from src.app.infrastructure.adapters.backup_strategy import ResticBackupStrategy
+from src.app.infrastructure.adapters.backup_strategy import ResticBackupStrategy, describe_restic_lock
 from src.control_plane.application.services.control_plane_service import ControlPlaneService
 from src.control_plane.domain.models import BackupTargetRecord, JobRecord, JobStatus, SecretRecord, SettingsRecord, StorageProfileRecord, WorkerRecord, utcnow
 from src.control_plane.infrastructure.repositories.in_memory import (
@@ -988,6 +988,165 @@ class RuntimeAndResticStreamingTests(unittest.TestCase):
         )
 
         self.assertFalse(result.success)
+
+
+class ResticStaleLockRecoveryTests(unittest.TestCase):
+    RESOLVED_RESTIC = "/pyinstaller-bundle/restic"
+    LOCK_STDERR = (
+        "Fatal: unable to create lock in backend: repository is already locked exclusively by PID 4242 on nas by svc (UID 1000, GID 1000)\n"
+        "lock was created at 2026-10-15 09:12:03 (47m18.4s ago)\n"
+        "storage ID 7f3a9c1e\n"
+        "the `unlock` command can be used to remove stale locks\n"
+    )
+    SUMMARY = '{"message_type":"summary","data_added":123,"total_duration":4.5}\n'
+
+    @staticmethod
+    def completed(returncode=0, stdout="", stderr=""):
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    def run_backup(self, backup_results, run_results, prune=True):
+        """Drive perform_backup with scripted outcomes; returns (result, argv list in call order)."""
+        argv = []
+        backup_outcomes = list(backup_results)
+        run_outcomes = list(run_results)
+
+        def backup(command, _env, _callback):
+            argv.append(command)
+            return backup_outcomes.pop(0)
+
+        def run(command, **_kwargs):
+            argv.append(command)
+            outcome = run_outcomes.pop(0)
+            if outcome.returncode != 0:
+                raise subprocess.CalledProcessError(outcome.returncode, command, output=outcome.stdout, stderr=outcome.stderr)
+            return outcome
+
+        strategy = ResticBackupStrategy()
+        strategy._run_incremental_backup = Mock(side_effect=backup)
+        config = BackupConfig(source_paths=["/backup"], restic_repository="rclone:remote:/repo", restic_keep_last=3, restic_prune=prune)
+        with patch(
+            "src.app.infrastructure.adapters.backup_strategy._require_executable", return_value=self.RESOLVED_RESTIC
+        ), patch("src.app.infrastructure.adapters.backup_strategy.subprocess.run", side_effect=run):
+            result = strategy.perform_backup(config)
+        return result, argv
+
+    def test_lock_detector_extracts_age_and_ignores_other_failures(self):
+        self.assertEqual(describe_restic_lock(self.LOCK_STDERR, 1), "lock created 47m18.4s ago")
+        self.assertEqual(describe_restic_lock("Fatal: repository is already locked by PID 1 on host\n", 1), "lock age unknown")
+        self.assertIsNone(describe_restic_lock(self.LOCK_STDERR, 0))
+        self.assertIsNone(describe_restic_lock("Fatal: wrong password or no key found\n", 1))
+        self.assertIsNone(describe_restic_lock(None, 1))
+
+    def test_locked_backup_runs_unlock_and_retries_exactly_once(self):
+        with self.assertLogs("src.app.infrastructure.adapters.backup_strategy", level="INFO") as logs:
+            result, argv = self.run_backup(
+                backup_results=[("", self.LOCK_STDERR, 1), (self.SUMMARY, "", 0)],
+                run_results=[self.completed(), self.completed(), self.completed()],
+            )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.size, 123)
+        self.assertEqual(
+            argv[:4],
+            [
+                [self.RESOLVED_RESTIC, "snapshots", "--json", "--latest", "1"],
+                [self.RESOLVED_RESTIC, "backup", "--json", "/backup"],
+                [self.RESOLVED_RESTIC, "unlock"],
+                [self.RESOLVED_RESTIC, "backup", "--json", "/backup"],
+            ],
+        )
+        self.assertEqual(argv[4][:2], [self.RESOLVED_RESTIC, "forget"])
+        self.assertEqual(len(argv), 5)
+        self.assertTrue(any("Restic repository is locked (lock created 47m18.4s ago); running 'restic unlock'" in line for line in logs.output))
+        self.assertFalse(any("--remove-all" in " ".join(command) for command in argv))
+
+    def test_backup_still_locked_after_unlock_fails_honestly_without_further_attempts(self):
+        result, argv = self.run_backup(
+            backup_results=[("", self.LOCK_STDERR, 1), ("", self.LOCK_STDERR, 1)],
+            run_results=[self.completed(), self.completed()],
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual([command[1] for command in argv], ["snapshots", "backup", "unlock", "backup"])
+        self.assertIn("repository is already locked exclusively by PID 4242 on nas", result.error)
+        self.assertIn("lock was created at 2026-10-15 09:12:03 (47m18.4s ago)", result.error)
+        self.assertIn("live restic process on this or another host", result.error)
+        self.assertNotIn("could not be unlocked", result.error.casefold())
+
+    def test_non_lock_backup_failure_never_runs_unlock(self):
+        result, argv = self.run_backup(
+            backup_results=[("", "Fatal: unable to open repository: network unreachable\n", 1)],
+            run_results=[self.completed()],
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual([command[1] for command in argv], ["snapshots", "backup"])
+        self.assertIn("network unreachable", result.error)
+
+    def test_locked_forget_runs_unlock_and_retries_exactly_once(self):
+        result, argv = self.run_backup(
+            backup_results=[(self.SUMMARY, "", 0)],
+            run_results=[self.completed(), self.completed(1, stderr=self.LOCK_STDERR), self.completed(), self.completed()],
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual([command[1] for command in argv], ["snapshots", "backup", "forget", "unlock", "forget"])
+        self.assertEqual(argv[2], argv[4])
+        self.assertIn("--prune", argv[2])
+
+    def test_forget_still_locked_after_unlock_fails_with_lock_detail(self):
+        result, argv = self.run_backup(
+            backup_results=[(self.SUMMARY, "", 0)],
+            run_results=[
+                self.completed(),
+                self.completed(1, stderr=self.LOCK_STDERR),
+                self.completed(),
+                self.completed(1, stderr=self.LOCK_STDERR),
+            ],
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual([command[1] for command in argv], ["snapshots", "backup", "forget", "unlock", "forget"])
+        self.assertIn("Restic retention command failed: repository is locked (lock created 47m18.4s ago)", result.error)
+        self.assertIn("live restic process", result.error)
+
+    def test_non_lock_forget_failure_never_runs_unlock(self):
+        result, argv = self.run_backup(
+            backup_results=[(self.SUMMARY, "", 0)],
+            run_results=[self.completed(), self.completed(1, stderr="Fatal: synthetic failure\n")],
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual([command[1] for command in argv], ["snapshots", "backup", "forget"])
+        self.assertEqual(result.error, "Restic retention command failed")
+
+    def test_locked_preflight_snapshots_recovers_without_running_init(self):
+        result, argv = self.run_backup(
+            backup_results=[(self.SUMMARY, "", 0)],
+            run_results=[self.completed(1, stderr=self.LOCK_STDERR), self.completed(), self.completed(stdout="[]"), self.completed()],
+        )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual([command[1] for command in argv], ["snapshots", "unlock", "snapshots", "backup", "forget"])
+
+    def test_preflight_still_locked_surfaces_lock_instead_of_init(self):
+        result, argv = self.run_backup(
+            backup_results=[],
+            run_results=[self.completed(1, stderr=self.LOCK_STDERR), self.completed(), self.completed(1, stderr=self.LOCK_STDERR)],
+        )
+
+        self.assertFalse(result.success)
+        self.assertEqual([command[1] for command in argv], ["snapshots", "unlock", "snapshots"])
+        self.assertIn("repository is already locked exclusively", result.error)
+
+    def test_lock_message_is_not_classified_as_restic_authentication_error(self):
+        message = (
+            "Restic failed: " + self.LOCK_STDERR
+            + "'restic unlock' only removes locks that restic considers stale; "
+            "a lock held by a live restic process on this or another host must finish or be released there"
+        )
+        code = WorkerAgentService._snapshot_listing_error_code(1, message)
+        self.assertNotEqual(code, WorkerAgentService.RESTIC_AUTHENTICATION_ERROR_CODE)
 
 
 class _RecordingJobsService:

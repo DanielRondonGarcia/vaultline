@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import logging
+import re
 import shutil
 import stat
 import tempfile
@@ -21,6 +22,32 @@ logger = logging.getLogger(__name__)
 
 SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
 UNSUPPORTED_METADATA = ["acl", "xattr", "timestamps", "special metadata"]
+RESTIC_LOCK_MARKERS = ("repository is already locked", "unable to create lock in backend")
+RESTIC_LOCK_STILL_HELD_HINT = (
+    "'restic unlock' only removes locks that restic considers stale; "
+    "a lock held by a live restic process on this or another host must finish or be released there"
+)
+_RESTIC_LOCK_AGE = re.compile(r"\(([^()]+) ago\)")
+
+
+def _text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value if isinstance(value, str) else ""
+
+
+def describe_restic_lock(stderr: Any, return_code: int) -> Optional[str]:
+    """Return a short description when a failed restic command hit a repository lock, else None."""
+    if return_code == 0 or not isinstance(stderr, str):
+        return None
+    lines = [line.strip() for line in stderr.splitlines() if line.strip()]
+    if not any(marker in line.casefold() for line in lines for marker in RESTIC_LOCK_MARKERS):
+        return None
+    for line in lines:
+        age = _RESTIC_LOCK_AGE.search(line)
+        if "lock was created at" in line.casefold() and age:
+            return f"lock created {age.group(1)} ago"
+    return "lock age unknown"
 
 
 def _require_executable(name: str) -> str:
@@ -476,6 +503,50 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             return_code = getattr(process, "returncode", 1)
         return "".join(stdout_lines), "".join(stderr_lines), int(return_code or 0)
 
+    def _run_restic_command(
+        self, command: list[str], env: dict[str, str], capture_stdout: bool = False
+    ) -> tuple[str, str, int]:
+        try:
+            completed = subprocess.run(
+                command,
+                env=env,
+                check=True,
+                stdout=subprocess.PIPE if capture_stdout else None,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.CalledProcessError as exc:
+            self._echo_stderr(exc.stderr)
+            return _text(exc.output), _text(exc.stderr), int(exc.returncode or 1)
+        self._echo_stderr(completed.stderr)
+        return _text(completed.stdout), _text(completed.stderr), 0
+
+    @classmethod
+    def _echo_stderr(cls, text: Any) -> None:
+        if isinstance(text, str) and text:
+            cls._emit_process_line(text, sys.stderr, None)
+
+    def _run_with_lock_recovery(
+        self, restic: str, env: dict[str, str], run: Callable[[], tuple[str, str, int]]
+    ) -> tuple[str, str, int]:
+        stdout, stderr, return_code = run()
+        lock = describe_restic_lock(stderr, return_code)
+        if lock is None:
+            return stdout, stderr, return_code
+        logger.info("Restic repository is locked (%s); running 'restic unlock' to clear stale locks", lock)
+        _unlock_stdout, _unlock_stderr, unlock_status = self._run_restic_command([restic, "unlock"], env, capture_stdout=True)
+        if unlock_status == 0:
+            logger.info("'restic unlock' finished; retrying the locked restic command once")
+        else:
+            logger.warning("'restic unlock' exited with status %s; retrying the locked restic command once", unlock_status)
+        stdout, stderr, return_code = run()
+        if describe_restic_lock(stderr, return_code) is not None:
+            logger.error("Restic repository is still locked after 'restic unlock' (%s); %s", lock, RESTIC_LOCK_STILL_HELD_HINT)
+            stderr = f"{stderr.rstrip()}\n{RESTIC_LOCK_STILL_HELD_HINT}\n"
+        return stdout, stderr, return_code
+
     def perform_backup(
         self,
         config: BackupConfig,
@@ -498,9 +569,12 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             env = restic_subprocess_environment(env)
             # Check if repo is initialized
             init_check_cmd = [restic, "snapshots", "--json", "--latest", "1"]
-            try:
-                subprocess.run(init_check_cmd, env=env, capture_output=True, check=True)
-            except subprocess.CalledProcessError:
+            check_stdout, check_stderr, check_status = self._run_with_lock_recovery(
+                restic, env, lambda: self._run_restic_command(init_check_cmd, env, capture_stdout=True)
+            )
+            if check_status != 0:
+                if describe_restic_lock(check_stderr, check_status) is not None:
+                    raise subprocess.CalledProcessError(check_status, init_check_cmd, output=check_stdout, stderr=check_stderr)
                 logger.info("Restic repository not initialized or not accessible. Attempting to initialize...")
                 # Try to init
                 try:
@@ -513,7 +587,9 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                     raise e
 
             cmd = [restic, "backup", "--json"] + sources
-            stdout, stderr, return_code = self._run_incremental_backup(cmd, env, output_callback)
+            stdout, stderr, return_code = self._run_with_lock_recovery(
+                restic, env, lambda: self._run_incremental_backup(cmd, env, output_callback)
+            )
             if return_code != 0:
                 raise subprocess.CalledProcessError(return_code, cmd, output=stdout, stderr=stderr)
 
@@ -547,11 +623,17 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                 if config.restic_prune
                 else "Applying Restic retention rules without pruning..."
             )
-            try:
-                subprocess.run(prune_cmd, env=env, check=True)
-            except subprocess.CalledProcessError as exc:
-                logger.error("Restic retention command failed with exit status %s", exc.returncode)
-                raise RuntimeError("Restic retention command failed") from None
+            _prune_stdout, prune_stderr, prune_status = self._run_with_lock_recovery(
+                restic, env, lambda: self._run_restic_command(prune_cmd, env)
+            )
+            if prune_status != 0:
+                logger.error("Restic retention command failed with exit status %s", prune_status)
+                lock = describe_restic_lock(prune_stderr, prune_status)
+                if lock is not None:
+                    raise RuntimeError(
+                        f"Restic retention command failed: repository is locked ({lock}); {RESTIC_LOCK_STILL_HELD_HINT}"
+                    )
+                raise RuntimeError("Restic retention command failed")
             logger.info(
                 "Pruning finished successfully."
                 if config.restic_prune

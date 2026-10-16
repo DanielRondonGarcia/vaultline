@@ -412,6 +412,23 @@ en cada arranque del servicio: ninguna exclusión por ruta la cubría. Si vienes
 de una de esas versiones, instala primero el MSI nuevo y luego añade la
 exclusión; no excluyas carpetas temporales ni todo `C:\Program Files\Vaultline`.
 
+##### El repositorio Restic queda bloqueado tras un job terminado a la fuerza
+
+**Síntoma**: el backup o la retención fallan con
+`unable to create lock in backend: repository is already locked by PID … lock was created at … (<edad> ago)`.
+Un `restic` terminado a mitad (Defender, reinicio, kill del servicio) deja su
+lock huérfano en el repositorio; `forget --prune` necesita un lock exclusivo
+y falla aunque `backup` siga pasando.
+
+**Solución**: automática. El worker detecta ese error en `snapshots`,
+`backup` y `forget`, registra
+`Restic repository is locked (lock created <edad> ago); running 'restic unlock' to clear stale locks`,
+ejecuta `restic unlock` (nunca `--remove-all`: solo retira locks que Restic
+considera obsoletos) y reintenta el comando una única vez. Si el segundo
+intento sigue bloqueado, el job falla con el mensaje original de Restic: el
+lock pertenece a un `restic` vivo en este u otro host; espera a que termine o
+libéralo allí.
+
 ##### Alternativa: ejecutable portable
 
 El `.exe` portable sigue publicándose para dos usos:

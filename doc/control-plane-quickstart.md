@@ -348,13 +348,16 @@ completo en una PowerShell **elevada** (Run as administrator). Descarga el MSI,
 lo instala en silencio esperando a que termine (SmartScreen puede advertir: el
 MSI no está firmado), recarga el `PATH` de la sesión (el MSI añade
 `C:\Program Files\Vaultline` al `PATH` del sistema, pero la consola abierta no
-lo ve hasta recargarlo), enrola y muestra el estado:
+lo ve hasta recargarlo), excluye el `rclone.exe` instalado de Microsoft Defender
+(ver [Defender termina rclone](#defender-termina-rclone-a-mitad-del-backup)),
+enrola y muestra el estado:
 
 ```powershell
 $msi = "$env:TEMP\vaultline-worker_<version>_windows-amd64.msi"
 Invoke-WebRequest -Uri https://github.com/DanielRondonGarcia/vaultline/releases/download/<version>/vaultline-worker_<version>_windows-amd64.msi -OutFile $msi
 Start-Process msiexec.exe -ArgumentList ('/i "{0}" /qn /norestart' -f $msi) -Wait
 $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+Add-MpPreference -ExclusionPath "C:\Program Files\Vaultline\rclone.exe"
 vaultline-worker enroll --control-plane-url https://backups.example.com --bootstrap-token <token>
 vaultline-worker service status
 ```
@@ -375,6 +378,37 @@ Actualizar: instala el MSI nuevo encima del anterior; el estado se conserva y no
 hace falta re-enrolar. Desinstalar: `msiexec /x vaultline-worker_<version>_windows-amd64.msi /qn`
 (o Panel de control) elimina el servicio y el ejecutable, pero conserva
 `C:\ProgramData\Vaultline\worker`.
+
+##### Defender termina rclone a mitad del backup
+
+**Síntoma**: un job con repositorio `rclone:` falla con
+`rclone stdio connection already closed` y no aparece ninguna línea `rclone:`
+en stderr: Restic pierde a su hijo rclone sin que rclone llegue a reportar un
+error propio.
+
+**Confirmación**: la detección de comportamiento `Behavior:Win32/SuspRclone.A`
+de Microsoft Defender termina el proceso (`rclone.exe` sin firmar, lanzado
+desde el servicio en Session 0 y abriendo conexiones FTP/SFTP). Queda
+registrada con los eventos 1116 (detección) y 1117 (acción tomada):
+
+```powershell
+Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = 1116, 1117 } | Where-Object { $_.Message -match 'SuspRclone' } | Select-Object TimeCreated, Id, Message
+```
+
+**Solución**: excluye únicamente el `rclone.exe` instalado. El bloque de
+instalación ya lo hace; si instalaste sin él, ejecútalo en una PowerShell
+elevada:
+
+```powershell
+Add-MpPreference -ExclusionPath "C:\Program Files\Vaultline\rclone.exe"
+```
+
+Desde esta versión `restic.exe` y `rclone.exe` viven en
+`C:\Program Files\Vaultline`, una ruta estable que sí se puede excluir. Las
+versiones anteriores extraían rclone a `%TEMP%\_MEIxxxx`, una carpeta distinta
+en cada arranque del servicio: ninguna exclusión por ruta la cubría. Si vienes
+de una de esas versiones, instala primero el MSI nuevo y luego añade la
+exclusión; no excluyas carpetas temporales ni todo `C:\Program Files\Vaultline`.
 
 ##### Alternativa: ejecutable portable
 

@@ -2090,12 +2090,20 @@ class WorkerUiStateTests(unittest.TestCase):
         self.assertIn("Start-Process msiexec.exe -ArgumentList ('/i \"{0}\" /qn /norestart' -f $msi) -Wait", windows_commands)
         # A fresh install updates the machine PATH only; the session must reload it.
         self.assertIn('$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine")', windows_commands)
+        # Defender's Behavior:Win32/SuspRclone.A kills rclone mid-backup; the
+        # exclusion is one explicit line scoped to the single installed file.
+        self.assertIn('Add-MpPreference -ExclusionPath "C:\\\\Program Files\\\\Vaultline\\\\rclone.exe"', windows_commands)
+        self.assertEqual(windows_commands.count("Add-MpPreference"), 1)
+        self.assertNotIn("-ExclusionProcess", windows_commands)
+        self.assertNotIn('-ExclusionPath "C:\\\\Program Files\\\\Vaultline"', windows_commands)
         self.assertIn("vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", windows_commands)
         self.assertIn("vaultline-worker service status", windows_commands)
         self.assertLess(windows_commands.index("Invoke-WebRequest"), windows_commands.index("msiexec.exe"))
         self.assertLess(windows_commands.index("msiexec.exe"), windows_commands.index("$env:Path ="))
-        self.assertLess(windows_commands.index("$env:Path ="), windows_commands.index("enroll --control-plane-url"))
+        self.assertLess(windows_commands.index("$env:Path ="), windows_commands.index("Add-MpPreference"))
+        self.assertLess(windows_commands.index("Add-MpPreference"), windows_commands.index("enroll --control-plane-url"))
         self.assertLess(windows_commands.index("enroll --control-plane-url"), windows_commands.index("service status"))
+        self.assertNotIn("Add-MpPreference", linux_commands)
 
         self.assertIn("curl -fsSL -o ${packageName} ${assetUrl}", linux_commands)
         self.assertIn("sudo dpkg -i ${packageName}", linux_commands)
@@ -2122,6 +2130,10 @@ class WorkerUiStateTests(unittest.TestCase):
         ):
             self.assertNotIn(stale, tab_source)
         self.assertIn("SmartScreen", tab_source)
+        # The WHY of the Defender exclusion lives in the panel text, not the block.
+        self.assertIn("Behavior:Win32/SuspRclone.A", tab_source)
+        self.assertIn("rclone stdio connection already closed", tab_source)
+        self.assertIn("acotada a un unico archivo instalado", tab_source)
         self.assertIn("sin reiniciar", tab_source)
         self.assertIn("sin necesidad de volver a enrolar", tab_source)
         self.assertIn("worker.env es opcional", tab_source)

@@ -1338,15 +1338,18 @@ sudo systemctl status docker-volume-backup-worker.service --no-pager`;
       // msiexec returns immediately in PowerShell; Start-Process -Wait keeps the
       // pasted block sequential. The MSI appends C:\Program Files\Vaultline to
       // the machine PATH, which the current session does not see until reloaded.
+      // Defender's Behavior:Win32/SuspRclone.A detection terminates the unsigned
+      // rclone mid-backup; the exclusion is scoped to the single installed file.
       const windowsCommands = `$msi = "$env:TEMP\\${packageName}"
 Invoke-WebRequest -Uri ${assetUrl} -OutFile $msi
 Start-Process msiexec.exe -ArgumentList ('/i "{0}" /qn /norestart' -f $msi) -Wait
 $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
+Add-MpPreference -ExclusionPath "C:\\Program Files\\Vaultline\\rclone.exe"
 vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}
 vaultline-worker service status`;
       const commands = info.os === "windows" ? windowsCommands : linuxCommands;
       const platformNote = info.os === "windows"
-        ? "Windows x64: ejecuta el bloque en una PowerShell elevada (Run as administrator). Instala el servicio SCM VaultlineWorker desde el MSI (LocalSystem, inicio automatico). Estado y credenciales en C:\\ProgramData\\Vaultline\\worker; logs en C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log. El MSI y el ejecutable no estan firmados: puede aparecer SmartScreen. El ejecutable portable queda solo para diagnostico (vaultline-worker.exe daemon) o para registrar el servicio a mano (service install)."
+        ? "Windows x64: ejecuta el bloque en una PowerShell elevada (Run as administrator). Instala el servicio SCM VaultlineWorker desde el MSI (LocalSystem, inicio automatico). Estado y credenciales en C:\\ProgramData\\Vaultline\\worker; logs en C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log. El MSI y el ejecutable no estan firmados: puede aparecer SmartScreen. El bloque agrega una exclusion de Microsoft Defender acotada a un unico archivo instalado, C:\\Program Files\\Vaultline\\rclone.exe: la deteccion de comportamiento Behavior:Win32/SuspRclone.A (eventos 1116/1117) termina rclone a mitad del backup y el job falla con 'rclone stdio connection already closed'. El ejecutable portable queda solo para diagnostico (vaultline-worker.exe daemon) o para registrar el servicio a mano (service install)."
         : "Linux requiere glibc >= 2.17. El .deb crea el usuario dvb-worker, /var/lib/docker-volume-backup y docker-volume-backup-worker.service; sigue los logs con journalctl -u docker-volume-backup-worker.service -f. /etc/docker-volume-backup/worker.env es opcional: solo para overrides como WORKER_NAME o WORKER_POLL_INTERVAL_SECONDS (el entorno siempre gana sobre worker.json).";
       const tokenNotice = enrollment && enrollment.secret
         ? `<div class="alert info" role="status"><strong>Token de un solo uso en el comando.</strong> El comando <code>enroll</code> ya incluye el bootstrap token: expira ${ttlMinutes ? `en ${escapeHtml(String(ttlMinutes))} minutos` : "al cumplirse el TTL configurado"} (${escapeHtml(fmtDate(enrollment.expires_at))}) y se invalida al usarse. Si el enrolamiento falla después de ese plazo, vuelve a <strong>Generar credencial</strong> y copia los comandos de nuevo. Si lo prefieres, limpia el historial de la terminal después de enrolar.</div>`

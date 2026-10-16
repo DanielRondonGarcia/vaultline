@@ -77,6 +77,7 @@ class NativeWorkerDocsTests(unittest.TestCase):
         self.assertIn("Invoke-WebRequest -Uri https://github.com/DanielRondonGarcia/vaultline/releases/download/<version>/vaultline-worker_<version>_windows-amd64.msi -OutFile $msi", windows_block)
         self.assertIn("Start-Process msiexec.exe -ArgumentList ('/i \"{0}\" /qn /norestart' -f $msi) -Wait", windows_block)
         self.assertIn('$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine")', windows_block)
+        self.assertIn('Add-MpPreference -ExclusionPath "C:\\Program Files\\Vaultline\\rclone.exe"', windows_block)
         self.assertIn("vaultline-worker enroll --control-plane-url https://backups.example.com --bootstrap-token <token>", windows_block)
         self.assertIn("vaultline-worker service status", windows_block)
         self.assertIn("C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log", windows)
@@ -84,7 +85,8 @@ class NativeWorkerDocsTests(unittest.TestCase):
         self.assertIn("`restic.exe` y `rclone.exe`", windows)
         self.assertLess(windows_block.index("Invoke-WebRequest"), windows_block.index("msiexec.exe"))
         self.assertLess(windows_block.index("msiexec.exe"), windows_block.index("$env:Path ="))
-        self.assertLess(windows_block.index("$env:Path ="), windows_block.index("enroll --control-plane-url"))
+        self.assertLess(windows_block.index("$env:Path ="), windows_block.index("Add-MpPreference"))
+        self.assertLess(windows_block.index("Add-MpPreference"), windows_block.index("enroll --control-plane-url"))
         self.assertLess(windows_block.index("enroll --control-plane-url"), windows_block.index("service status"))
         self.assertIn("msiexec /x", windows)
         self.assertIn("vaultline-worker.exe daemon", windows)
@@ -120,6 +122,30 @@ class NativeWorkerDocsTests(unittest.TestCase):
         # Developer checkout flow is preserved.
         self.assertIn("python -m src.worker_agent.cli daemon", native)
 
+    def test_quickstart_troubleshoots_defender_terminating_the_installed_rclone(self):
+        start = self.quickstart.index("##### Defender termina rclone a mitad del backup")
+        end = self.quickstart.index("##### Alternativa: ejecutable portable")
+        entry = self.quickstart[start:end]
+        self.assertLess(self.quickstart.index("#### Runner Windows como servicio (MSI)"), start)
+
+        # Symptom -> confirmation -> fix -> why the stable path matters.
+        self.assertIn("rclone stdio connection already closed", entry)
+        self.assertIn("no aparece ninguna línea `rclone:`", entry)
+        self.assertIn("Behavior:Win32/SuspRclone.A", entry)
+        self.assertIn("eventos 1116 (detección) y 1117 (acción tomada)", entry)
+        blocks = self._fenced_blocks(entry)
+        self.assertEqual(len(blocks), 2)
+        self.assertIn("Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-Windows Defender/Operational'; Id = 1116, 1117 }", blocks[0])
+        self.assertIn("SuspRclone", blocks[0])
+        self.assertEqual(blocks[1].strip(), 'Add-MpPreference -ExclusionPath "C:\\Program Files\\Vaultline\\rclone.exe"')
+        self.assertIn("Desde esta versión `restic.exe` y `rclone.exe` viven en\n`C:\\Program Files\\Vaultline`", entry)
+        self.assertIn("%TEMP%\\_MEIxxxx", entry)
+        self.assertIn("instala primero el MSI nuevo", entry)
+        self.assertIn("no excluyas carpetas temporales ni todo `C:\\Program Files\\Vaultline`", entry)
+        self.assertNotIn("-ExclusionProcess", entry)
+        # The install section links to the entry instead of repeating it.
+        self.assertIn("(#defender-termina-rclone-a-mitad-del-backup)", self.quickstart)
+
     def test_readme_links_to_native_worker_package_guidance_concisely(self):
         self.assertIn("packaged native worker guide", self.readme)
         self.assertIn("doc/control-plane-quickstart.md#worker-nativo-empaquetado-v2-seguro", self.readme)
@@ -131,6 +157,20 @@ class NativeWorkerDocsTests(unittest.TestCase):
         self.assertIn("(`C:\\Program Files\\Vaultline` or `/usr/lib/vaultline`)", self.readme)
         self.assertIn("keep `rclone.conf` and repository credentials in separate secrets", self.readme)
         self.assertNotIn("Task Scheduler", self.readme)
+
+    def test_readme_troubleshoots_defender_terminating_rclone_in_one_entry(self):
+        entry = re.search(r"(?m)^Windows troubleshooting: .*$", self.readme)
+        self.assertIsNotNone(entry)
+        entry = entry.group(0)
+        self.assertIn("rclone stdio connection already closed", entry)
+        self.assertIn("no `rclone:` stderr", entry)
+        self.assertIn("Behavior:Win32/SuspRclone.A", entry)
+        self.assertIn("`Get-WinEvent` on the `Microsoft-Windows-Windows Defender/Operational` log (event Ids 1116/1117)", entry)
+        self.assertIn('Add-MpPreference -ExclusionPath "C:\\Program Files\\Vaultline\\rclone.exe"', entry)
+        self.assertIn("From this version the binaries live in `C:\\Program Files\\Vaultline`", entry)
+        self.assertIn("upgrade the MSI first", entry)
+        self.assertIn("doc/control-plane-quickstart.md#defender-termina-rclone-a-mitad-del-backup", entry)
+        self.assertEqual(self.readme.count("Add-MpPreference"), 1)
 
     def test_public_docs_use_canonical_vaultline_repository_and_images(self):
         docs_by_path = {path: path.read_text(encoding="utf-8") for path in DOCS_TO_AUDIT}

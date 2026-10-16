@@ -23,7 +23,7 @@ _RESTIC_LS_HEADER = re.compile(
     r"^snapshot (?P<snapshot>[0-9a-fA-F]{8,64}) of \[[^\]\r\n]{0,4096}\] "
     r"(?:filtered by \[[^\]\r\n]{0,4096}\] at (?P<filtered_at>" + _HEADER_TIMESTAMP + r")|"
     r"at (?P<listed_at>" + _HEADER_TIMESTAMP + r")"
-    r"(?: by [^@\s:\[\]]+@[^@\s:\[\]]+)? filtered by \[[^\]\r\n]{0,4096}\])\:$"
+    r"(?: by (?P<identity>(?:[^@\r\n]*@)+[^@\r\n]*))? filtered by \[[^\]\r\n]{0,4096}\])\:$"
 )
 
 

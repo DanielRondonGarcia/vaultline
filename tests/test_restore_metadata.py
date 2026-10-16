@@ -148,6 +148,28 @@ class RestoreMetadataTests(unittest.TestCase):
         self.assertEqual(evidence.snapshot, "85ce8467")
         self.assertEqual([item.path for item in evidence.files], ["/data/file"])
 
+    def test_header_accepts_arbitrary_restic_identity_text(self):
+        output = (
+            "snapshot 85ce8467 of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC "
+            "by backup@realm@[2001:db8::1] filtered by []:\n"
+            f"{line(path='/data/file')}"
+        )
+
+        evidence = parse_restic_ls_long(output, snapshot="85ce8467")
+
+        self.assertTrue(evidence.success)
+        self.assertEqual(evidence.snapshot, "85ce8467")
+
+    def test_header_rejects_identity_without_at_sign(self):
+        output = (
+            "snapshot 85ce8467 of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC "
+            "by backup-host filtered by []:\n"
+            f"{line(path='/data/file')}"
+        )
+
+        with self.assertRaisesRegex(ResticMetadataError, "inspection"):
+            parse_restic_ls_long(output, snapshot="85ce8467")
+
     def test_restic_long_format_accepts_sticky_directory_mode(self):
         evidence = parse_restic_ls_long(line(mode="dtrwxrwxrwx", path="/tmp"))
 

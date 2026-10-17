@@ -348,12 +348,11 @@ class AuditReportsMatrixTests(unittest.TestCase):
             "Servicio",
             "Servidor",
             "Periodicidad",
-            "Retenci&oacute;n",
-            ">Exitoso %<",
-            ">Fallido %<",
-            "Bytes procesados",
-            "Bytes agregados al backend",
-            "Ubicaci&oacute;n",
+            "Retención",
+            "Exitoso %",
+            "Fallido %",
+            "Tamaño de origen procesado",
+            "Ubicación",
         ):
             self.assertIn(label, self.source)
 
@@ -367,16 +366,12 @@ class AuditReportsMatrixTests(unittest.TestCase):
         ):
             self.assertIn(marker, row_source)
 
-    def test_matrix_reports_separate_processed_and_added_size_with_coverage(self):
+    def test_matrix_reports_exact_processed_size_with_job_coverage(self):
         self.assertIsNotNone(self.row)
         row_source = self.row.group(0)
-        for marker in (
-            "bytes_processed",
-            "bytes_added",
-            "reported_jobs",
-            "unavailable_jobs",
-        ):
+        for marker in ("bytes_processed", "reported_jobs", "unavailable_jobs"):
             self.assertIn(marker, row_source)
+        self.assertNotIn("bytes_added", row_source)
         # Percentages and sizes are never invented: missing values render as
         # "n/a" rather than zero.
         self.assertIn("n/a", row_source)
@@ -433,11 +428,7 @@ const sample = {
   failed_percent: 25,
   backup_size: {
     bytes_processed: 1234,
-    bytes_added: 567,
-    coverage: {
-      bytes_processed: { reported_jobs: 4, unavailable_jobs: 0 },
-      bytes_added: { reported_jobs: 3, unavailable_jobs: 1 },
-    },
+    coverage: { bytes_processed: { reported_jobs: 4, unavailable_jobs: 0 } },
   },
   storage_location: { backend_type: "rclone", storage_profile_name: "s3-prod", path_storage: "s3:prod/vault" },
   target_id: "t-1",
@@ -454,7 +445,12 @@ const missing = {
   storage_location: {},
   target_id: "t-2",
 };
-process.stdout.write(JSON.stringify({ html: reportMatrixRowHtml(sample), missing: reportMatrixRowHtml(missing) }));
+const partial = {
+  ...sample,
+  target_id: "t-3",
+  backup_size: { bytes_processed: 1234, coverage: { bytes_processed: { reported_jobs: 3, unavailable_jobs: 1 } } },
+};
+process.stdout.write(JSON.stringify({ html: reportMatrixRowHtml(sample), missing: reportMatrixRowHtml(missing), partial: reportMatrixRowHtml(partial) }));
 '''
         )
         result = subprocess.run(
@@ -482,10 +478,10 @@ process.stdout.write(JSON.stringify({ html: reportMatrixRowHtml(sample), missing
         self.assertIn("75", output["html"])
         self.assertIn("25", output["html"])
         self.assertIn("1234 B", output["html"])
-        self.assertIn("567 B", output["html"])
+        self.assertNotIn("567 B", output["html"])
         self.assertIn("Dato exacto en todas las 4 ejecuciones del período.", output["html"])
-        self.assertIn("Parcial: 3 de 4 ejecuciones reportaron este dato", output["html"])
-        self.assertIn("No se estiman los faltantes.", output["html"])
+        self.assertIn("Parcial: 3 de 4 ejecuciones reportaron este dato", output["partial"])
+        self.assertIn("No se estiman los faltantes.", output["partial"])
         self.assertIn("rclone", output["html"])
         self.assertIn("s3:prod/vault", output["html"])
         # Missing values are honest: n/a, never zero, and readable placeholders.
@@ -555,7 +551,7 @@ class AuditReportsLayoutTests(unittest.TestCase):
     def test_report_preview_has_section_spacing_and_a_readable_scrollable_matrix(self):
         self.assertIn('<div id="reportPreviewRegion" class="report-preview-region"', self.source)
         self.assertIn('<div class="table-wrap report-table-wrap">', self.source)
-        self.assertIn('<table class="table report-table"', self.source)
+        self.assertIn('<table class="table datatable report-table"', self.source)
         for marker in (
             ".report-preview-region {",
             "gap: 16px;",
@@ -572,7 +568,146 @@ class AuditReportsLayoutTests(unittest.TestCase):
         self.assertNotIn("report-coverage-note", self.source)
         self.assertNotIn(".report-coverage-note", self.styles)
         self.assertIn("reportCoverageText(metrics.bytes_processed)", self.source)
-        self.assertIn("reportCoverageText(metrics.bytes_added)", self.source)
+        self.assertNotIn("reportCoverageText(metrics.bytes_added)", self.source)
+        self.assertNotIn("Bytes agregados al backend", self.source)
+        self.assertNotIn('sizeCell("bytes_added")', self.source)
+
+    def test_report_summary_shows_exact_size_and_target_metric_coverage_separately(self):
+        for marker in (
+            'class="report-size-summary"',
+            "Tamaño de origen procesado",
+            "Targets con medición",
+            "measuredTargetCount",
+            "summary.target_count",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.source)
+
+    def test_report_matrix_has_search_and_sort_controls(self):
+        for marker in (
+            'id="reportMatrixFilter"',
+            'class="table datatable report-table"',
+            'data-report-sort="${key}"',
+            'id="reportMatrixCount"',
+            'addEventListener("input"',
+            'addEventListener("click"',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.source)
+
+
+class AuditReportsMatrixBehaviorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UI_PATH.read_text(encoding="utf-8")
+        cls.matrix_filter_sort = re.search(
+            r"(function filterAndSortReportMatrix\(rows, query, sortKey, sortDir\) \{.*?\n    \})",
+            cls.source,
+            re.S,
+        )
+
+    def test_filtering_and_numeric_sorting_apply_to_report_targets(self):
+        self.assertIsNotNone(self.matrix_filter_sort)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = (
+            '"use strict";\n'
+            + self.matrix_filter_sort.group(1)
+            + "\n"
+            + r'''const rows = [
+  { service: "Zulu", server: { name: "North", host: "west-1" }, backup_size: { bytes_processed: 90 } },
+  { service: "Alpha", server: { name: "South", host: "west-2" }, backup_size: { bytes_processed: 10 } },
+  { service: "Beta", server: { name: "East", host: "east-1" }, backup_size: { bytes_processed: 30 } },
+];
+const asc = filterAndSortReportMatrix(rows, "west", "bytes_processed", "asc").map(row => row.service);
+const desc = filterAndSortReportMatrix(rows, "west", "bytes_processed", "desc").map(row => row.service);
+const alphabetical = filterAndSortReportMatrix(rows, "", "service", "asc").map(row => row.service);
+process.stdout.write(JSON.stringify({ asc, desc, alphabetical }));
+'''
+        )
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            {"asc": ["Alpha", "Zulu"], "desc": ["Zulu", "Alpha"], "alphabetical": ["Alpha", "Beta", "Zulu"]},
+        )
+
+    def test_target_coverage_counts_targets_with_exact_processed_size(self):
+        target_counter = re.search(
+            r"(function reportTargetsWithProcessedSize\(rows\) \{.*?\n    \})",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(target_counter)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = (
+            '"use strict";\n'
+            + target_counter.group(1)
+            + "\nprocess.stdout.write(String(reportTargetsWithProcessedSize(["
+            + '{ backup_size: { coverage: { bytes_processed: { reported_jobs: 2 } } } },'
+            + '{ backup_size: { coverage: { bytes_processed: { reported_jobs: 0 } } } },'
+            + '{ backup_size: {} }, null])));'
+        )
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "1")
+
+
+class AuditReportsSizeLabelBehaviorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UI_PATH.read_text(encoding="utf-8")
+        cls.label_helper = re.search(
+            r"(function reportSizeTotalLabel\(metric, measuredTargets, totalTargets\) \{.*?\n    \})",
+            cls.source,
+            re.S,
+        )
+
+    def test_partial_or_incomplete_target_coverage_never_uses_total_label(self):
+        self.assertIsNotNone(self.label_helper)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = (
+            '"use strict";\n'
+            + self.label_helper.group(1)
+            + "\nprocess.stdout.write(JSON.stringify(["
+            + 'reportSizeTotalLabel({ available: true, complete: true }, 2, 2),'
+            + 'reportSizeTotalLabel({ available: true, complete: true }, 1, 2),'
+            + 'reportSizeTotalLabel({ available: true, complete: false }, 2, 2),'
+            + 'reportSizeTotalLabel({ available: false, complete: false }, 0, 2),'
+            + 'reportSizeTotalLabel({ available: true, complete: true }, 0, 0)\n]));'
+        )
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout),
+            [
+                "Tamaño total calculado",
+                "Tamaño calculado (parcial)",
+                "Tamaño calculado (parcial)",
+                "Tamaño calculado",
+                "Tamaño calculado (parcial)",
+            ],
+        )
 
 
 class AuditReportsDownloadUrlBehaviorTests(unittest.TestCase):

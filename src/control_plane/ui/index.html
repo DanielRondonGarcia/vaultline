@@ -7118,6 +7118,94 @@ docker compose up -d
       return null;
     }
 
+    let reportTableState = { filter: "", sortKey: "service", sortDir: "asc" };
+
+    function filterAndSortReportMatrix(rows, query, sortKey, sortDir) {
+      const normalize = value => String(value === null || value === undefined ? "" : value)
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLocaleLowerCase("es-CO");
+      const numericKeys = new Set(["jobs", "succeeded_percent", "failed_percent", "bytes_processed"]);
+      const valueFor = row => {
+        const server = row.server || {};
+        const schedule = row.schedule || {};
+        const retention = row.retention || {};
+        const counts = row.job_counts || {};
+        const size = row.backup_size || {};
+        const location = row.storage_location || {};
+        switch (sortKey) {
+          case "server": return `${server.name || ""} ${server.host || ""}`;
+          case "schedule": return schedule.cron_expression || schedule.source || "";
+          case "retention": return retention.name || "";
+          case "jobs": return Number(counts.total) || 0;
+          case "succeeded_percent": return row.succeeded_percent;
+          case "failed_percent": return row.failed_percent;
+          case "bytes_processed": return size.bytes_processed;
+          case "location": return `${location.backend_type || ""} ${location.storage_profile_name || ""} ${location.path_storage || ""}`;
+          default: return row.service || "";
+        }
+      };
+      const searchableText = row => {
+        const server = row.server || {};
+        const schedule = row.schedule || {};
+        const retention = row.retention || {};
+        const counts = row.job_counts || {};
+        const size = row.backup_size || {};
+        const location = row.storage_location || {};
+        return normalize([
+          row.target_id, row.service, server.name, server.host,
+          schedule.cron_expression, schedule.source,
+          retention.name, retention.keep_last, retention.keep_hourly, retention.keep_daily,
+          retention.keep_weekly, retention.keep_monthly, retention.keep_yearly,
+          counts.succeeded, counts.failed, row.succeeded_percent, row.failed_percent,
+          size.bytes_processed, location.backend_type, location.storage_profile_name, location.path_storage,
+        ].join(" "));
+      };
+      const terms = normalize(query).trim().split(/\s+/).filter(Boolean);
+      const direction = sortDir === "desc" ? -1 : 1;
+      return (Array.isArray(rows) ? rows : [])
+        .filter(row => {
+          const text = searchableText(row);
+          return terms.every(term => text.includes(term));
+        })
+        .slice()
+        .sort((left, right) => {
+          const leftValue = valueFor(left);
+          const rightValue = valueFor(right);
+          const leftMissing = leftValue === null || leftValue === undefined || leftValue === "";
+          const rightMissing = rightValue === null || rightValue === undefined || rightValue === "";
+          if (leftMissing || rightMissing) return leftMissing === rightMissing ? 0 : leftMissing ? 1 : -1;
+          let order;
+          if (numericKeys.has(sortKey)) {
+            const leftNumber = Number(leftValue);
+            const rightNumber = Number(rightValue);
+            const leftInvalid = !Number.isFinite(leftNumber);
+            const rightInvalid = !Number.isFinite(rightNumber);
+            if (leftInvalid || rightInvalid) {
+              if (leftInvalid === rightInvalid) return 0;
+              return leftInvalid ? 1 : -1;
+            }
+            order = leftNumber - rightNumber;
+          } else {
+            order = normalize(leftValue).localeCompare(normalize(rightValue), "es-CO", { numeric: true });
+          }
+          return order * direction;
+        });
+    }
+
+    function reportTargetsWithProcessedSize(rows) {
+      return (Array.isArray(rows) ? rows : []).filter(row => {
+        const coverage = (((row || {}).backup_size || {}).coverage || {}).bytes_processed || {};
+        return Number(coverage.reported_jobs) > 0;
+      }).length;
+    }
+
+    function reportSizeTotalLabel(metric, measuredTargets, totalTargets) {
+      if (!metric || metric.available !== true) return "Tamaño calculado";
+      if (metric.complete === true && totalTargets > 0 && measuredTargets === totalTargets) {
+        return "Tamaño total calculado";
+      }
+      return "Tamaño calculado (parcial)";
+    }
+
     function reportCoverageText(metric) {
       const noData = "Sin datos exactos registrados para este período; no se estiman valores.";
       if (!metric) return noData;
@@ -7190,7 +7278,6 @@ docker compose up -d
         <td>${escapeHtml(percent(row.succeeded_percent))}</td>
         <td>${escapeHtml(percent(row.failed_percent))}</td>
         <td>${sizeCell("bytes_processed")}</td>
-        <td>${sizeCell("bytes_added")}</td>
         <td>${orDash(location.backend_type)}${location.storage_profile_name ? `<div class="helper">${orDash(location.storage_profile_name)}</div>` : ""}${location.path_storage ? `<div class="helper mono">${escapeHtml(location.path_storage)}</div>` : ""}</td>
       </tr>`;
     }
@@ -7203,23 +7290,93 @@ docker compose up -d
       const availability = (report.availability || {}).backup_size || {};
       const metrics = availability.metrics || {};
       const period = report.period || {};
+      const matrix = Array.isArray(report.matrix) ? report.matrix : [];
+      const targetCount = Number.isInteger(summary.target_count) && summary.target_count >= 0 ? summary.target_count : matrix.length;
+      const measuredTargetCount = reportTargetsWithProcessedSize(matrix);
+      const sizeTotalLabel = reportSizeTotalLabel(metrics.bytes_processed, measuredTargetCount, targetCount);
+      const formatCount = value => Number(value || 0).toLocaleString("es-CO");
       const orNA = value => value === null || value === undefined ? "n/a" : String(value);
       const percentText = value => value === null || value === undefined ? "n/a" : `${Number(value).toLocaleString("es-CO", { maximumFractionDigits: 2 })}%`;
       const bytesText = value => value === null || value === undefined ? "n/a" : (formatJobBytes(value) || `${Number(value).toLocaleString("es-CO")} B`);
+      const tableHeaders = [
+        ["service", "Servicio"], ["server", "Servidor"], ["schedule", "Periodicidad"],
+        ["retention", "Retención"], ["jobs", "Exitosos / Fallidos"],
+        ["succeeded_percent", "Exitoso %"], ["failed_percent", "Fallido %"],
+        ["bytes_processed", "Tamaño de origen procesado"], ["location", "Ubicación"],
+      ];
+      const sortHeader = ([key, label]) => {
+        const active = reportTableState.sortKey === key;
+        const ariaSort = active ? (reportTableState.sortDir === "asc" ? "ascending" : "descending") : "none";
+        const icon = active ? (reportTableState.sortDir === "asc" ? "↑" : "↓") : "↕";
+        return `<th scope="col" data-report-sort-col="${key}" aria-sort="${ariaSort}"><button type="button" class="report-sort-button" data-report-sort="${key}">${escapeHtml(label)} <span class="report-sort-indicator" aria-hidden="true">${icon}</span></button></th>`;
+      };
       region.innerHTML = `
         <div class="stat-grid">
           ${statCard("Servidores y servicios", "Targets", String(summary.target_count ?? 0), `periodo ${escapeHtml(period.start_date || range.start_date)} a ${escapeHtml(period.end_date || range.end_date)} · zona ${escapeHtml(period.timezone || "desconocida")}`)}
           ${statCard("Jobs de backup", "Total", String(summary.backup_job_count ?? 0), `exitosos ${orNA(summary.succeeded_count)} · fallidos ${orNA(summary.failed_count)}`)}
           ${statCard("Resultado", "Exitoso", percentText(summary.succeeded_percent), "sobre jobs completados")}
           ${statCard("Resultado", "Fallido", percentText(summary.failed_percent), "sobre jobs completados")}
-          ${statCard("Tamaño", "Bytes procesados", bytesText(size.bytes_processed), reportCoverageText(metrics.bytes_processed))}
-          ${statCard("Tamaño", "Bytes agregados al backend", bytesText(size.bytes_added), reportCoverageText(metrics.bytes_added))}
         </div>
-        <div class="table-wrap report-table-wrap"><div class="sheet"><table class="table report-table" aria-label="Matriz de backups por servidor y servicio">
-          <thead><tr><th>Servicio</th><th>Servidor</th><th>Periodicidad</th><th>Retenci&oacute;n</th><th>Exitosos / Fallidos</th><th>Exitoso %</th><th>Fallido %</th><th>Bytes procesados</th><th>Bytes agregados al backend</th><th>Ubicaci&oacute;n</th></tr></thead>
-          <tbody>${(report.matrix || []).map(reportMatrixRowHtml).join("") || `<tr><td colspan="10" class="empty-state">Sin targets configurados para el rango seleccionado</td></tr>`}</tbody>
+        <section class="report-size-summary" aria-label="Tamaño calculado y cobertura por target">
+          <div class="report-size-value">
+            <span class="report-size-label">${sizeTotalLabel}</span>
+            <strong>${bytesText(size.bytes_processed)}</strong>
+            <span class="helper">Suma exacta del tamaño de origen procesado informado por las ejecuciones Restic.</span>
+          </div>
+          <div class="report-size-coverage">
+            <span class="report-size-label">Targets con medición</span>
+            <strong>${formatCount(measuredTargetCount)} de ${formatCount(targetCount)}</strong>
+            <span class="helper">${escapeHtml(reportCoverageText(metrics.bytes_processed))}</span>
+          </div>
+        </section>
+        <div class="report-table-toolbar">
+          <label for="reportMatrixFilter">Filtrar targets</label>
+          <input id="reportMatrixFilter" class="dt-filter" type="search" placeholder="Servicio, servidor, periodicidad o ubicación…" value="${escapeHtml(reportTableState.filter)}" />
+          <span id="reportMatrixCount" role="status" aria-live="polite"></span>
+        </div>
+        <div class="table-wrap report-table-wrap"><div class="sheet"><table class="table datatable report-table" aria-label="Matriz de backups por servidor y servicio">
+          <thead><tr>${tableHeaders.map(sortHeader).join("")}</tr></thead>
+          <tbody id="reportMatrixBody"></tbody>
         </table></div></div>
       `;
+      const filterInput = region.querySelector("#reportMatrixFilter");
+      const tableBody = region.querySelector("#reportMatrixBody");
+      const resultCount = region.querySelector("#reportMatrixCount");
+      const renderMatrix = () => {
+        const visibleRows = filterAndSortReportMatrix(matrix, reportTableState.filter, reportTableState.sortKey, reportTableState.sortDir);
+        if (resultCount) resultCount.textContent = `Mostrando ${formatCount(visibleRows.length)} de ${formatCount(matrix.length)} targets`;
+        if (tableBody) {
+          const emptyText = reportTableState.filter.trim()
+            ? "No hay targets que coincidan con el filtro."
+            : "Sin targets configurados para el rango seleccionado.";
+          tableBody.innerHTML = visibleRows.map(reportMatrixRowHtml).join("") || `<tr><td colspan="9" class="empty-state">${emptyText}</td></tr>`;
+        }
+        region.querySelectorAll("th[data-report-sort-col]").forEach(th => {
+          const key = th.dataset.reportSortCol;
+          const active = reportTableState.sortKey === key;
+          th.setAttribute("aria-sort", active ? (reportTableState.sortDir === "asc" ? "ascending" : "descending") : "none");
+          const indicator = th.querySelector(".report-sort-indicator");
+          if (indicator) indicator.textContent = active ? (reportTableState.sortDir === "asc" ? "↑" : "↓") : "↕";
+        });
+      };
+      if (filterInput) {
+        filterInput.addEventListener("input", () => {
+          reportTableState.filter = filterInput.value;
+          renderMatrix();
+        });
+      }
+      region.querySelectorAll("[data-report-sort]").forEach(button => {
+        button.addEventListener("click", () => {
+          const key = button.dataset.reportSort;
+          if (reportTableState.sortKey === key) reportTableState.sortDir = reportTableState.sortDir === "asc" ? "desc" : "asc";
+          else {
+            reportTableState.sortKey = key;
+            reportTableState.sortDir = "asc";
+          }
+          renderMatrix();
+        });
+      });
+      renderMatrix();
     }
 
     async function loadReportPreview() {

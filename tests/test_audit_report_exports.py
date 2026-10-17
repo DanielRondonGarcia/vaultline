@@ -187,8 +187,8 @@ class BackupAuditXlsxExportTests(unittest.TestCase):
             header_row,
             (
                 "ID del destino", "Servicio", "Servidor (worker)", "Host del servidor", "Tipo de ejecución",
-                "Estrategia de respaldo", "Modo de respaldo", "Habilitado", "Programación (cron)",
-                "Origen de programación", "Zona horaria", "Política de retención", "Últimos",
+                "Estrategia de respaldo", "Modo de respaldo", "Habilitado", "Periodicidad",
+                "Origen del horario", "Hora local", "Política de retención", "Últimos",
                 "Cada hora", "Cada día", "Cada semana", "Cada mes", "Cada año",
                 "Depuración", "Trabajos totales", "Completados", "Correctos", "Fallidos", "Otros",
                 "Porcentaje de éxito", "Porcentaje de fallos", "Bytes de origen procesados", "Bytes agregados al backend",
@@ -242,8 +242,9 @@ class BackupAuditPdfExportTests(unittest.TestCase):
         # Both byte metrics and their independent coverage remain visible in Spanish.
         self.assertIn(b"2,048 bytes", body)
         self.assertIn(b"1,024 bytes", body)
-        self.assertIn(b"1/2 trabajos", body)
-        self.assertIn(b"(Parcial | 1/2 trabajos)", body)
+        self.assertIn(b"Dato exacto en 1 de 2 ejecuciones", body)
+        self.assertIn(b"(Parcial | Dato exacto en 1 de 2 ejecuciones)", body)
+        self.assertIn(b"(Periodicidad)", body)
 
 
 class BackupAuditRenderDispatchTests(unittest.TestCase):
@@ -317,12 +318,12 @@ class BackupAuditSpreadsheetInjectionTests(unittest.TestCase):
         self.assertEqual(summary["A10"].value, "Métrica")
         self.assertEqual(summary["A11"].value, "Bytes de origen procesados")
         self.assertEqual(summary["A12"].value, "Bytes agregados al backend")
-        self.assertEqual(summary["C11"].value, "1/2 trabajos")
-        self.assertEqual(summary["D11"].value, "Parcial")
+        self.assertEqual(summary["C11"].value, "Dato exacto en 1 de 2 ejecuciones")
+        self.assertEqual(summary["D11"].value, "Parcial (no cubre todo el período)")
         self.assertEqual(summary["B11"].value, 2048)
         self.assertEqual(summary["B12"].value, 1024)
         self.assertEqual(summary["A14"].value, "Método y calidad de los datos")
-        self.assertIn("sin estimarlos", summary["A15"].value)
+        self.assertIn("no se estiman valores faltantes", summary["A15"].value)
         self.assertIn("perfil de almacenamiento", summary["A17"].value)
         self.assertFalse(summary.sheet_view.showGridLines)
 
@@ -366,6 +367,87 @@ class BackupAuditPdfLayoutTests(unittest.TestCase):
         self.assertEqual(body.count(b"(Servicio / destino)"), page_count)
         self.assertIn(b"(P\xe1gina 1 de", body)
         self.assertIn(b"(P\xe1gina 2 de", body)
+
+
+class BackupAuditScheduleHumanizationTests(unittest.TestCase):
+    """S5 follow-up: plain-language periodicity without changing JSON/CSV contracts."""
+
+    def test_xlsx_matrix_humanizes_common_cron_patterns(self):
+        workbook = load_workbook(io.BytesIO(export_backup_audit_xlsx(_sample_report())))
+        matrix = workbook["Matriz de respaldos"]
+        data_row = next(row for row in matrix.iter_rows(values_only=True) if row and row[0] == "target-a")
+        columns = dict(zip(BACKUP_AUDIT_MATRIX_COLUMNS, data_row))
+        self.assertEqual(columns["schedule_cron"], "Todos los días a las 02:00 (cron: 0 2 * * *)")
+        self.assertEqual(columns["schedule_source"], "Configurado para este servicio")
+
+    def test_xlsx_matrix_labels_unsupported_cron_as_custom_and_retains_the_expression(self):
+        report = _sample_report()
+        report["matrix"][0]["schedule"]["cron_expression"] = "7,9 2 * * *"
+        workbook = load_workbook(io.BytesIO(export_backup_audit_xlsx(report)))
+        matrix = workbook["Matriz de respaldos"]
+        data_row = next(row for row in matrix.iter_rows(values_only=True) if row and row[0] == "target-a")
+        columns = dict(zip(BACKUP_AUDIT_MATRIX_COLUMNS, data_row))
+        self.assertEqual(columns["schedule_cron"], "Horario personalizado (cron: 7,9 2 * * *)")
+
+    def test_xlsx_matrix_uses_raw_fallback_for_composed_steps_and_ambiguous_day_fields(self):
+        for expression in ("*/15 */2 * * *", "0 2 1 * 1"):
+            with self.subTest(expression=expression):
+                report = _sample_report()
+                report["matrix"][0]["schedule"]["cron_expression"] = expression
+                workbook = load_workbook(io.BytesIO(export_backup_audit_xlsx(report)))
+                matrix = workbook["Matriz de respaldos"]
+                data_row = next(row for row in matrix.iter_rows(values_only=True) if row and row[0] == "target-a")
+                columns = dict(zip(BACKUP_AUDIT_MATRIX_COLUMNS, data_row))
+                self.assertEqual(columns["schedule_cron"], f"Horario personalizado (cron: {expression})")
+
+    def test_csv_and_json_exports_preserve_the_raw_cron_expression(self):
+        report = _sample_report()
+        rows = list(csv.reader(io.StringIO(export_backup_audit_csv(report).decode("utf-8"))))
+        columns = dict(zip(BACKUP_AUDIT_MATRIX_COLUMNS, rows[1]))
+        self.assertEqual(columns["schedule_cron"], "0 2 * * *")
+        json_text = export_backup_audit_json(report).decode("utf-8")
+        payload = json.loads(json_text)
+        self.assertEqual(payload, report)
+        self.assertNotIn("diario a las", json_text)
+
+    def test_xlsx_executive_summary_marks_partials_without_implying_a_full_period_total(self):
+        wb = load_workbook(io.BytesIO(export_backup_audit_xlsx(_sample_report())))
+        summary = wb["Resumen ejecutivo"]
+        self.assertIn("no representa la suma de todo el período", summary["A15"].value)
+        self.assertIn("estrategias que no generan esta medición", summary["A15"].value)
+        self.assertIn("no se estiman valores faltantes", summary["A15"].value)
+
+        complete_report = _sample_report()
+        complete_report["availability"]["backup_size"]["metrics"]["bytes_processed"]["complete"] = True
+        complete_report["summary"]["backup_size"]["coverage"]["bytes_processed"] = {
+            "reported_jobs": 2,
+            "unavailable_jobs": 0,
+        }
+        complete_wb = load_workbook(io.BytesIO(export_backup_audit_xlsx(complete_report)))
+        complete_summary = complete_wb["Resumen ejecutivo"]
+        self.assertEqual(complete_summary["C11"].value, "Dato exacto en todas las 2 ejecuciones del período.")
+        self.assertEqual(complete_summary["D11"].value, "Completo")
+
+
+class BackupAuditSchedulePdfHumanizationTests(unittest.TestCase):
+    def test_pdf_humanizes_the_schedule_while_keeping_the_raw_cron_available(self):
+        body = export_backup_audit_pdf(_sample_report())
+        self.assertIn("Todos los días a las".encode("latin-1"), body)
+        self.assertIn(b"02:00", body)
+        self.assertIn(b"cron: 0 2 * * *", body)
+        self.assertIn("Hora local".encode("latin-1"), body)
+        self.assertIn("Periodicidad".encode("latin-1"), body)
+
+    def test_pdf_falls_back_to_the_raw_cron_when_the_pattern_is_unsupported(self):
+        report = _sample_report()
+        report["matrix"][0]["schedule"]["cron_expression"] = "7,9 2 * * *"
+        body = export_backup_audit_pdf(report)
+        self.assertIn(b"Horario personalizado", body)
+        self.assertIn(b"cron: 7,9 2 * * *", body)
+
+    def test_pdf_states_that_partial_totals_do_not_cover_the_whole_period(self):
+        body = export_backup_audit_pdf(_sample_report())
+        self.assertIn("no representa la suma de todo el período".encode("latin-1"), body)
 
 
 if __name__ == "__main__":

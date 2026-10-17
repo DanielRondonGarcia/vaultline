@@ -398,11 +398,23 @@ class AuditReportsRowBehaviorTests(unittest.TestCase):
             self.source,
             re.S,
         )
+        cron_describe = re.search(r"(function cronDescribe\(cronExpr\) \{.*?\n    \})", self.source, re.S)
+        report_cron_description = re.search(r"(function reportCronDescription\(expression\) \{.*?\n    \})", self.source, re.S)
+        report_coverage = re.search(r"(function reportCoverageText\(metric\) \{.*?\n    \})", self.source, re.S)
         self.assertIsNotNone(row)
+        self.assertIsNotNone(cron_describe)
+        self.assertIsNotNone(report_cron_description)
+        self.assertIsNotNone(report_coverage)
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
         script = (
             '"use strict";\n'
+            + cron_describe.group(1)
+            + "\n"
+            + report_cron_description.group(1)
+            + "\n"
+            + report_coverage.group(1)
+            + "\n"
             + row.group(1)
             + "\n"
             + r'''
@@ -458,8 +470,9 @@ process.stdout.write(JSON.stringify({ html: reportMatrixRowHtml(sample), missing
         self.assertNotIn("<script>", output["html"])
         self.assertIn("&lt;script&gt;", output["html"])
         self.assertIn("10.0.0.1&quot;", output["html"])
-        self.assertIn("0 2 * * *", output["html"])
-        self.assertIn("America/Bogota", output["html"])
+        self.assertIn("Todos los días a las 02:00", output["html"])
+        self.assertIn("Expresión original: 0 2 * * *", output["html"])
+        self.assertIn("Hora local: America/Bogota", output["html"])
         self.assertIn("30-days", output["html"])
         self.assertIn("por hora 24", output["html"])
         self.assertIn("por semana 4", output["html"])
@@ -470,8 +483,9 @@ process.stdout.write(JSON.stringify({ html: reportMatrixRowHtml(sample), missing
         self.assertIn("25", output["html"])
         self.assertIn("1234 B", output["html"])
         self.assertIn("567 B", output["html"])
-        self.assertIn("4/4", output["html"])
-        self.assertIn("3/4", output["html"])
+        self.assertIn("Dato exacto en todas las 4 ejecuciones del período.", output["html"])
+        self.assertIn("Parcial: 3 de 4 ejecuciones reportaron este dato", output["html"])
+        self.assertIn("No se estiman los faltantes.", output["html"])
         self.assertIn("rclone", output["html"])
         self.assertIn("s3:prod/vault", output["html"])
         # Missing values are honest: n/a, never zero, and readable placeholders.
@@ -557,8 +571,8 @@ class AuditReportsLayoutTests(unittest.TestCase):
     def test_report_preview_omits_verbose_coverage_banner_but_keeps_metric_coverage(self):
         self.assertNotIn("report-coverage-note", self.source)
         self.assertNotIn(".report-coverage-note", self.styles)
-        self.assertIn("coverageText(metrics.bytes_processed)", self.source)
-        self.assertIn("coverageText(metrics.bytes_added)", self.source)
+        self.assertIn("reportCoverageText(metrics.bytes_processed)", self.source)
+        self.assertIn("reportCoverageText(metrics.bytes_added)", self.source)
 
 
 class AuditReportsDownloadUrlBehaviorTests(unittest.TestCase):
@@ -601,3 +615,151 @@ process.stdout.write(JSON.stringify(fmts));
                 output[fmt],
                 f"/api/v1/reports/backups/download/{fmt}?start_date=2026-04-01&end_date=2026-04-30",
             )
+
+
+class AuditReportsHumanizedScheduleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UI_PATH.read_text(encoding="utf-8")
+
+    def test_periodicidad_cell_uses_the_report_cron_description_helper(self):
+        row = re.search(r"(function reportMatrixRowHtml\(row\) \{.*?\n    \})", self.source, re.S)
+        self.assertIsNotNone(row)
+        self.assertIn("reportCronDescription(schedule.cron_expression)", row.group(1))
+
+    def test_report_cron_description_translates_common_patterns_and_falls_back_honestly(self):
+        cron_describe = re.search(r"(function cronDescribe\(cronExpr\) \{.*?\n    \})", self.source, re.S)
+        description = re.search(r"(function reportCronDescription\(expression\) \{.*?\n    \})", self.source, re.S)
+        self.assertIsNotNone(cron_describe)
+        self.assertIsNotNone(description)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = (
+            '"use strict";\n'
+            + cron_describe.group(1)
+            + "\n"
+            + description.group(1)
+            + r'''
+const cases = {};
+for (const expr of ["0 2 * * *", "15 3 * * 1", "0 */6 * * *", "30 * * * *", "*/15 * * * *", "0 2 1 * *"]) {
+  cases[expr] = reportCronDescription(expr);
+}
+process.stdout.write(JSON.stringify({ cases, commaList: reportCronDescription("7,9 2 * * *"), range: reportCronDescription("0 2 * * 1-5"), combinedSteps: reportCronDescription("*/15 */2 * * *"), bothDayFields: reportCronDescription("0 2 1 * 1"), empty: reportCronDescription(""), malformed: reportCronDescription("no cron") }));
+'''
+        )
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["cases"]["0 2 * * *"], "Todos los días a las 02:00")
+        self.assertEqual(output["cases"]["15 3 * * 1"], "Cada lunes a las 03:15")
+        self.assertEqual(output["cases"]["0 */6 * * *"], "Cada 6 horas")
+        self.assertEqual(output["cases"]["30 * * * *"], "Cada hora en el minuto 30")
+        self.assertEqual(output["cases"]["*/15 * * * *"], "Cada 15 minutos")
+        self.assertEqual(output["cases"]["0 2 1 * *"], "El día 1 de cada mes a las 02:00")
+        # Unsupported patterns fall back honestly instead of inventing text.
+        self.assertIsNone(output["commaList"])
+        self.assertIsNone(output["range"])
+        self.assertIsNone(output["combinedSteps"])
+        self.assertIsNone(output["bothDayFields"])
+        self.assertIsNone(output["empty"])
+        self.assertIsNone(output["malformed"])
+
+    def test_periodicidad_row_shows_plain_language_with_raw_cron_and_timezone(self):
+        row = re.search(r"(function reportMatrixRowHtml\(row\) \{.*?\n    \})", self.source, re.S)
+        cron_describe = re.search(r"(function cronDescribe\(cronExpr\) \{.*?\n    \})", self.source, re.S)
+        description = re.search(r"(function reportCronDescription\(expression\) \{.*?\n    \})", self.source, re.S)
+        coverage = re.search(r"(function reportCoverageText\(metric\) \{.*?\n    \})", self.source, re.S)
+        self.assertIsNotNone(row)
+        self.assertIsNotNone(cron_describe)
+        self.assertIsNotNone(description)
+        self.assertIsNotNone(coverage)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = (
+            '"use strict";\n'
+            + cron_describe.group(1)
+            + "\n"
+            + description.group(1)
+            + "\n"
+            + coverage.group(1)
+            + "\n"
+            + row.group(1)
+            + r'''
+const escapeHtml = (str) => {
+  if (str === null || str === undefined) return "";
+  return String(str).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+};
+const rowOf = (cron) => ({
+  service: "svc",
+  server: { name: "srv-01" },
+  schedule: { cron_expression: cron, source: "target", timezone: "America/Bogota" },
+  retention: { name: "daily" },
+  job_counts: { succeeded: 1, failed: 0 },
+  succeeded_percent: 100,
+  failed_percent: 0,
+  backup_size: {},
+  storage_location: {},
+  target_id: "t-1",
+});
+process.stdout.write(JSON.stringify({ supported: reportMatrixRowHtml(rowOf("0 2 * * *")), unsupported: reportMatrixRowHtml(rowOf("7,9 2 * * *")) }));
+'''
+        )
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertIn("Todos los días a las 02:00", output["supported"])
+        self.assertIn("Expresión original: 0 2 * * *", output["supported"])
+        self.assertIn("Hora local: America/Bogota", output["supported"])
+        self.assertIn("Horario personalizado", output["unsupported"])
+        self.assertIn("7,9 2 * * *", output["unsupported"])
+
+
+class AuditReportsPartialCoverageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UI_PATH.read_text(encoding="utf-8")
+
+    def test_report_coverage_text_marks_partial_totals_without_implying_a_full_period(self):
+        coverage = re.search(r"(function reportCoverageText\(metric\) \{.*?\n    \})", self.source, re.S)
+        self.assertIsNotNone(coverage)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = (
+            '"use strict";\n'
+            + coverage.group(1)
+            + r'''
+const complete = reportCoverageText({ available: true, complete: true, reported_jobs: 4, unavailable_jobs: 0 });
+const partial = reportCoverageText({ available: true, complete: false, reported_jobs: 4, unavailable_jobs: 1515 });
+const missing = reportCoverageText({ available: false });
+const absent = reportCoverageText(null);
+process.stdout.write(JSON.stringify({ complete, partial, missing, absent }));
+'''
+        )
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertEqual(output["complete"], "Dato exacto en todas las 4 ejecuciones del período.")
+        self.assertIn("Parcial: 4 de 1.519 ejecuciones reportaron este dato", output["partial"])
+        self.assertIn("no se cubre todo el período", output["partial"])
+        self.assertIn("estrategias que no generan esta medición", output["partial"])
+        self.assertIn("No se estiman los faltantes.", output["partial"])
+        self.assertEqual(output["missing"], "Sin datos exactos registrados para este período; no se estiman valores.")
+        self.assertEqual(output["absent"], "Sin datos exactos registrados para este período; no se estiman valores.")

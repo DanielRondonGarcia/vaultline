@@ -7074,6 +7074,65 @@ docker compose up -d
       return `<div class="btn-row" data-report-downloads>${buttons}</div>`;
     }
 
+    function reportCronDescription(expression) {
+      if (typeof expression !== "string") return null;
+      const trimmed = expression.trim();
+      const parts = trimmed.split(/\s+/);
+      if (trimmed === "" || parts.length !== 5 || parts.some(part => part.includes(",") || part.includes("-"))) return null;
+      const [minute, hour, dayOfMonth, month, dayOfWeek] = parts;
+      if (month !== "*" || (dayOfMonth !== "*" && dayOfWeek !== "*")) return null;
+      const number = (field, low, high) => {
+        if (!/^\d+$/.test(field)) return null;
+        const value = Number(field);
+        return Number.isInteger(value) && value >= low && value <= high ? value : null;
+      };
+      const step = (field, low, high) => {
+        const match = /^\*\/(\d+)$/.exec(field);
+        return match ? number(match[1], low, high) : null;
+      };
+      const minuteNumber = number(minute, 0, 59);
+      const hourNumber = number(hour, 0, 23);
+      const dayNumber = number(dayOfMonth, 1, 31);
+      const weekdayNumber = number(dayOfWeek, 0, 7);
+      const time = (hh, mm) => `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
+      if (trimmed === "* * * * *") return "Cada minuto";
+      if (dayOfMonth === "*" && dayOfWeek === "*") {
+        if (minuteNumber !== null && hourNumber !== null) return `Todos los días a las ${time(hourNumber, minuteNumber)}`;
+        if (minuteNumber !== null && hour === "*") return `Cada hora en el minuto ${String(minuteNumber).padStart(2, "0")}`;
+        if (hour === "*") {
+          const minuteStep = step(minute, 1, 59);
+          if (minuteStep !== null) return minuteStep === 1 ? "Cada minuto" : `Cada ${minuteStep} minutos`;
+        }
+        if (minute === "0") {
+          const hourStep = step(hour, 1, 23);
+          if (hourStep !== null) return hourStep === 1 ? "Cada hora" : `Cada ${hourStep} horas`;
+        }
+      }
+      if (dayOfMonth === "*" && weekdayNumber !== null && minuteNumber !== null && hourNumber !== null) {
+        const weekdays = ["domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"];
+        return `Cada ${weekdays[weekdayNumber % 7]} a las ${time(hourNumber, minuteNumber)}`;
+      }
+      if (dayOfWeek === "*" && dayNumber !== null && minuteNumber !== null && hourNumber !== null) {
+        return `El día ${dayNumber} de cada mes a las ${time(hourNumber, minuteNumber)}`;
+      }
+      return null;
+    }
+
+    function reportCoverageText(metric) {
+      const noData = "Sin datos exactos registrados para este período; no se estiman valores.";
+      if (!metric) return noData;
+      const reported = Math.max(0, Math.trunc(Number(metric.reported_jobs) || 0));
+      const unavailable = Math.max(0, Math.trunc(Number(metric.unavailable_jobs) || 0));
+      const jobs = reported + unavailable;
+      const formatCount = value => value.toLocaleString("es-CO");
+      if (jobs === 0) return noData;
+      if (reported === 0) return `Ninguna de ${formatCount(jobs)} ejecuciones registró el dato; no se estiman valores.`;
+      if (metric.complete !== false && unavailable === 0) {
+        return `Dato exacto en todas las ${formatCount(jobs)} ejecuciones del período.`;
+      }
+      return `Parcial: ${formatCount(reported)} de ${formatCount(jobs)} ejecuciones reportaron este dato; no se cubre todo el período. Puede faltar en trabajos anteriores o con estrategias que no generan esta medición. No se estiman los faltantes.`;
+    }
+
     function reportMatrixRowHtml(row) {
       const server = row.server || {};
       const schedule = row.schedule || {};
@@ -7084,6 +7143,16 @@ docker compose up -d
       const coverage = size.coverage || {};
       const location = row.storage_location || {};
       const orDash = value => escapeHtml(value === undefined || value === null || value === "" ? "—" : value);
+      const cronDescription = reportCronDescription(schedule.cron_expression);
+      const scheduleText = schedule.cron_expression
+        ? (cronDescription || "Horario personalizado")
+        : (schedule.source === "manual" || !schedule.source ? "Solo bajo demanda" : "Sin horario automático");
+      const cronDetails = schedule.cron_expression
+        ? `<div class="helper mono">Expresión original: ${escapeHtml(schedule.cron_expression)}</div>`
+        : "";
+      const timezoneDetails = schedule.timezone
+        ? `<div class="helper">Hora local: ${escapeHtml(schedule.timezone)}</div>`
+        : "";
       const retentionValues = [
         ["últimas", retention.keep_last],
         ["por hora", retention.keep_hourly],
@@ -7102,12 +7171,20 @@ docker compose up -d
         const metricCoverage = coverage[metric] || {};
         const reported = Number(metricCoverage.reported_jobs) || 0;
         const unavailable = Number(metricCoverage.unavailable_jobs) || 0;
-        return `<div class="mono">${escapeHtml(bytesValue(size[metric]))}</div><div class="helper">reportado en ${reported}/${reported + unavailable} jobs</div>`;
+        const isPartial = reported > 0 && unavailable > 0 && size[metric] !== null && size[metric] !== undefined;
+        const valueText = isPartial ? `Parcial · ${bytesValue(size[metric])}` : bytesValue(size[metric]);
+        const coverageText = reportCoverageText({
+          available: reported > 0,
+          complete: unavailable === 0,
+          reported_jobs: reported,
+          unavailable_jobs: unavailable,
+        });
+        return `<div class="mono">${escapeHtml(valueText)}</div><div class="helper">${escapeHtml(coverageText)}</div>`;
       };
       return `<tr data-report-target-id="${escapeHtml(row.target_id)}">
         <td>${orDash(row.service)}</td>
         <td>${orDash(server.name)}${server.host ? `<div class="helper mono">${escapeHtml(server.host)}</div>` : ""}</td>
-        <td>${schedule.cron_expression ? `<code class="mono">${escapeHtml(schedule.cron_expression)}</code><div class="helper">${orDash(schedule.timezone)}</div>` : `<div class="helper">${orDash(schedule.source || "manual")}</div>`}</td>
+        <td><div>${escapeHtml(scheduleText)}</div>${cronDetails}${timezoneDetails}</td>
         <td>${orDash(retention.name)}${hasRetention ? `<div class="helper mono">${escapeHtml(retentionValues.join(" · "))}</div>` : ""}</td>
         <td class="mono">${orDash(counts.succeeded)} / ${orDash(counts.failed)}</td>
         <td>${escapeHtml(percent(row.succeeded_percent))}</td>
@@ -7129,19 +7206,14 @@ docker compose up -d
       const orNA = value => value === null || value === undefined ? "n/a" : String(value);
       const percentText = value => value === null || value === undefined ? "n/a" : `${Number(value).toLocaleString("es-CO", { maximumFractionDigits: 2 })}%`;
       const bytesText = value => value === null || value === undefined ? "n/a" : (formatJobBytes(value) || `${Number(value).toLocaleString("es-CO")} B`);
-      const coverageText = metric => {
-        if (!metric || !metric.available) return "sin datos reportados en el periodo";
-        const jobs = (Number(metric.reported_jobs) || 0) + (Number(metric.unavailable_jobs) || 0);
-        return `${Number(metric.reported_jobs) || 0}/${jobs} jobs`;
-      };
       region.innerHTML = `
         <div class="stat-grid">
           ${statCard("Servidores y servicios", "Targets", String(summary.target_count ?? 0), `periodo ${escapeHtml(period.start_date || range.start_date)} a ${escapeHtml(period.end_date || range.end_date)} · zona ${escapeHtml(period.timezone || "desconocida")}`)}
           ${statCard("Jobs de backup", "Total", String(summary.backup_job_count ?? 0), `exitosos ${orNA(summary.succeeded_count)} · fallidos ${orNA(summary.failed_count)}`)}
           ${statCard("Resultado", "Exitoso", percentText(summary.succeeded_percent), "sobre jobs completados")}
           ${statCard("Resultado", "Fallido", percentText(summary.failed_percent), "sobre jobs completados")}
-          ${statCard("Tamaño", "Bytes procesados", bytesText(size.bytes_processed), coverageText(metrics.bytes_processed))}
-          ${statCard("Tamaño", "Bytes agregados al backend", bytesText(size.bytes_added), coverageText(metrics.bytes_added))}
+          ${statCard("Tamaño", "Bytes procesados", bytesText(size.bytes_processed), reportCoverageText(metrics.bytes_processed))}
+          ${statCard("Tamaño", "Bytes agregados al backend", bytesText(size.bytes_added), reportCoverageText(metrics.bytes_added))}
         </div>
         <div class="table-wrap report-table-wrap"><div class="sheet"><table class="table report-table" aria-label="Matriz de backups por servidor y servicio">
           <thead><tr><th>Servicio</th><th>Servidor</th><th>Periodicidad</th><th>Retenci&oacute;n</th><th>Exitosos / Fallidos</th><th>Exitoso %</th><th>Fallido %</th><th>Bytes procesados</th><th>Bytes agregados al backend</th><th>Ubicaci&oacute;n</th></tr></thead>

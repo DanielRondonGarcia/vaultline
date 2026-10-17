@@ -75,9 +75,9 @@ BACKUP_AUDIT_XLSX_HEADERS: Tuple[str, ...] = (
     "Estrategia de respaldo",
     "Modo de respaldo",
     "Habilitado",
-    "Programación (cron)",
-    "Origen de programación",
-    "Zona horaria",
+    "Periodicidad",
+    "Origen del horario",
+    "Hora local",
     "Política de retención",
     "Últimos",
     "Cada hora",
@@ -170,13 +170,70 @@ def _flatten_target(row: Dict[str, Any]) -> list:
     ]
 
 
+_CRON_WEEKDAY_NAMES = ("domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado")
+
+
+def _humanize_cron_expression(expression: Any) -> str | None:
+    """Translate supported five-field cron patterns without guessing at custom rules."""
+    normalized = str(expression or "").strip()
+    if not normalized or "," in normalized or "-" in normalized:
+        return None
+    parts = normalized.split()
+    if len(parts) != 5:
+        return None
+    minute, hour, day_of_month, month, day_of_week = parts
+    if month != "*" or (day_of_month != "*" and day_of_week != "*"):
+        return None
+
+    def number(field: str, low: int, high: int) -> int | None:
+        if not field.isdigit():
+            return None
+        value = int(field)
+        return value if low <= value <= high else None
+
+    def step(field: str, low: int, high: int) -> int | None:
+        if not field.startswith("*/") or not field[2:].isdigit():
+            return None
+        value = int(field[2:])
+        return value if low <= value <= high else None
+
+    minute_number = number(minute, 0, 59)
+    hour_number = number(hour, 0, 23)
+    day_number = number(day_of_month, 1, 31)
+    weekday_number = number(day_of_week, 0, 7)
+
+    def time_text(hour_value: int, minute_value: int) -> str:
+        return f"{hour_value:02d}:{minute_value:02d}"
+
+    if normalized == "* * * * *":
+        return "Cada minuto"
+    if day_of_month == "*" and day_of_week == "*":
+        if minute_number is not None and hour_number is not None:
+            return f"Todos los días a las {time_text(hour_number, minute_number)}"
+        if minute_number is not None and hour == "*":
+            return f"Cada hora en el minuto {minute_number:02d}"
+        if hour == "*" and month == "*":
+            minute_step = step(minute, 1, 59)
+            if minute_step is not None:
+                return "Cada minuto" if minute_step == 1 else f"Cada {minute_step} minutos"
+        if minute == "0" and month == "*":
+            hour_step = step(hour, 1, 23)
+            if hour_step is not None:
+                return "Cada hora" if hour_step == 1 else f"Cada {hour_step} horas"
+    if day_of_month == "*" and weekday_number is not None and minute_number is not None and hour_number is not None:
+        return f"Cada {_CRON_WEEKDAY_NAMES[weekday_number % 7]} a las {time_text(hour_number, minute_number)}"
+    if day_of_week == "*" and day_number is not None and minute_number is not None and hour_number is not None:
+        return f"El día {day_number} de cada mes a las {time_text(hour_number, minute_number)}"
+    return None
+
+
 def _spanish_size_basis(available: bool) -> str:
     if not available:
-        return "No hay datos históricos exactos de tamaño; los valores faltantes se marcan como no disponibles y no se estiman."
+        return "No hay mediciones exactas de tamaño registradas en este período; no se estiman valores faltantes."
     return (
-        "Los bytes de origen procesados (total_bytes_processed) y los bytes agregados al backend (data_added) "
-        "provienen del resumen JSON de Restic de cada trabajo backup.run. Son métricas independientes; "
-        "los valores faltantes se marcan como no disponibles, sin estimarlos."
+        "El total suma solo los trabajos de respaldo que informaron la medición. "
+        "Los trabajos anteriores al inicio de este registro y las estrategias que no generan esta medición quedan fuera; "
+        "no se estiman valores faltantes. Si la cobertura es parcial, el total no representa la suma de todo el período."
     )
 
 
@@ -188,6 +245,19 @@ def _spanish_location_basis(available: bool) -> str:
 
 def _spanish_coverage_status(status: str) -> str:
     return {"complete": "Completo", "partial": "Parcial", "unavailable": "No disponible"}.get(status, status)
+
+
+def _spanish_metric_coverage(reported: Any, unavailable: Any) -> str:
+    reported_count = max(0, int(reported or 0))
+    unavailable_count = max(0, int(unavailable or 0))
+    total = reported_count + unavailable_count
+    if total == 0:
+        return "Sin ejecuciones en el período"
+    if reported_count == 0:
+        return "Ninguna ejecución registró el dato"
+    if unavailable_count == 0:
+        return f"Dato exacto en todas las {total} ejecuciones del período."
+    return f"Dato exacto en {reported_count} de {total} ejecuciones"
 
 
 def _spanish_job_status(status: Any) -> str:
@@ -209,12 +279,13 @@ def _spanish_job_status(status: Any) -> str:
 def _spanish_schedule_source(source: Any) -> str:
     normalized = str(source or "").strip().lower()
     return {
-        "target": "destino",
-        "settings": "configuración",
-        "worker": "servidor",
-        "global": "global",
-        "default": "predeterminada",
-    }.get(normalized, str(source or "no disponible"))
+        "target": "Configurado para este servicio",
+        "settings": "Horario general",
+        "worker": "Definido por el servidor",
+        "global": "Horario general",
+        "default": "Horario general",
+        "manual": "Solo bajo demanda",
+    }.get(normalized, "Origen del horario no disponible")
 
 
 def export_backup_audit_json(report: Dict[str, Any]) -> bytes:
@@ -228,6 +299,16 @@ def export_backup_audit_csv(report: Dict[str, Any]) -> bytes:
     for row in report.get("matrix") or []:
         writer.writerow([_spreadsheet_safe_cell(value) for value in _flatten_target(row)])
     return buffer.getvalue().encode("utf-8")
+
+
+def _xlsx_schedule_cron_value(row: Dict[str, Any]) -> str:
+    cron = (row.get("schedule") or {}).get("cron_expression")
+    if not cron:
+        return "Solo bajo demanda"
+    description = _humanize_cron_expression(cron)
+    if description:
+        return f"{description} (cron: {cron})"
+    return f"Horario personalizado (cron: {cron})"
 
 
 def export_backup_audit_xlsx(report: Dict[str, Any]) -> bytes:
@@ -260,8 +341,14 @@ def export_backup_audit_xlsx(report: Dict[str, Any]) -> bytes:
     matrix.sheet_view.showGridLines = False
     header_row = 1
     matrix.append(list(BACKUP_AUDIT_XLSX_HEADERS))
+    schedule_cron_column = BACKUP_AUDIT_MATRIX_COLUMNS.index("schedule_cron")
+    schedule_source_column = BACKUP_AUDIT_MATRIX_COLUMNS.index("schedule_source")
     for row in report.get("matrix") or []:
-        matrix.append([_spreadsheet_safe_cell(value) for value in _flatten_target(row)])
+        values = [_spreadsheet_safe_cell(value) for value in _flatten_target(row)]
+        schedule = row.get("schedule") or {}
+        values[schedule_cron_column] = _spreadsheet_safe_cell(_xlsx_schedule_cron_value(row))
+        values[schedule_source_column] = _spreadsheet_safe_cell(_spanish_schedule_source(schedule.get("source")))
+        matrix.append(values)
 
     last_column = len(BACKUP_AUDIT_MATRIX_COLUMNS)
     last_column_letter = get_column_letter(last_column)
@@ -278,7 +365,7 @@ def export_backup_audit_xlsx(report: Dict[str, Any]) -> bytes:
     matrix.row_dimensions[header_row].height = 42
 
     column_widths = (
-        20, 28, 22, 24, 15, 17, 14, 11, 18, 17, 22, 24, 12, 13, 12, 13, 14, 13,
+        20, 28, 22, 24, 15, 17, 14, 11, 34, 28, 22, 24, 12, 13, 12, 13, 14, 13,
         10, 12, 13, 13, 11, 11, 15, 15, 25, 23, 22, 25, 20, 24, 19, 24, 34,
     )
     for column_index, (column_name, width) in enumerate(zip(BACKUP_AUDIT_MATRIX_COLUMNS, column_widths), start=1):
@@ -429,8 +516,8 @@ def export_backup_audit_xlsx(report: Dict[str, Any]) -> bytes:
         elif metric.get("complete", unavailable == 0):
             status = "Completo"
         else:
-            status = "Parcial"
-        values = (label, value, f"{reported}/{total} trabajos", status)
+            status = "Parcial (no cubre todo el período)"
+        values = (label, value, _spanish_metric_coverage(reported, unavailable), status)
         for column_index, cell_value in enumerate(values, start=1):
             cell = executive.cell(row=row_number, column=column_index, value=cell_value)
             cell.fill = PatternFill("solid", fgColor="FFFFFF" if row_number % 2 else pale_gray)
@@ -440,7 +527,9 @@ def export_backup_audit_xlsx(report: Dict[str, Any]) -> bytes:
         executive.cell(row=row_number, column=2).number_format = '#,##0 "bytes"'
         status_cell = executive.cell(row=row_number, column=4)
         status_cell.font = Font(name="Aptos", size=10, bold=True, color="276221" if status == "Completo" else "9C6500")
-        status_cell.fill = PatternFill("solid", fgColor=green if status == "Completo" else ("FFF2CC" if status == "Parcial" else pale_gray))
+        status_cell.fill = PatternFill(
+            "solid", fgColor=green if status == "Completo" else ("FFF2CC" if status.startswith("Parcial") else pale_gray)
+        )
         executive.row_dimensions[row_number].height = 27
     executive.row_dimensions[13].height = 10
 
@@ -584,7 +673,7 @@ def _pdf_metric_details(report: Dict[str, Any], metric_key: str) -> Tuple[str, s
     else:
         status = _spanish_coverage_status("partial")
         value_text = f"{_pdf_human_bytes(value)} | {value:,} bytes"
-    return value_text, f"{reported}/{total} trabajos", status
+    return value_text, _spanish_metric_coverage(reported, unavailable), status
 
 
 def _pdf_draw_card(commands, x, y, width, height, label, value, accent, fill, detail=None, value_size=16.0):
@@ -613,6 +702,15 @@ def _pdf_row_values(row: Dict[str, Any]) -> list[list[str]]:
             return "Sí" if value else "No"
         return str(value)
 
+    cron_text = schedule.get("cron_expression")
+    cron_description = _humanize_cron_expression(cron_text)
+    if cron_text and cron_description:
+        schedule_lines = [cron_description, f"cron: {cron_text}"]
+    elif cron_text:
+        schedule_lines = ["Horario personalizado", f"cron: {cron_text}"]
+    else:
+        schedule_lines = ["Solo bajo demanda"]
+
     def metric_cell(key: str) -> list[str]:
         metric = coverage.get(key) or {}
         reported = metric.get("reported_jobs", 0)
@@ -626,7 +724,7 @@ def _pdf_row_values(row: Dict[str, Any]) -> list[list[str]]:
         else:
             status = _spanish_coverage_status("complete")
         value_text = f"{value:,} bytes" if value is not None else "No disponible"
-        return [value_text, f"{status} | {reported}/{total} trabajos"]
+        return [value_text, f"{status} | {_spanish_metric_coverage(reported, unavailable)}"]
 
     other_statuses = counts.get("other_statuses") or {}
     other_text = ", ".join(
@@ -650,12 +748,11 @@ def _pdf_row_values(row: Dict[str, Any]) -> list[list[str]]:
         ],
         [str(server.get("name") or "No disponible"), f"Host: {server.get('host') or 'no disponible'}"],
         [
-            f"Programación: {schedule.get('cron_expression') or 'manual'}",
+            *schedule_lines,
             f"Origen: {_spanish_schedule_source(schedule.get('source'))}",
-            f"Zona horaria: {schedule.get('timezone') or 'no disponible'}",
+            f"Hora local: {schedule.get('timezone') or 'no disponible'}",
         ],
-        [
-            str(retention.get("name") or "Sin política"),
+        [str(retention.get("name") or "Sin política"),
             f"Últimos {policy_value('keep_last')} | Cada hora {policy_value('keep_hourly')}",
             f"Cada día {policy_value('keep_daily')} | Cada semana {policy_value('keep_weekly')}",
             f"Cada mes {policy_value('keep_monthly')} | Cada año {policy_value('keep_yearly')}",
@@ -735,7 +832,7 @@ def export_backup_audit_pdf(report: Dict[str, Any]) -> bytes:
     inner_width = page_width - 2 * margin
     column_widths = (102.0, 82.0, 84.0, 94.0, 90.0, 92.0, 92.0, 134.0)
     column_labels = (
-        "Servicio / destino", "Servidor", "Programación", "Retención", "Resultados",
+        "Servicio / destino", "Servidor", "Periodicidad", "Retención", "Resultados",
         "Bytes de origen procesados", "Bytes agregados al backend", "Destino de almacenamiento",
     )
     colors = {

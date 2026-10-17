@@ -696,7 +696,10 @@
       } else if (view === "secrets") {
         loadSecrets();
       } else if (view === "users") {
-        load("localUsers", "/api/v1/admin/users", response => { state.localUsers = response.items || []; }, isAdmin, { items: [] });
+        load("localUsers", "/api/v1/admin/users", response => {
+          state.localUsers = response.items || [];
+          state.userManagement = response.management || null;
+        }, isAdmin, { items: [], management: null });
       } else if (view === "settings") {
         loadSettings();
         load("rcloneRemote", "/api/v1/settings/rclone-remote", response => { state.rcloneRemote = response.remote_name || null; }, isAdmin, { remote_name: null });
@@ -7932,6 +7935,7 @@ docker compose up -d
 
     function renderUsers(content) {
       const canManage = state.currentRole === "admin";
+      const canResetPasswords = canManage && state.userManagement?.manageable === true;
       content.innerHTML = `
         <div class="page-header"><div><h2>Usuarios</h2><div class="subtitle">Usuarios locales del Control Plane</div></div></div>
         ${canManage ? `<details class="form-section"><summary>Crear usuario</summary><div class="form-body">
@@ -7946,8 +7950,8 @@ docker compose up -d
         </div></details>` : ""}
         <div class="page-header"><div><h2>Usuarios configurados</h2></div></div>
         <div class="table-wrap"><div class="sheet"><table class="table">
-          <thead><tr><th>Usuario</th><th>Rol</th><th>Cambio obligatorio</th><th>Creado</th></tr></thead>
-          <tbody>${state.localUsers.length ? state.localUsers.map(u => `<tr><td>${escapeHtml(u.username)}</td><td><span class="pill muted">${escapeHtml(u.role)}</span></td><td>${u.must_change_password ? '<span class="pill warn">si</span>' : '<span class="pill ok">no</span>'}</td><td class="mono">${fmtDate(u.created_at)}</td></tr>`).join("") : `<tr><td colspan="4" class="empty-state">Sin usuarios</td></tr>`}</tbody>
+          <thead><tr><th>Usuario</th><th>Rol</th><th>Cambio obligatorio</th><th>Creado</th>${canResetPasswords ? "<th>Acciones</th>" : ""}</tr></thead>
+          <tbody>${state.localUsers.length ? state.localUsers.map(u => `<tr><td>${escapeHtml(u.username)}</td><td><span class="pill muted">${escapeHtml(u.role)}</span></td><td>${u.must_change_password ? '<span class="pill warn">si</span>' : '<span class="pill ok">no</span>'}</td><td class="mono">${fmtDate(u.created_at)}</td>${canResetPasswords ? `<td>${u.role === "admin" ? '<span class="muted">—</span>' : `<details class="form-section user-password-reset"><summary>Restablecer contraseña</summary><div class="form-body"><form class="user-password-reset-form" data-reset-password-user="${escapeHtml(u.username)}"><div class="field"><label>Nueva contraseña</label><input name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper">El usuario deberá cambiarla al iniciar sesión.</div><div class="btn-row"><button type="submit" class="btn primary sm">Guardar contraseña</button></div></form></div></details>`}</td>` : ""}</tr>`).join("") : `<tr><td colspan="${canResetPasswords ? 5 : 4}" class="empty-state">Sin usuarios</td></tr>`}</tbody>
         </table></div></div>
       `;
       const form = document.getElementById("createUserForm");
@@ -7964,6 +7968,18 @@ docker compose up -d
           }, "Creando...").catch(() => {});
         });
       }
+      content.querySelectorAll("form[data-reset-password-user]").forEach(form => {
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          const username = form.dataset.resetPasswordUser;
+          const newPassword = form.elements.new_password.value;
+          await withBtnLoading(e.submitter, async () => {
+            await apiPost(`/api/v1/admin/users/${encodeURIComponent(username)}/reset-password`, { new_password: newPassword });
+            await loadPageData("users", true);
+            setView("users");
+          }, "Restableciendo...").catch(() => {});
+        });
+      });
     }
 
     function renderSettings(content) {

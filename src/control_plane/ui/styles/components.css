@@ -114,6 +114,38 @@
 .table tbody tr.target-execution-blocked > td { background: color-mix(in srgb, var(--muted) 45%, var(--card)); }
 .table tbody tr.target-execution-blocked:hover > td { background: color-mix(in srgb, var(--accent) 18%, var(--card)); }
 .table td.mono, .table td .mono { font-family: var(--font-mono); font-size: 12px; }
+
+/* Keep the audit report readable without changing shared table layouts. */
+.report-filter-card { padding: 18px 20px; gap: 16px; }
+.report-filter-card .form-grid { column-gap: 20px; row-gap: 16px; }
+.report-filter-card .btn-row { gap: 10px; flex-wrap: wrap; }
+.report-preview-region { display: flex; min-width: 0; flex-direction: column; gap: 16px; margin-top: 12px; }
+.report-preview-region > .stat-grid { gap: 16px; }
+.report-preview-region > .stat-grid > .card { min-width: 0; min-height: 144px; padding: 16px; gap: 10px; }
+.report-preview-region > .stat-grid .title { min-height: 2.6em; line-height: 1.35; }
+.report-preview-region > .stat-grid .meta { line-height: 1.5; }
+.report-table-wrap { max-width: 100%; }
+.report-table-wrap .sheet { min-width: 1550px; }
+.report-table { width: 100%; min-width: 1550px; table-layout: fixed; }
+.report-table th,
+.report-table td { padding: 16px; vertical-align: top; line-height: 1.5; overflow-wrap: anywhere; }
+.report-table th:nth-child(1), .report-table td:nth-child(1) { width: 13%; }
+.report-table th:nth-child(2), .report-table td:nth-child(2) { width: 12%; }
+.report-table th:nth-child(3), .report-table td:nth-child(3) { width: 10%; }
+.report-table th:nth-child(4), .report-table td:nth-child(4) { width: 17%; }
+.report-table th:nth-child(5), .report-table td:nth-child(5) { width: 7%; }
+.report-table th:nth-child(6), .report-table td:nth-child(6),
+.report-table th:nth-child(7), .report-table td:nth-child(7) { width: 6%; }
+.report-table th:nth-child(8), .report-table td:nth-child(8),
+.report-table th:nth-child(9), .report-table td:nth-child(9) { width: 9%; }
+.report-table th:nth-child(10), .report-table td:nth-child(10) { width: 11%; }
+.report-table td .helper { display: block; margin-top: 6px; line-height: 1.5; overflow-wrap: anywhere; }
+.report-table td .mono { overflow-wrap: anywhere; word-break: normal; }
+
+@media (max-width: 760px) {
+  .report-filter-card { padding: 16px; }
+  .report-preview-region > .stat-grid { grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); }
+}
 .table.datatable .filter-row th { padding: 6px 8px; background: var(--card); border-bottom: 1px solid var(--border); }
 .table.datatable .filter-row th::before { display: none; }
 .dt-filter {

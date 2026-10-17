@@ -7143,8 +7143,7 @@ docker compose up -d
           ${statCard("Tamaño", "Bytes procesados", bytesText(size.bytes_processed), coverageText(metrics.bytes_processed))}
           ${statCard("Tamaño", "Bytes agregados al backend", bytesText(size.bytes_added), coverageText(metrics.bytes_added))}
         </div>
-        ${availability && availability.complete === false ? `<div class="helper">Cobertura parcial: ${escapeHtml(availability.basis || "")}</div>` : ""}
-        <div class="table-wrap"><div class="sheet"><table class="table" aria-label="Matriz de backups por servidor y servicio">
+        <div class="table-wrap report-table-wrap"><div class="sheet"><table class="table report-table" aria-label="Matriz de backups por servidor y servicio">
           <thead><tr><th>Servicio</th><th>Servidor</th><th>Periodicidad</th><th>Retenci&oacute;n</th><th>Exitosos / Fallidos</th><th>Exitoso %</th><th>Fallido %</th><th>Bytes procesados</th><th>Bytes agregados al backend</th><th>Ubicaci&oacute;n</th></tr></thead>
           <tbody>${(report.matrix || []).map(reportMatrixRowHtml).join("") || `<tr><td colspan="10" class="empty-state">Sin targets configurados para el rango seleccionado</td></tr>`}</tbody>
         </table></div></div>
@@ -7187,7 +7186,7 @@ docker compose up -d
       const timezoneLabel = state.schedulerTimezone ? escapeHtml(state.schedulerTimezone) : "zona del scheduler no disponible";
       content.innerHTML = `
         <div class="page-header"><div><h2>Informes</h2><div class="subtitle">Balance para auditoria: servidores, servicios, periodicidad, retencion, resultado y ubicacion de los backups</div></div></div>
-        <div class="card compact">
+        <div class="card compact report-filter-card">
           <div class="form-grid">
             <div class="field"><label for="reportPreset">Rango</label><select id="reportPreset">${presetOptions}</select><div class="hint">Las fechas del informe se interpretan en la zona del scheduler: ${timezoneLabel}</div></div>
             <div class="field" id="reportCustomStartField" ${isCustom ? "" : "hidden"}><label for="reportStartDate">Fecha inicial</label><input id="reportStartDate" type="date" value="${escapeHtml(reportRangeState.start)}" /></div>
@@ -7195,7 +7194,7 @@ docker compose up -d
           </div>
           <div id="reportDownloads">${reportDownloadButtonsHtml(range)}</div>
         </div>
-        <div id="reportPreviewRegion" role="status" aria-live="polite"></div>
+        <div id="reportPreviewRegion" class="report-preview-region" role="status" aria-live="polite"></div>
       `;
       const downloads = content.querySelector("#reportDownloads");
       const refreshDownloads = () => { downloads.innerHTML = reportDownloadButtonsHtml(currentReportRange()); };

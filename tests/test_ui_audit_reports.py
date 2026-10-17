@@ -15,6 +15,7 @@ from pathlib import Path
 
 
 UI_PATH = Path(__file__).resolve().parents[1] / "src" / "control_plane" / "ui" / "index.html"
+UI_COMPONENTS_CSS_PATH = Path(__file__).resolve().parents[1] / "src" / "control_plane" / "ui" / "styles" / "components.css"
 
 
 class AuditReportsNavigationTests(unittest.TestCase):
@@ -529,6 +530,35 @@ class AuditReportsDownloadTests(unittest.TestCase):
         self.assertIn("reportRangeIsValid(range)", source)
         self.assertIn("reportDownloadUrl(range, fmt)", source)
         self.assertIn("disabled", source)
+
+
+class AuditReportsLayoutTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UI_PATH.read_text(encoding="utf-8")
+        cls.styles = UI_COMPONENTS_CSS_PATH.read_text(encoding="utf-8")
+
+    def test_report_preview_has_section_spacing_and_a_readable_scrollable_matrix(self):
+        self.assertIn('<div id="reportPreviewRegion" class="report-preview-region"', self.source)
+        self.assertIn('<div class="table-wrap report-table-wrap">', self.source)
+        self.assertIn('<table class="table report-table"', self.source)
+        for marker in (
+            ".report-preview-region {",
+            "gap: 16px;",
+            ".report-table-wrap .sheet {",
+            "min-width: 1550px;",
+            ".report-table {",
+            "table-layout: fixed;",
+            "overflow-wrap: anywhere;",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.styles)
+
+    def test_report_preview_omits_verbose_coverage_banner_but_keeps_metric_coverage(self):
+        self.assertNotIn("report-coverage-note", self.source)
+        self.assertNotIn(".report-coverage-note", self.styles)
+        self.assertIn("coverageText(metrics.bytes_processed)", self.source)
+        self.assertIn("coverageText(metrics.bytes_added)", self.source)
 
 
 class AuditReportsDownloadUrlBehaviorTests(unittest.TestCase):

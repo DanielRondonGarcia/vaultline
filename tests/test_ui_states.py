@@ -1270,6 +1270,7 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
 
         functions = []
         for pattern in (
+            r"function loadPageData\(view, force = false\) \{.*?\n    \}",
             r"function currentRouteView\(\) \{.*?\n    \}",
             r"function route\(\) \{.*?\n    \}",
             r"function shouldFetchJobsDuringRefresh\(view\) \{.*?\n    \}",
@@ -1299,8 +1300,8 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
             script = script.replace(original, scaled)
         script += r'''
 const state = {
-  currentUser: null,
-  currentRole: null,
+  currentUser: "test",
+  currentRole: "admin",
   currentView: "dashboard",
   jobs: [],
   jobStats: null,
@@ -1311,8 +1312,10 @@ const state = {
   secrets: [],
   localUsers: [],
   settings: {},
+  pageDataLoaded: {},
+  pageDataPending: {},
 };
-const NAV_ITEMS = ["dashboard", "targets", "jobs"].map(id => ({ id }));
+const NAV_ITEMS = ["dashboard", "targets", "jobs"].map(id => ({ id, roles: ["admin", "operator", "viewer"] }));
 const window = { location: { hash: "#/targets" } };
 const document = { getElementById: () => null };
 const escapeHtml = value => String(value);
@@ -2656,6 +2659,179 @@ process.stdout.write(JSON.stringify({ candidates, rows }));
             self.css,
             r"@media \(max-width: 640px\) \{\s*\.volume-group-body \{ grid-template-columns: 1fr; \}\s*\}",
         )
+
+
+class PageScopedLoaderUiStateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UI_PATH.read_text(encoding="utf-8")
+
+    def test_home_refresh_only_requests_shared_and_dashboard_data(self):
+        nav_items = re.search(r"const NAV_ITEMS = \[.*?\n    \];", self.source, re.S)
+        current_view = re.search(r"function currentRouteView\(\) \{.*?\n    \}", self.source, re.S)
+        should_fetch_jobs = re.search(r"function shouldFetchJobsDuringRefresh\(view\) \{.*?\n    \}", self.source, re.S)
+        dashboard_jobs = re.search(r"async function fetchDashboardJobs\(\) \{.*?\n    \}", self.source, re.S)
+        page_loader = re.search(r"function loadPageData\(view, force = false\) \{.*?\n    \}", self.source, re.S)
+        refresh = re.search(r"async function refreshAll\(\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(nav_items)
+        self.assertIsNotNone(current_view)
+        self.assertIsNotNone(should_fetch_jobs)
+        self.assertIsNotNone(dashboard_jobs)
+        self.assertIsNotNone(refresh)
+        refresh_source = refresh.group(0)
+        page_loader_source = page_loader.group(0) if page_loader else "function loadPageData() { return null; }"
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+
+        script = (
+            '"use strict";\n'
+            + nav_items.group(0)
+            + "\n"
+            + current_view.group(0)
+            + "\n"
+            + should_fetch_jobs.group(0)
+            + "\n"
+            + dashboard_jobs.group(0)
+            + "\n"
+            + page_loader_source
+            + "\n"
+            + refresh.group(0)
+            + r'''
+const calls = [];
+const state = {
+  currentUser: "admin", currentRole: "admin", currentView: "dashboard",
+  workers: [], targets: [], jobs: [], jobStats: null, storageProfiles: [],
+  retentionPolicies: [], secrets: [], localUsers: [], settings: {},
+  schedulerTimezone: null, workerInventories: {}, pageDataLoaded: {}, pageDataPending: {},
+};
+const window = { location: { hash: "#/dashboard" } };
+const browserTimezoneOffsetMinutes = () => 0;
+const apiGet = async path => {
+  calls.push(path);
+  if (path === "/api/v1/workers" || path === "/api/v1/targets" || path === "/api/v1/config/public") return { items: [], scheduler_timezone: "America/Bogota" };
+  if (path === "/api/v1/version") return { version: "test" };
+  if (path === "/api/v1/jobs?limit=5") return { items: [], total: 0 };
+  if (path.startsWith("/api/v1/jobs/stats?")) return { total: 0, by_status: {}, by_day: [] };
+  return { items: [] };
+};
+const applyDashboardJobs = () => {};
+const renderVersionBanner = () => {};
+const route = () => {};
+(async () => {
+  await refreshAll();
+  const pageOnly = [
+    "/api/v1/retention-policies", "/api/v1/secrets",
+    "/api/v1/admin/users", "/api/v1/settings", "/api/v1/settings/rclone-remote",
+    "/api/v1/version/latest",
+  ];
+  if (calls.some(path => pageOnly.includes(path))) throw new Error(`home made page-only requests: ${JSON.stringify(calls)}`);
+  if (calls.includes("/api/v1/auth/me")) throw new Error(`refreshAll repeated auth: ${JSON.stringify(calls)}`);
+  for (const path of ["/api/v1/workers", "/api/v1/targets", "/api/v1/jobs?limit=5", "/api/v1/config/public", "/api/v1/storage-profiles"]) {
+    if (!calls.includes(path)) throw new Error(`missing home dependency ${path}: ${JSON.stringify(calls)}`);
+  }
+  process.stdout.write(JSON.stringify(calls));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        )
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("/api/v1/auth/me", refresh_source)
+        self.assertNotIn("/api/v1/version/latest", refresh_source)
+        self.assertIn("loadPageData(routeView", refresh_source)
+
+    def test_page_data_loader_is_cached_by_view_and_role_aware(self):
+        nav_items = re.search(r"const NAV_ITEMS = \[.*?\n    \];", self.source, re.S)
+        loader = re.search(r"function loadPageData\(view, force = false\) \{.*?\n    \}", self.source, re.S)
+        current_view = re.search(r"function currentRouteView\(\) \{.*?\n    \}", self.source, re.S)
+        set_view = re.search(r"function setView\(view\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(nav_items)
+        self.assertIsNotNone(loader)
+        self.assertIsNotNone(current_view)
+        self.assertIsNotNone(set_view)
+        self.assertIn("loadPageData(view)", set_view.group(0))
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+
+        script = (
+            '"use strict";\n'
+            + nav_items.group(0)
+            + r'''
+const calls = [];
+const state = {
+  currentRole: "admin",
+  pageDataLoaded: {},
+  pageDataPending: {},
+  storageProfiles: [],
+  retentionPolicies: [],
+  secrets: [],
+  localUsers: [],
+  settings: {},
+  rcloneRemote: null,
+};
+const window = { location: { hash: "#/dashboard" } };
+const apiGet = async path => {
+  calls.push(path);
+  if (["/api/v1/storage-profiles", "/api/v1/retention-policies", "/api/v1/secrets", "/api/v1/admin/users"].includes(path)) return { items: [{ path }] };
+  if (path === "/api/v1/settings/rclone-remote") return { remote_name: "remote" };
+  if (path === "/api/v1/settings") return { restic_password_secret_id: "secret-1" };
+  return { scheduler_timezone: "America/Bogota" };
+};
+'''
+            + loader.group(0)
+            + "\n"
+            + current_view.group(0)
+            + r'''
+(async () => {
+  await loadPageData("dashboard");
+  if (calls.length !== 0) throw new Error(`dashboard requested page data: ${JSON.stringify(calls)}`);
+  await loadPageData("settings");
+  const settingsData = ["/api/v1/settings", "/api/v1/settings/rclone-remote", "/api/v1/secrets"];
+  if (JSON.stringify(calls) !== JSON.stringify(settingsData)) throw new Error(`settings did not load only its dependencies: ${JSON.stringify(calls)}`);
+  await loadPageData("settings");
+  if (calls.length !== 3) throw new Error("cached settings data was fetched again");
+  await loadPageData("targets");
+  const targetData = [...settingsData, "/api/v1/storage-profiles", "/api/v1/retention-policies"].sort();
+  if (JSON.stringify([...calls].sort()) !== JSON.stringify(targetData)) throw new Error(`targets did not load only its dependencies: ${JSON.stringify(calls)}`);
+  await loadPageData("targets");
+  if (calls.length !== 5) throw new Error("cached target page data was fetched again");
+  await loadPageData("secrets");
+  if (calls.length !== 5) throw new Error("secrets page ignored the shared in-memory cache");
+  await loadPageData("users");
+  if (calls[5] !== "/api/v1/admin/users") throw new Error(`users page loaded unrelated data: ${JSON.stringify(calls)}`);
+  await loadPageData("users", true);
+  if (calls.length !== 7 || calls[6] !== "/api/v1/admin/users") throw new Error("forced page refresh did not reload only the active dataset");
+  state.currentRole = "operator";
+  state.pageDataLoaded = {};
+  state.pageDataPending = {};
+  calls.length = 0;
+  await loadPageData("targets");
+  if (JSON.stringify([...calls].sort()) !== JSON.stringify(["/api/v1/storage-profiles", "/api/v1/retention-policies"].sort())) throw new Error(`operator target page requested admin data: ${JSON.stringify(calls)}`);
+  state.currentRole = "viewer";
+  state.pageDataLoaded = {};
+  state.pageDataPending = {};
+  calls.length = 0;
+  window.location.hash = "#/secrets";
+  if (currentRouteView() !== "dashboard") throw new Error("viewer deep-link was not rejected before rendering");
+  await loadPageData("secrets", true);
+  if (calls.length !== 0) throw new Error("viewer caused a request to the admin-only secrets API");
+  process.stdout.write(JSON.stringify(calls));
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        )
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

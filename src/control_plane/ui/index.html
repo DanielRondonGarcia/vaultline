@@ -241,6 +241,10 @@
       latestVersionUrl: null,
       latestAssets: {},
       schedulerTimezone: null,
+      settings: {},
+      rcloneRemote: null,
+      pageDataLoaded: {},
+      pageDataPending: {},
     };
     let workersNotice = null;
 
@@ -639,7 +643,73 @@
       }
     }
 
+    function loadPageData(view, force = false) {
+      const isAdmin = state.currentRole === "admin";
+      const requests = [];
+      const load = (key, path, apply, allowed = true, fallback) => {
+        if (!allowed) return;
+        if (state.pageDataPending[key]) {
+          requests.push(state.pageDataPending[key]);
+          return;
+        }
+        if (!force && state.pageDataLoaded[key]) return;
+
+        let pending;
+        pending = apiGet(path)
+          .then((response) => {
+            apply(response);
+            state.pageDataLoaded[key] = true;
+          })
+          .catch((error) => {
+            if (fallback !== undefined) {
+              apply(fallback);
+              state.pageDataLoaded[key] = true;
+              return;
+            }
+            state.pageDataLoaded[key] = false;
+            throw error;
+          })
+          .finally(() => {
+            if (state.pageDataPending[key] === pending) delete state.pageDataPending[key];
+          });
+        state.pageDataPending[key] = pending;
+        requests.push(pending);
+      };
+      const loadStorageProfiles = () => load("storageProfiles", "/api/v1/storage-profiles", response => { state.storageProfiles = response.items || []; });
+      const loadRetentionPolicies = () => load("retentionPolicies", "/api/v1/retention-policies", response => { state.retentionPolicies = response.items || []; });
+      const loadSecrets = () => load("secrets", "/api/v1/secrets", response => { state.secrets = response.items || []; }, isAdmin, { items: [] });
+      const loadSettings = () => load("settings", "/api/v1/settings", response => {
+        state.settings = response || {};
+        state.schedulerTimezone = state.schedulerTimezone || state.settings.scheduler_timezone || null;
+      }, isAdmin, {});
+
+      if (view === "targets") {
+        loadStorageProfiles();
+        loadRetentionPolicies();
+        loadSecrets();
+        loadSettings();
+      } else if (view === "storage") {
+        loadStorageProfiles();
+        loadSecrets();
+      } else if (view === "retention") {
+        loadRetentionPolicies();
+      } else if (view === "secrets") {
+        loadSecrets();
+      } else if (view === "users") {
+        load("localUsers", "/api/v1/admin/users", response => { state.localUsers = response.items || []; }, isAdmin, { items: [] });
+      } else if (view === "settings") {
+        loadSettings();
+        load("rcloneRemote", "/api/v1/settings/rclone-remote", response => { state.rcloneRemote = response.remote_name || null; }, isAdmin, { remote_name: null });
+        loadSecrets();
+      }
+      return requests.length ? Promise.all(requests) : null;
+    }
+
+    let viewRenderGeneration = 0;
+
     function setView(view) {
+      const navItem = NAV_ITEMS.find(item => item.id === view);
+      if (!navItem || !navItem.roles.includes(state.currentRole)) view = "dashboard";
       const preservedTargetDropdown = view === "targets" && state.currentView === "targets"
         ? captureTargetDropdownState()
         : null;
@@ -661,18 +731,38 @@
         reports: renderReports,
       };
       const renderer = viewRenderers[view];
-      if (renderer) renderer(content);
-      if (preservedTargetDropdown) restoreTargetDropdownState(preservedTargetDropdown);
+      if (!renderer) return;
+      const generation = ++viewRenderGeneration;
+      const renderCurrentView = () => {
+        if (generation !== viewRenderGeneration || state.currentView !== view) return;
+        renderer(content);
+        if (preservedTargetDropdown) restoreTargetDropdownState(preservedTargetDropdown);
+      };
+      const pageData = loadPageData(view);
+      if (!pageData) {
+        renderCurrentView();
+        return;
+      }
+      content.innerHTML = '<div class="helper" role="status">Cargando información...</div>';
+      pageData.then(renderCurrentView).catch(error => {
+        if (generation !== viewRenderGeneration || state.currentView !== view) return;
+        content.innerHTML = '<div class="helper" role="alert">No se pudo cargar la información de esta página.</div>';
+        if (error.message !== "auth") console.error(error);
+      });
     }
 
     function currentRouteView() {
       const hash = window.location.hash.replace(/^#\/?/, "") || "dashboard";
-      return NAV_ITEMS.some(i => i.id === hash) ? hash : "dashboard";
+      const navItem = NAV_ITEMS.find(item => item.id === hash);
+      return navItem && navItem.roles.includes(state.currentRole) ? navItem.id : "dashboard";
     }
 
     function route() {
       const previousView = state.currentView;
+      const requestedHash = window.location.hash.replace(/^#\/?/, "") || "dashboard";
       const view = currentRouteView();
+      const requestedItem = NAV_ITEMS.find(item => item.id === requestedHash);
+      if (requestedItem && !requestedItem.roles.includes(state.currentRole)) window.location.hash = "#/dashboard";
       setView(view);
       if (view === "dashboard" && previousView !== view) void refreshDashboardJobs();
     }
@@ -8081,52 +8171,45 @@ docker compose up -d
 
     async function refreshAll() {
       try {
-        const me = await apiGet("/api/v1/auth/me");
-        state.currentUser = me.username;
-        state.currentRole = me.role;
         const routeView = currentRouteView();
-        const [workers, targets, dashboardJobs, storageProfiles, retentionPolicies, secrets, users, settings, schedulerConfig] = await Promise.all([
+        const dashboardView = routeView === "dashboard";
+        const [workers, targets, dashboardJobs, storageProfiles, schedulerConfig, systemVersion] = await Promise.all([
           apiGet("/api/v1/workers"),
           apiGet("/api/v1/targets"),
           shouldFetchJobsDuringRefresh(routeView) ? fetchDashboardJobs() : Promise.resolve(null),
-          apiGet("/api/v1/storage-profiles"),
-          apiGet("/api/v1/retention-policies"),
-          apiGet("/api/v1/secrets").catch(() => ({ items: [] })),
-          apiGet("/api/v1/admin/users").catch(() => ({ items: [] })),
-          apiGet("/api/v1/settings").catch(() => ({})),
+          dashboardView ? apiGet("/api/v1/storage-profiles") : Promise.resolve({ items: state.storageProfiles }),
           apiGet("/api/v1/config/public").catch(() => ({})),
+          apiGet("/api/v1/version").catch(() => ({ version: "dev" })),
         ]);
         state.workers = workers.items || [];
         state.targets = targets.items || [];
         applyDashboardJobs(dashboardJobs);
-        state.storageProfiles = storageProfiles.items || [];
-        state.retentionPolicies = retentionPolicies.items || [];
-        state.secrets = secrets.items || [];
-        state.localUsers = users.items || [];
-        state.settings = settings || {};
+        if (dashboardView) {
+          state.storageProfiles = storageProfiles.items || [];
+          state.pageDataLoaded.storageProfiles = true;
+        }
         state.schedulerTimezone = schedulerConfig.scheduler_timezone || state.settings.scheduler_timezone || null;
-        let rcloneRemote = null;
-        try {
-          const rr = await apiGet("/api/v1/settings/rclone-remote");
-          rcloneRemote = rr.remote_name || null;
-        } catch (e) {}
-        state.rcloneRemote = rcloneRemote;
         state.workerInventories = {};
-        try { state.systemVersion = (await apiGet("/api/v1/version")).version || "dev"; } catch (e) {}
-        try {
-          const latest = await apiGet("/api/v1/version/latest");
-          if (latest && latest.tag_name) {
-            const normalize = v => (v || "").replace(/^v/, "").trim();
-            state.latestVersion = latest.tag_name;
-            state.latestVersionUrl = latest.html_url || "https://github.com/DanielRondonGarcia/vaultline/releases/latest";
-            state.latestAssets = latest.assets && typeof latest.assets === "object" ? latest.assets : {};
-          }
-        } catch (e) {}
+        state.systemVersion = systemVersion.version || "dev";
+        const pageData = loadPageData(routeView, true);
+        if (pageData) await pageData;
         renderVersionBanner();
         route();
       } catch (error) {
         if (error.message !== "auth") console.error(error);
       }
+    }
+
+    async function refreshLatestVersion() {
+      try {
+        const latest = await apiGet("/api/v1/version/latest");
+        if (latest && latest.tag_name) {
+          state.latestVersion = latest.tag_name;
+          state.latestVersionUrl = latest.html_url || "https://github.com/DanielRondonGarcia/vaultline/releases/latest";
+          state.latestAssets = latest.assets && typeof latest.assets === "object" ? latest.assets : {};
+          renderVersionBanner();
+        }
+      } catch (error) {}
     }
 
     function shouldFetchJobsDuringRefresh(view) {
@@ -8169,6 +8252,7 @@ docker compose up -d
         if (me.must_change_password) { window.location.href = "/change-password"; return; }
         await refreshAll();
         hideAppLoader();
+        setTimeout(() => { void refreshLatestVersion(); }, 0);
       } catch (error) {
         if (error.message !== "auth") console.error(error);
         hideAppLoader();

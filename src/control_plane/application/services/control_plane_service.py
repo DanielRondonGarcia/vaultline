@@ -7,8 +7,13 @@ import math
 import os
 import posixpath
 import re
+import smtplib
+import ssl
+import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta
+from email.message import EmailMessage
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 from uuid import uuid4
@@ -51,6 +56,11 @@ from src.restic_retention import apply_target_retention_policy, build_restic_for
 
 logger = logging.getLogger(__name__)
 _TARGET_FIELD_UNSET = object()
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
 
 
 class WorkerDeletionConflict(ValueError):
@@ -2807,7 +2817,14 @@ class ControlPlaneService:
 
     SUPPORTED_NOTIFICATION_CHANNEL_TYPES = frozenset({"webhook", "smtp"})
     NOTIFICATION_CHANNEL_NAME_MAX_LENGTH = 100
+    MAX_NOTIFICATION_PAYLOAD_BYTES = 8192
+    NOTIFICATION_DELIVERY_TIMEOUT_SECONDS = 5
     SMTP_SECURITY_MODES = frozenset({"starttls", "ssl", "none"})
+    SMTP_EMAIL_PATTERN = re.compile(
+        r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
+        r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+        r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
+    )
 
     @staticmethod
     def _require_notification_channel_repository(repository):
@@ -2860,7 +2877,7 @@ class ControlPlaneService:
         ):
             raise ValueError("SMTP recipients must be a non-empty list of valid email addresses")
         security = config.get("security", "starttls")
-        if security not in cls.SMTP_SECURITY_MODES:
+        if not isinstance(security, str) or security not in cls.SMTP_SECURITY_MODES:
             raise ValueError("SMTP security must be starttls, ssl, or none")
         username = config.get("username")
         password = config.get("password")
@@ -2882,12 +2899,11 @@ class ControlPlaneService:
             normalized["password"] = password
         return normalized
 
-    @staticmethod
-    def _is_notification_email(value: Any) -> bool:
-        if not isinstance(value, str) or "\r" in value or "\n" in value:
+    @classmethod
+    def _is_notification_email(cls, value: Any) -> bool:
+        if not isinstance(value, str) or len(value) > 254 or "\r" in value or "\n" in value:
             return False
-        local, separator, domain = value.strip().partition("@")
-        return bool(separator and local and domain and " " not in local and " " not in domain and "." in domain)
+        return bool(cls.SMTP_EMAIL_PATTERN.fullmatch(value.strip()))
 
     def _notification_channel_config(self, channel: NotificationChannelRecord) -> Dict[str, Any]:
         try:
@@ -3005,6 +3021,135 @@ class ControlPlaneService:
         if repository.get(channel_id) is None:
             return False
         return repository.delete(channel_id)
+
+    def _schedule_failed_backup_notifications(self, job: JobRecord) -> None:
+        if job.command != "backup.run" or JobStatus.normalize(job.status) != JobStatus.FAILED:
+            return
+        if self.notification_channel_repository is None:
+            return
+        try:
+            notification_job = copy.deepcopy(job)
+            thread = threading.Thread(
+                target=self._deliver_failed_backup_notifications,
+                args=(notification_job,),
+                daemon=True,
+                name=f"backup-notification-{str(job.id)[:32]}",
+            )
+            thread.start()
+        except Exception as exc:
+            logger.warning("Failed backup notification dispatch failed (%s)", type(exc).__name__)
+
+    def _build_failure_notification_payload(self, job: JobRecord) -> Dict[str, Any]:
+        safe_summary = self._safe_result_summary(job)
+        summary: Dict[str, Any] = {}
+        for key in (
+            "error",
+            "status_code",
+            "state",
+            "source",
+            "recovery",
+            "diagnostic_code",
+            "diagnostic_category",
+            "diagnostic_message",
+        ):
+            value = safe_summary.get(key)
+            if isinstance(value, str):
+                max_length = 2048 if key == "error" else 512
+                summary[key] = self._redact_job_text(value, self._job_sensitive_values(job))[:max_length]
+            elif isinstance(value, (int, float, bool)) or value is None:
+                if value is not None:
+                    summary[key] = value
+
+        payload = {
+            "event": "backup.failed",
+            "job_id": str(job.id)[:128],
+            "target_id": str(job.target_id)[:128] if job.target_id else None,
+            "command": "backup.run",
+            "status": JobStatus.FAILED,
+            "started_at": job.started_at.isoformat() if job.started_at else None,
+            "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+            "summary": summary,
+        }
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
+            error = summary.get("error")
+            payload["summary"] = {"error": error[:512]} if isinstance(error, str) else {}
+            serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
+            payload["summary"] = {}
+        return payload
+
+    def _deliver_failed_backup_notifications(self, job: JobRecord) -> None:
+        repository = self.notification_channel_repository
+        if repository is None or job.command != "backup.run" or JobStatus.normalize(job.status) != JobStatus.FAILED:
+            return
+        try:
+            channels = repository.list()
+            payload = self._build_failure_notification_payload(job)
+        except Exception as exc:
+            logger.warning("Failed backup notification preparation failed (%s)", type(exc).__name__)
+            return
+
+        for channel in channels:
+            if not channel.enabled:
+                continue
+            try:
+                if not repository.claim_delivery_attempt(job.id, channel.id):
+                    continue
+                self._send_notification_channel(channel, payload)
+            except Exception as exc:
+                logger.warning(
+                    "Notification delivery failed for channel %s (%s)",
+                    channel.id,
+                    type(exc).__name__,
+                )
+
+    def _send_notification_channel(self, channel: NotificationChannelRecord, payload: Dict[str, Any]) -> None:
+        config = self._notification_channel_config(channel)
+        serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
+            raise ValueError("notification payload exceeds the permitted size")
+
+        if channel.channel_type == "webhook":
+            request = urllib.request.Request(
+                config["url"],
+                data=serialized,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+                method="POST",
+            )
+            opener = urllib.request.build_opener(_NoRedirectHandler())
+            with opener.open(request, timeout=self.NOTIFICATION_DELIVERY_TIMEOUT_SECONDS) as response:
+                status = getattr(response, "status", 200)
+            if status < 200 or status >= 300:
+                raise ValueError("notification webhook returned a non-success response")
+            return
+
+        message = EmailMessage()
+        message["Subject"] = f"Backup failed: {payload['job_id']}"
+        message["From"] = config["from"]
+        message["To"] = ", ".join(config["to"])
+        message.set_content(serialized.decode("utf-8"))
+        security = config["security"]
+        context = ssl.create_default_context()
+        if security == "ssl":
+            with smtplib.SMTP_SSL(
+                config["host"], config["port"], timeout=self.NOTIFICATION_DELIVERY_TIMEOUT_SECONDS, context=context
+            ) as client:
+                if config.get("username"):
+                    client.login(config["username"], config["password"])
+                client.send_message(message)
+            return
+
+        with smtplib.SMTP(
+            config["host"], config["port"], timeout=self.NOTIFICATION_DELIVERY_TIMEOUT_SECONDS
+        ) as client:
+            if security == "starttls":
+                client.ehlo()
+                client.starttls(context=context)
+                client.ehlo()
+            if config.get("username"):
+                client.login(config["username"], config["password"])
+            client.send_message(message)
 
     def find_secret_usages(self, secret_id: str) -> List[Dict[str, Any]]:
         usages: List[Dict[str, Any]] = []
@@ -3830,6 +3975,8 @@ class ControlPlaneService:
                 self._invalidate_explorer_metadata_after_success(job)
         saved_job = self.job_repository.save(job)
         self._publish_job_event(saved_job)
+        if status == JobStatus.FAILED:
+            self._schedule_failed_backup_notifications(saved_job)
         if status == JobStatus.SUCCEEDED:
             try:
                 self._schedule_snapshot_sync_after_mutation(saved_job)
@@ -4382,6 +4529,7 @@ class ControlPlaneService:
                 job = self.job_repository.get(job_id)
                 if job is not None and JobStatus.normalize(job.status) == JobStatus.FAILED:
                     self._publish_job_event(job)
+                    self._schedule_failed_backup_notifications(job)
         return reconciled
 
     def _require_target(self, target_id: str) -> BackupTargetRecord:

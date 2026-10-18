@@ -9,6 +9,8 @@ from pathlib import Path
 UI_PATH = Path(__file__).resolve().parents[1] / "src" / "control_plane" / "ui" / "index.html"
 UI_CSS_PATH = Path(__file__).resolve().parents[1] / "src" / "control_plane" / "ui" / "styles" / "components.css"
 UI_APP_CSS_PATH = Path(__file__).resolve().parents[1] / "src" / "control_plane" / "ui" / "styles" / "app.css"
+README_PATH = Path(__file__).resolve().parents[1] / "README.md"
+NOTIFICATION_GUIDE_PATH = Path(__file__).resolve().parents[1] / "doc" / "backup-failure-notifications.md"
 
 
 class SnapshotExplorerUiStateTests(unittest.TestCase):
@@ -2424,6 +2426,45 @@ class WorkerUiStateTests(unittest.TestCase):
         ):
             self.assertIn(marker, settings_source)
 
+    def test_settings_manages_multiple_webhook_and_smtp_channels_safely(self):
+        settings_loader = re.search(r'else if \(view === "settings"\) \{.*?\n      \}', self.source, re.S)
+        self.assertIsNotNone(settings_loader)
+        self.assertIn('"notificationChannels", "/api/v1/notification-channels"', settings_loader.group(0))
+
+        manager = re.search(r"function renderNotificationChannelManager\(.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(manager)
+        manager_source = manager.group(0)
+        for marker in (
+            "state.notificationChannels",
+            "channel.config_summary",
+            "webhook",
+            "smtp",
+            "apiPost(\"/api/v1/notification-channels\"",
+            "apiPatch(`/api/v1/notification-channels/",
+            "apiDelete(`/api/v1/notification-channels/",
+            "STARTTLS",
+            "Nueva contraseña SMTP",
+            "URL del webhook",
+        ):
+            self.assertIn(marker, manager_source)
+        self.assertNotIn("config_ciphertext", manager_source)
+        self.assertIn("renderNotificationChannelManager()", self.source)
+
+    def test_notification_setup_guide_documents_channels_and_is_linked(self):
+        guide = NOTIFICATION_GUIDE_PATH.read_text(encoding="utf-8")
+        readme = README_PATH.read_text(encoding="utf-8")
+        for marker in (
+            "Webhook",
+            "SMTP",
+            "STARTTLS",
+            "backup.failed",
+            "logs completos",
+            "un intento",
+            "redes internas",
+        ):
+            self.assertIn(marker.lower(), guide.lower())
+        self.assertIn("[Notificaciones de backups fallidos](doc/backup-failure-notifications.md)", readme)
+
     def test_restore_ownership_ui_uses_simple_spanish_choices_and_preserves_payload_contract(self):
         restore = re.search(r"function openRestoreFromSnapshotModal\(.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(restore)
@@ -2791,21 +2832,21 @@ const apiGet = async path => {
   await loadPageData("dashboard");
   if (calls.length !== 0) throw new Error(`dashboard requested page data: ${JSON.stringify(calls)}`);
   await loadPageData("settings");
-  const settingsData = ["/api/v1/settings", "/api/v1/settings/rclone-remote", "/api/v1/secrets"];
+  const settingsData = ["/api/v1/settings", "/api/v1/settings/rclone-remote", "/api/v1/secrets", "/api/v1/notification-channels"];
   if (JSON.stringify(calls) !== JSON.stringify(settingsData)) throw new Error(`settings did not load only its dependencies: ${JSON.stringify(calls)}`);
   await loadPageData("settings");
-  if (calls.length !== 3) throw new Error("cached settings data was fetched again");
+  if (calls.length !== 4) throw new Error("cached settings data was fetched again");
   await loadPageData("targets");
   const targetData = [...settingsData, "/api/v1/storage-profiles", "/api/v1/retention-policies"].sort();
   if (JSON.stringify([...calls].sort()) !== JSON.stringify(targetData)) throw new Error(`targets did not load only its dependencies: ${JSON.stringify(calls)}`);
   await loadPageData("targets");
-  if (calls.length !== 5) throw new Error("cached target page data was fetched again");
+  if (calls.length !== 6) throw new Error("cached target page data was fetched again");
   await loadPageData("secrets");
-  if (calls.length !== 5) throw new Error("secrets page ignored the shared in-memory cache");
+  if (calls.length !== 6) throw new Error("secrets page ignored the shared in-memory cache");
   await loadPageData("users");
-  if (calls[5] !== "/api/v1/admin/users") throw new Error(`users page loaded unrelated data: ${JSON.stringify(calls)}`);
+  if (calls[6] !== "/api/v1/admin/users") throw new Error(`users page loaded unrelated data: ${JSON.stringify(calls)}`);
   await loadPageData("users", true);
-  if (calls.length !== 7 || calls[6] !== "/api/v1/admin/users") throw new Error("forced page refresh did not reload only the active dataset");
+  if (calls.length !== 8 || calls[7] !== "/api/v1/admin/users") throw new Error("forced page refresh did not reload only the active dataset");
   state.currentRole = "operator";
   state.pageDataLoaded = {};
   state.pageDataPending = {};

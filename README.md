@@ -308,6 +308,7 @@ docker compose -f deploy/worker/docker-compose.yml down
 
 ## Documentación detallada
 
+- [Notificaciones de backups fallidos](doc/backup-failure-notifications.md)
 - [Control Plane — Guía completa](doc/control-plane-quickstart.md)
 - [Control Plane — Especificación técnica](doc/control-plane-spec.md)
 - [Despliegue del Control Plane](deploy/control-plane/README.md)

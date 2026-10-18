@@ -243,6 +243,9 @@
       schedulerTimezone: null,
       settings: {},
       rcloneRemote: null,
+      notificationChannels: [],
+      notificationChannelEditor: null,
+      notificationChannelFeedback: null,
       pageDataLoaded: {},
       pageDataPending: {},
     };
@@ -704,6 +707,7 @@
         loadSettings();
         load("rcloneRemote", "/api/v1/settings/rclone-remote", response => { state.rcloneRemote = response.remote_name || null; }, isAdmin, { remote_name: null });
         loadSecrets();
+        load("notificationChannels", "/api/v1/notification-channels", response => { state.notificationChannels = response.items || []; }, isAdmin, { items: [] });
       }
       return requests.length ? Promise.all(requests) : null;
     }
@@ -8325,6 +8329,7 @@ docker compose up -d
             <div id="settingsFeedback"></div>
           </div>
         </form>
+        <div id="notificationChannelManager"></div>
       `;
       const feedbackEl = () => document.getElementById("settingsFeedback");
       const showFeedback = (msg, type) => {
@@ -8410,6 +8415,181 @@ docker compose up -d
         }, "Guardando...").catch((error) => {
           showFeedback(`Error guardando configuracion: ${error.message}`, "error");
         });
+      });
+      renderNotificationChannelManager();
+    }
+
+    function renderNotificationChannelManager() {
+      const container = document.getElementById("notificationChannelManager");
+      if (!container) return;
+      const channels = Array.isArray(state.notificationChannels) ? state.notificationChannels : [];
+      const editor = state.notificationChannelEditor;
+      const editingChannel = editor?.channel || null;
+      const channelType = editingChannel?.channel_type || editor?.channelType || "webhook";
+      const channelSummary = editingChannel?.config_summary || {};
+      const isEditing = !!editingChannel;
+      const channelCards = channels.length ? channels.map(channel => {
+        const summary = channel.config_summary || {};
+        const detail = channel.channel_type === "webhook"
+          ? `Destino: ${summary.destination || "URL guardada"}`
+          : `${summary.host || "SMTP"}:${summary.port || ""} · ${summary.from || ""} → ${(summary.to || []).join(", ")} · ${summary.security || "STARTTLS"}`;
+        return `
+          <article class="settings-card notification-channel-card">
+            <div class="settings-card-header">
+              <span class="settings-icon">${channel.channel_type === "webhook" ? "🔔" : "✉️"}</span>
+              <div><h3>${escapeHtml(channel.name)}</h3><div class="settings-card-sub">${channel.channel_type === "webhook" ? "Webhook" : "Correo SMTP"} · ${channel.enabled ? "Activo" : "Desactivado"}</div></div>
+            </div>
+            <div class="helper">${escapeHtml(detail)}</div>
+            ${channel.channel_type === "smtp" && summary.authentication_configured ? '<div class="helper">Autenticación configurada; las credenciales no se muestran.</div>' : ""}
+            <div class="settings-actions">
+              <button type="button" class="btn secondary" data-notification-edit="${escapeHtml(channel.id)}">Editar</button>
+              <button type="button" class="btn secondary" data-notification-toggle="${escapeHtml(channel.id)}">${channel.enabled ? "Desactivar" : "Activar"}</button>
+              <button type="button" class="btn danger" data-notification-delete="${escapeHtml(channel.id)}">Eliminar</button>
+            </div>
+          </article>`;
+      }).join("") : '<div class="settings-card"><div class="helper">Aún no hay canales. Agrega un webhook o un destino de correo SMTP.</div></div>';
+      const editorFields = !editor ? "" : channelType === "webhook" ? `
+        <div class="field full"><label for="notificationWebhookUrl">URL del webhook</label><input id="notificationWebhookUrl" name="url" type="url" placeholder="https://hooks.example.test/backup" ${isEditing ? "" : "required"} /><div class="helper">Se admite una dirección interna. En edición, deja el campo vacío para conservar la URL guardada; no se mostrará el token ni la ruta existente.</div></div>
+      ` : `
+        <div class="field"><label for="notificationSmtpHost">Servidor SMTP</label><input id="notificationSmtpHost" name="host" value="${escapeHtml(channelSummary.host || "")}" required placeholder="smtp.example.test" /></div>
+        <div class="field"><label for="notificationSmtpPort">Puerto</label><input id="notificationSmtpPort" name="port" type="number" min="1" max="65535" value="${escapeHtml(channelSummary.port || 587)}" required /></div>
+        <div class="field"><label for="notificationSmtpFrom">Remitente</label><input id="notificationSmtpFrom" name="from" type="email" value="${escapeHtml(channelSummary.from || "")}" required placeholder="backups@example.test" /></div>
+        <div class="field"><label for="notificationSmtpTo">Destinatarios</label><input id="notificationSmtpTo" name="to" value="${escapeHtml((channelSummary.to || []).join(", "))}" required placeholder="oncall@example.test, admin@example.test" /><div class="helper">Separa varias direcciones con comas.</div></div>
+        <div class="field"><label for="notificationSmtpSecurity">Seguridad</label><select id="notificationSmtpSecurity" name="security"><option value="starttls" ${(channelSummary.security || "starttls") === "starttls" ? "selected" : ""}>STARTTLS (recomendado)</option><option value="ssl" ${channelSummary.security === "ssl" ? "selected" : ""}>SSL/TLS</option><option value="none" ${channelSummary.security === "none" ? "selected" : ""}>Sin TLS (red confiable)</option></select></div>
+        <div class="field"><label for="notificationSmtpUsername">Usuario SMTP (opcional)</label><input id="notificationSmtpUsername" name="username" autocomplete="off" placeholder="${channelSummary.authentication_configured ? "Dejar vacío para conservar" : "Usuario"}" /></div>
+        <div class="field"><label for="notificationSmtpPassword">Nueva contraseña SMTP</label><input id="notificationSmtpPassword" name="password" type="password" autocomplete="new-password" placeholder="${channelSummary.authentication_configured ? "Dejar vacío para conservar" : "Contraseña"}" /></div>
+        <div class="helper full">Si defines usuario, también debes indicar contraseña. Las credenciales guardadas nunca se devuelven a la interfaz.</div>
+      `;
+      const editorMarkup = !editor ? "" : `
+        <div class="settings-card notification-channel-editor">
+          <div class="settings-card-header"><div><h3>${isEditing ? "Editar canal" : "Agregar canal"}</h3><div class="settings-card-sub">${isEditing ? "Los campos secretos no se rellenan ni se vuelven a mostrar." : "Las credenciales se cifran antes de guardarse."}</div></div></div>
+          <form id="notificationChannelForm" class="form-grid">
+            <div class="field"><label for="notificationChannelName">Nombre</label><input id="notificationChannelName" name="name" value="${escapeHtml(editor.name || editingChannel?.name || "")}" required maxlength="100" placeholder="Operaciones" /></div>
+            <div class="field"><label for="notificationChannelType">Tipo</label><select id="notificationChannelType" name="channel_type" ${isEditing ? "disabled" : ""}><option value="webhook" ${channelType === "webhook" ? "selected" : ""}>Webhook</option><option value="smtp" ${channelType === "smtp" ? "selected" : ""}>Correo SMTP</option></select></div>
+            ${editorFields}
+            <div class="settings-actions"><button type="submit" class="btn primary">${isEditing ? "Guardar cambios" : "Crear canal"}</button><button type="button" class="btn secondary" id="cancelNotificationChannelEdit">Cancelar</button></div>
+          </form>
+        </div>`;
+      const feedback = state.notificationChannelFeedback;
+      container.innerHTML = `
+        <section class="settings-grid notification-settings" aria-label="Notificaciones de backups fallidos">
+          <div class="settings-card">
+            <div class="settings-card-header"><span class="settings-icon">📣</span><div><h3>Notificaciones de backups fallidos</h3><div class="settings-card-sub">Varios webhooks y destinos SMTP</div></div></div>
+            <div class="helper">Cada canal activo recibe un resumen seguro cuando falla un backup. El envío es de mejor esfuerzo y no bloquea el backup.</div>
+            <div class="settings-actions"><button type="button" class="btn primary" id="addNotificationChannel">Agregar canal</button></div>
+          </div>
+          <div class="settings-card"><h3>Canales configurados</h3><div class="notification-channel-list">${channelCards}</div></div>
+          ${editorMarkup}
+          <div id="notificationChannelFeedback" class="helper" role="status" aria-live="polite" style="${feedback?.type === "error" ? "color:var(--destructive);" : "color:var(--success);"}">${escapeHtml(feedback?.message || "")}</div>
+        </section>`;
+
+      const showFeedback = (message, type = "success") => {
+        state.notificationChannelFeedback = { message, type };
+        const feedbackElement = container.querySelector("#notificationChannelFeedback");
+        if (feedbackElement) {
+          feedbackElement.textContent = message;
+          feedbackElement.style.color = type === "error" ? "var(--destructive)" : "var(--success)";
+        }
+      };
+      const reloadChannels = async () => {
+        const response = await apiGet("/api/v1/notification-channels");
+        state.notificationChannels = response.items || [];
+        state.pageDataLoaded.notificationChannels = true;
+      };
+      container.querySelector("#addNotificationChannel")?.addEventListener("click", () => {
+        state.notificationChannelFeedback = null;
+        state.notificationChannelEditor = { channelType: "webhook", name: "" };
+        renderNotificationChannelManager();
+      });
+      container.querySelector("#cancelNotificationChannelEdit")?.addEventListener("click", () => {
+        state.notificationChannelEditor = null;
+        renderNotificationChannelManager();
+      });
+      container.querySelectorAll("[data-notification-edit]").forEach(button => button.addEventListener("click", () => {
+        const channel = channels.find(item => item.id === button.dataset.notificationEdit);
+        if (!channel) return;
+        state.notificationChannelFeedback = null;
+        state.notificationChannelEditor = { channel, channelType: channel.channel_type, name: channel.name };
+        renderNotificationChannelManager();
+      }));
+      container.querySelectorAll("[data-notification-toggle]").forEach(button => button.addEventListener("click", async () => {
+        const channel = channels.find(item => item.id === button.dataset.notificationToggle);
+        if (!channel) return;
+        try {
+          await apiPatch(`/api/v1/notification-channels/${encodeURIComponent(channel.id)}`, { enabled: !channel.enabled });
+          await reloadChannels();
+          state.notificationChannelFeedback = { message: "Estado del canal actualizado.", type: "success" };
+          renderNotificationChannelManager();
+        } catch (error) {
+          showFeedback(`No se pudo actualizar el canal: ${error.message}`, "error");
+        }
+      }));
+      container.querySelectorAll("[data-notification-delete]").forEach(button => button.addEventListener("click", async () => {
+        const channel = channels.find(item => item.id === button.dataset.notificationDelete);
+        if (!channel || !window.confirm(`¿Eliminar el canal “${channel.name}”?`)) return;
+        try {
+          await apiDelete(`/api/v1/notification-channels/${encodeURIComponent(channel.id)}`);
+          await reloadChannels();
+          state.notificationChannelEditor = null;
+          state.notificationChannelFeedback = { message: "Canal eliminado.", type: "success" };
+          renderNotificationChannelManager();
+        } catch (error) {
+          showFeedback(`No se pudo eliminar el canal: ${error.message}`, "error");
+        }
+      }));
+      const typeSelect = container.querySelector("#notificationChannelType");
+      typeSelect?.addEventListener("change", () => {
+        if (!state.notificationChannelEditor) return;
+        const name = container.querySelector("#notificationChannelName")?.value || "";
+        state.notificationChannelEditor = { ...state.notificationChannelEditor, channelType: typeSelect.value, name };
+        renderNotificationChannelManager();
+      });
+      const form = container.querySelector("#notificationChannelForm");
+      form?.addEventListener("submit", async event => {
+        event.preventDefault();
+        const formData = new FormData(form);
+        const name = String(formData.get("name") || "").trim();
+        const config = {};
+        if (channelType === "webhook") {
+          const url = String(formData.get("url") || "").trim();
+          if (url) config.url = url;
+          if (!isEditing && !url) {
+            showFeedback("La URL del webhook es obligatoria.", "error");
+            return;
+          }
+        } else {
+          config.host = String(formData.get("host") || "").trim();
+          config.port = Number(formData.get("port"));
+          config.from = String(formData.get("from") || "").trim();
+          config.to = String(formData.get("to") || "").split(",").map(value => value.trim()).filter(Boolean);
+          config.security = String(formData.get("security") || "starttls");
+          const username = String(formData.get("username") || "").trim();
+          const password = String(formData.get("password") || "");
+          if (Boolean(username) !== Boolean(password)) {
+            showFeedback("Para cambiar la autenticación SMTP, indica usuario y contraseña.", "error");
+            return;
+          }
+          if (username) {
+            config.username = username;
+            config.password = password;
+          }
+        }
+        const submitButton = form.querySelector('button[type="submit"]');
+        if (submitButton) submitButton.disabled = true;
+        try {
+          if (isEditing) {
+            await apiPatch(`/api/v1/notification-channels/${encodeURIComponent(editingChannel.id)}`, { name, config });
+          } else {
+            await apiPost("/api/v1/notification-channels", { name, channel_type: channelType, config });
+          }
+          await reloadChannels();
+          state.notificationChannelEditor = null;
+          state.notificationChannelFeedback = { message: isEditing ? "Canal actualizado." : "Canal creado.", type: "success" };
+          renderNotificationChannelManager();
+        } catch (error) {
+          showFeedback(`No se pudo guardar el canal: ${error.message}`, "error");
+          if (submitButton) submitButton.disabled = false;
+        }
       });
     }
 

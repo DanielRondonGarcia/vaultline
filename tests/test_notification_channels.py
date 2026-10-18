@@ -230,6 +230,47 @@ class NotificationChannelRouteTests(unittest.TestCase):
         handler._control_plane_service.assert_not_called()
         handler._write_json.assert_not_called()
 
+    def test_malformed_smtp_security_returns_validation_error_without_saving(self):
+        repository = _NotificationRepository()
+        service = ControlPlaneService(
+            worker_repository=InMemoryWorkerRepository(),
+            inventory_repository=InMemoryInventoryRepository(),
+            target_repository=InMemoryTargetRepository(),
+            job_repository=InMemoryJobRepository(),
+            storage_profile_repository=InMemoryStorageProfileRepository(),
+            secret_repository=InMemorySecretRepository(),
+            snapshot_repository=InMemorySnapshotRepository(),
+            retention_policy_repository=InMemoryRetentionPolicyRepository(),
+            target_stats_repository=InMemoryTargetStatsRepository(),
+            secret_codec=SecretCodec(Fernet.generate_key()),
+            settings_repository=InMemorySettingsRepository(),
+            cache_repository=InMemoryCacheRepository(),
+            index_repository=InMemoryIndexRepository(),
+        )
+        service.notification_channel_repository = repository
+        handler = self._handler(
+            "/api/v1/notification-channels",
+            service,
+            {
+                "name": "Invalid SMTP",
+                "channel_type": "smtp",
+                "config": {
+                    "host": "mail.internal",
+                    "port": 587,
+                    "from": "backup@example.test",
+                    "to": ["oncall@example.test"],
+                    "security": [],
+                },
+            },
+        )
+
+        handler.do_POST()
+
+        handler._write_json.assert_called_once_with(
+            400, {"error": "SMTP security must be starttls, ssl, or none"}
+        )
+        self.assertEqual(repository.list(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

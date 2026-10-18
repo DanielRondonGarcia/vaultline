@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -170,12 +171,20 @@ class NotificationDeliveryTests(unittest.TestCase):
     def test_attempt_claim_is_atomic_and_survives_repository_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = str(Path(directory) / "notifications.db")
-            repository = SQLiteNotificationChannelRepository(database_path)
+            repositories = [SQLiteNotificationChannelRepository(database_path) for _ in range(8)]
 
-            self.assertTrue(repository.claim_delivery_attempt("job-1", "channel-1"))
-            self.assertFalse(repository.claim_delivery_attempt("job-1", "channel-1"))
+            with ThreadPoolExecutor(max_workers=len(repositories)) as executor:
+                claims = list(
+                    executor.map(
+                        lambda repository: repository.claim_delivery_attempt("job-1", "channel-1"),
+                        repositories,
+                    )
+                )
+
+            self.assertEqual(sum(claims), 1)
             reopened = SQLiteNotificationChannelRepository(database_path)
             self.assertFalse(reopened.claim_delivery_attempt("job-1", "channel-1"))
+            self.assertTrue(reopened.claim_delivery_attempt("job-1", "channel-2"))
             self.assertTrue(reopened.claim_delivery_attempt("job-2", "channel-1"))
 
     def test_repeated_failed_publications_send_once_per_job_and_channel(self):

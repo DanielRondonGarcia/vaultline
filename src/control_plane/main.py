@@ -41,6 +41,7 @@ from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryCacheRepository,
     InMemoryIndexRepository,
     InMemoryJobRepository,
+    InMemoryNotificationChannelRepository,
     InMemoryRetentionPolicyRepository,
     InMemorySecretRepository,
     InMemorySettingsRepository,
@@ -55,6 +56,7 @@ from src.control_plane.infrastructure.repositories.sqlite import (
     SQLiteCacheRepository,
     SQLiteIndexRepository,
     SQLiteJobRepository,
+    SQLiteNotificationChannelRepository,
     SQLiteRetentionPolicyRepository,
     SQLiteSecretRepository,
     SQLiteSettingsRepository,
@@ -361,6 +363,7 @@ def _build_service() -> ControlPlaneService:
             target_stats_repository=InMemoryTargetStatsRepository(),
             secret_codec=codec,
             settings_repository=InMemorySettingsRepository(),
+            notification_channel_repository=InMemoryNotificationChannelRepository(),
         )
         service.worker_auth = WorkerAuthState()
         return service
@@ -382,6 +385,7 @@ def _build_service() -> ControlPlaneService:
         target_stats_repository=SQLiteTargetStatsRepository(database_path),
         secret_codec=codec,
         settings_repository=SQLiteSettingsRepository(database_path),
+        notification_channel_repository=SQLiteNotificationChannelRepository(database_path),
     )
     service.worker_auth = worker_auth
     return service
@@ -800,6 +804,17 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     {"items": [_secret_to_public(item) for item in self._control_plane_service().list_secrets()]},
                     head_only=head_only,
                 )
+            if path == "/api/v1/notification-channels":
+                if not self._require_auth(ROLE_ADMIN, head_only=head_only, api_mode=True):
+                    return
+                service = self._control_plane_service()
+                items = [service.notification_channel_public_view(item) for item in service.list_notification_channels()]
+                return self._write_json(
+                    200,
+                    {"items": items},
+                    head_only=head_only,
+                    extra_headers={"Cache-Control": "no-store"},
+                )
             if path == "/api/v1/settings":
                 if not self._require_auth(ROLE_ADMIN, head_only=head_only, api_mode=True):
                     return
@@ -1128,6 +1143,18 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     labels=body.get("labels") or {},
                 )
                 return self._write_json(201, _to_jsonable(policy))
+
+            if path == "/api/v1/notification-channels":
+                if not self._require_auth(ROLE_ADMIN, api_mode=True):
+                    return
+                service = self._control_plane_service()
+                channel = service.create_notification_channel(
+                    name=body.get("name"),
+                    channel_type=body.get("channel_type"),
+                    config=body.get("config"),
+                    enabled=body.get("enabled", True),
+                )
+                return self._write_json(201, service.notification_channel_public_view(channel))
 
             if path == "/api/v1/secrets":
                 if not self._require_auth(ROLE_ADMIN, api_mode=True):
@@ -1495,6 +1522,16 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                 if self._live_lane() is not None:
                     self._live_lane().cancel_target(parts[3])
                 return self._write_json(200, self._target_jsonable(target))
+            if len(parts) == 4 and parts[:3] == ["api", "v1", "notification-channels"]:
+                service = self._control_plane_service()
+                channel = service.update_notification_channel(
+                    channel_id=parts[3],
+                    name=body.get("name"),
+                    channel_type=body.get("channel_type"),
+                    config=body.get("config"),
+                    enabled=body.get("enabled"),
+                )
+                return self._write_json(200, service.notification_channel_public_view(channel))
             if path == "/api/v1/settings":
                 settings = self._control_plane_service().update_settings(
                     restic_repository_base=body.get("restic_repository_base"),
@@ -1556,6 +1593,10 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     self._live_service().invalidate_target(parts[3], "target_deleted")
                 if self._live_lane() is not None:
                     self._live_lane().cancel_target(parts[3])
+                return self._write_json(204, {})
+            if len(parts) == 4 and parts[:3] == ["api", "v1", "notification-channels"]:
+                if not self._control_plane_service().delete_notification_channel(parts[3]):
+                    return self._write_json(404, {"error": "notification channel not found"})
                 return self._write_json(204, {})
             if len(parts) == 4 and parts[:3] == ["api", "v1", "secrets"]:
                 self._control_plane_service().delete_secret(parts[3])

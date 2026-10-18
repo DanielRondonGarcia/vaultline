@@ -9,6 +9,7 @@ from src.control_plane.application.ports.ports import (
     IndexRepository,
     InventoryRepository,
     JobRepository,
+    NotificationChannelRepository,
     RetentionPolicyRepository,
     SecretRepository,
     SettingsRepository,
@@ -29,6 +30,7 @@ from src.control_plane.domain.models import (
     InventorySnapshot,
     JobRecord,
     JobStatus,
+    NotificationChannelRecord,
     RetentionPolicyRecord,
     SecretRecord,
     SettingsRecord,
@@ -467,6 +469,29 @@ class InMemorySecretRepository(SecretRepository):
     def delete(self, secret_id: str) -> None:
         with self._lock:
             self._items.pop(secret_id, None)
+
+
+class InMemoryNotificationChannelRepository(NotificationChannelRepository):
+    def __init__(self):
+        self._items: Dict[str, NotificationChannelRecord] = {}
+        self._lock = Lock()
+
+    def save(self, channel: NotificationChannelRecord) -> NotificationChannelRecord:
+        with self._lock:
+            self._items[channel.id] = channel
+        return channel
+
+    def get(self, channel_id: str) -> Optional[NotificationChannelRecord]:
+        with self._lock:
+            return self._items.get(channel_id)
+
+    def list(self) -> List[NotificationChannelRecord]:
+        with self._lock:
+            return sorted(self._items.values(), key=lambda item: item.created_at)
+
+    def delete(self, channel_id: str) -> bool:
+        with self._lock:
+            return self._items.pop(channel_id, None) is not None
 
 
 class InMemorySnapshotRepository(SnapshotRepository):

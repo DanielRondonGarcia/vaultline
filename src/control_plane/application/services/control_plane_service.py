@@ -10,6 +10,7 @@ import re
 import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from src.control_plane.application.ports.ports import (
@@ -17,6 +18,7 @@ from src.control_plane.application.ports.ports import (
     IndexRepository,
     InventoryRepository,
     JobRepository,
+    NotificationChannelRepository,
     RetentionPolicyRepository,
     SecretRepository,
     SettingsRepository,
@@ -32,6 +34,7 @@ from src.control_plane.domain.models import (
     InventorySnapshot,
     JobRecord,
     JobStatus,
+    NotificationChannelRecord,
     RetentionPolicyRecord,
     SecretRecord,
     SettingsRecord,
@@ -175,6 +178,7 @@ class ControlPlaneService:
         cache_repository: Optional[CacheRepository] = None,
         index_repository: Optional[IndexRepository] = None,
         job_event_broker: Optional[JobEventBroker] = None,
+        notification_channel_repository: Optional[NotificationChannelRepository] = None,
     ):
         self.worker_repository = worker_repository
         self.inventory_repository = inventory_repository
@@ -190,6 +194,7 @@ class ControlPlaneService:
         self.cache_repository = cache_repository
         self.index_repository = index_repository
         self.job_event_broker = job_event_broker or JobEventBroker()
+        self.notification_channel_repository = notification_channel_repository
         self.worker_auth = None
 
     def register_worker(
@@ -2799,6 +2804,207 @@ class ControlPlaneService:
             secret.key_version = getattr(self.secret_codec, "key_version", "v1")
         secret.updated_at = utcnow()
         return self.secret_repository.save(secret)
+
+    SUPPORTED_NOTIFICATION_CHANNEL_TYPES = frozenset({"webhook", "smtp"})
+    NOTIFICATION_CHANNEL_NAME_MAX_LENGTH = 100
+    SMTP_SECURITY_MODES = frozenset({"starttls", "ssl", "none"})
+
+    @staticmethod
+    def _require_notification_channel_repository(repository):
+        if repository is None:
+            raise ValueError("notification channel repository not configured")
+        return repository
+
+    @classmethod
+    def _validate_notification_channel_config(cls, channel_type: str, config: Any) -> Dict[str, Any]:
+        if not isinstance(config, dict):
+            raise ValueError("notification channel config must be an object")
+
+        if channel_type == "webhook":
+            unknown = set(config) - {"url"}
+            if unknown:
+                raise ValueError(f"unsupported webhook config field: {sorted(unknown)[0]}")
+            url = config.get("url")
+            if not isinstance(url, str) or not url.strip() or len(url) > 2048:
+                raise ValueError("webhook URL is required and must be at most 2048 characters")
+            try:
+                parsed = urlsplit(url.strip())
+                hostname = parsed.hostname
+                _ = parsed.port
+            except ValueError as exc:
+                raise ValueError("webhook URL is invalid") from exc
+            if parsed.scheme not in {"http", "https"} or not hostname:
+                raise ValueError("webhook URL must be an absolute HTTP or HTTPS URL")
+            if parsed.username is not None or parsed.password is not None:
+                raise ValueError("webhook URL must not contain user information")
+            if parsed.fragment:
+                raise ValueError("webhook URL must not contain a fragment")
+            return {"url": url.strip()}
+
+        allowed = {"host", "port", "from", "to", "security", "username", "password"}
+        unknown = set(config) - allowed
+        if unknown:
+            raise ValueError(f"unsupported SMTP config field: {sorted(unknown)[0]}")
+        host = config.get("host")
+        if not isinstance(host, str) or not host.strip() or any(char.isspace() for char in host):
+            raise ValueError("SMTP host is required")
+        port = config.get("port", 587)
+        if isinstance(port, bool) or not isinstance(port, int) or not 1 <= port <= 65535:
+            raise ValueError("SMTP port must be an integer between 1 and 65535")
+        sender = config.get("from")
+        if not cls._is_notification_email(sender):
+            raise ValueError("SMTP sender must be a valid email address")
+        recipients = config.get("to")
+        if not isinstance(recipients, list) or not recipients or any(
+            not cls._is_notification_email(recipient) for recipient in recipients
+        ):
+            raise ValueError("SMTP recipients must be a non-empty list of valid email addresses")
+        security = config.get("security", "starttls")
+        if security not in cls.SMTP_SECURITY_MODES:
+            raise ValueError("SMTP security must be starttls, ssl, or none")
+        username = config.get("username")
+        password = config.get("password")
+        if username is not None and (not isinstance(username, str) or "\r" in username or "\n" in username):
+            raise ValueError("SMTP username is invalid")
+        if password is not None and not isinstance(password, str):
+            raise ValueError("SMTP password is invalid")
+        if bool(username) != bool(password):
+            raise ValueError("SMTP username and password must be configured together")
+        normalized = {
+            "host": host.strip(),
+            "port": port,
+            "from": sender.strip(),
+            "to": [recipient.strip() for recipient in recipients],
+            "security": security,
+        }
+        if username:
+            normalized["username"] = username
+            normalized["password"] = password
+        return normalized
+
+    @staticmethod
+    def _is_notification_email(value: Any) -> bool:
+        if not isinstance(value, str) or "\r" in value or "\n" in value:
+            return False
+        local, separator, domain = value.strip().partition("@")
+        return bool(separator and local and domain and " " not in local and " " not in domain and "." in domain)
+
+    def _notification_channel_config(self, channel: NotificationChannelRecord) -> Dict[str, Any]:
+        try:
+            decoded = json.loads(self.secret_codec.decrypt(channel.config_ciphertext))
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("notification channel configuration could not be decrypted") from exc
+        return self._validate_notification_channel_config(channel.channel_type, decoded)
+
+    def create_notification_channel(
+        self,
+        name: str,
+        channel_type: str,
+        config: Dict[str, Any],
+        enabled: bool = True,
+    ) -> NotificationChannelRecord:
+        repository = self._require_notification_channel_repository(self.notification_channel_repository)
+        normalized_name = name.strip() if isinstance(name, str) else ""
+        if not normalized_name or len(normalized_name) > self.NOTIFICATION_CHANNEL_NAME_MAX_LENGTH:
+            raise ValueError("notification channel name is required and must be at most 100 characters")
+        normalized_type = channel_type.strip().lower() if isinstance(channel_type, str) else ""
+        if normalized_type not in self.SUPPORTED_NOTIFICATION_CHANNEL_TYPES:
+            raise ValueError("unsupported notification channel type")
+        if not isinstance(enabled, bool):
+            raise ValueError("notification channel enabled must be a boolean")
+        normalized_config = self._validate_notification_channel_config(normalized_type, config)
+        encrypted_config = self.secret_codec.encrypt(
+            json.dumps(normalized_config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        record = NotificationChannelRecord(
+            name=normalized_name,
+            channel_type=normalized_type,
+            config_ciphertext=encrypted_config,
+            key_version=getattr(self.secret_codec, "key_version", "v1"),
+            enabled=enabled,
+        )
+        return repository.save(record)
+
+    def list_notification_channels(self) -> List[NotificationChannelRecord]:
+        repository = self._require_notification_channel_repository(self.notification_channel_repository)
+        return repository.list()
+
+    def get_notification_channel(self, channel_id: str) -> Optional[NotificationChannelRecord]:
+        repository = self._require_notification_channel_repository(self.notification_channel_repository)
+        return repository.get(channel_id)
+
+    def notification_channel_public_view(self, channel: NotificationChannelRecord) -> Dict[str, Any]:
+        config = self._notification_channel_config(channel)
+        if channel.channel_type == "webhook":
+            parsed = urlsplit(config["url"])
+            host = parsed.hostname or ""
+            if parsed.port:
+                host = f"{host}:{parsed.port}"
+            config_summary = {"destination": f"{parsed.scheme}://{host}", "url_configured": True}
+        else:
+            config_summary = {
+                "host": config["host"],
+                "port": config["port"],
+                "from": config["from"],
+                "to": list(config["to"]),
+                "security": config["security"],
+                "authentication_configured": bool(config.get("username") and config.get("password")),
+            }
+        return {
+            "id": channel.id,
+            "name": channel.name,
+            "channel_type": channel.channel_type,
+            "enabled": channel.enabled,
+            "config_summary": config_summary,
+            "created_at": channel.created_at,
+            "updated_at": channel.updated_at,
+        }
+
+    def update_notification_channel(
+        self,
+        channel_id: str,
+        name: Optional[str] = None,
+        channel_type: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        enabled: Optional[bool] = None,
+    ) -> NotificationChannelRecord:
+        repository = self._require_notification_channel_repository(self.notification_channel_repository)
+        existing = repository.get(channel_id)
+        if existing is None:
+            raise ValueError("notification channel not found")
+        new_type = (channel_type.strip().lower() if isinstance(channel_type, str) else channel_type) or existing.channel_type
+        if new_type not in self.SUPPORTED_NOTIFICATION_CHANNEL_TYPES:
+            raise ValueError("unsupported notification channel type")
+        if enabled is not None and not isinstance(enabled, bool):
+            raise ValueError("notification channel enabled must be a boolean")
+        current_config = self._notification_channel_config(existing)
+        if config is not None:
+            if not isinstance(config, dict):
+                raise ValueError("notification channel config must be an object")
+            current_config = current_config if new_type != existing.channel_type else {**current_config, **config}
+            if new_type != existing.channel_type:
+                current_config = config
+        normalized_config = self._validate_notification_channel_config(new_type, current_config)
+        if name is not None:
+            normalized_name = name.strip() if isinstance(name, str) else ""
+            if not normalized_name or len(normalized_name) > self.NOTIFICATION_CHANNEL_NAME_MAX_LENGTH:
+                raise ValueError("notification channel name is required and must be at most 100 characters")
+            existing.name = normalized_name
+        existing.channel_type = new_type
+        existing.config_ciphertext = self.secret_codec.encrypt(
+            json.dumps(normalized_config, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        )
+        existing.key_version = getattr(self.secret_codec, "key_version", "v1")
+        if enabled is not None:
+            existing.enabled = enabled
+        existing.updated_at = utcnow()
+        return repository.save(existing)
+
+    def delete_notification_channel(self, channel_id: str) -> bool:
+        repository = self._require_notification_channel_repository(self.notification_channel_repository)
+        if repository.get(channel_id) is None:
+            return False
+        return repository.delete(channel_id)
 
     def find_secret_usages(self, secret_id: str) -> List[Dict[str, Any]]:
         usages: List[Dict[str, Any]] = []

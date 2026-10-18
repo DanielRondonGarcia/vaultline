@@ -137,6 +137,18 @@ class SecretRecord:
 
 
 @dataclass
+class NotificationChannelRecord:
+    name: str
+    channel_type: str
+    config_ciphertext: str
+    key_version: str = "v1"
+    enabled: bool = True
+    id: str = field(default_factory=lambda: str(uuid4()))
+    created_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass
 class SnapshotRecord:
     target_id: str
     worker_id: str

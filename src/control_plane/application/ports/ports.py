@@ -9,6 +9,7 @@ from src.control_plane.domain.models import (
     InventorySnapshot,
     JobRecord,
     JobStatus,
+    NotificationChannelRecord,
     RetentionPolicyRecord,
     SecretRecord,
     SettingsRecord,
@@ -308,6 +309,24 @@ class SecretRepository(ABC):
 
     @abstractmethod
     def delete(self, secret_id: str) -> None:
+        raise NotImplementedError
+
+
+class NotificationChannelRepository(ABC):
+    @abstractmethod
+    def save(self, channel: NotificationChannelRecord) -> NotificationChannelRecord:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get(self, channel_id: str) -> Optional[NotificationChannelRecord]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list(self) -> List[NotificationChannelRecord]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete(self, channel_id: str) -> bool:
         raise NotImplementedError
 
 

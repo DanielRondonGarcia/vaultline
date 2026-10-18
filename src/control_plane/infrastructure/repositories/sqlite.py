@@ -11,6 +11,7 @@ from src.control_plane.application.ports.ports import (
     IndexRepository,
     InventoryRepository,
     JobRepository,
+    NotificationChannelRepository,
     RetentionPolicyRepository,
     SecretRepository,
     SettingsRepository,
@@ -31,6 +32,7 @@ from src.control_plane.domain.models import (
     InventorySnapshot,
     JobRecord,
     JobStatus,
+    NotificationChannelRecord,
     RetentionPolicyRecord,
     SecretRecord,
     SettingsRecord,
@@ -273,6 +275,17 @@ class SQLiteRepositoryBase:
                     ciphertext TEXT NOT NULL,
                     key_version TEXT NOT NULL,
                     metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS notification_channels (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    channel_type TEXT NOT NULL,
+                    config_ciphertext TEXT NOT NULL,
+                    key_version TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -1332,6 +1345,61 @@ class SQLiteSecretRepository(SQLiteRepositoryBase, SecretRepository):
             ciphertext=row["ciphertext"],
             key_version=row["key_version"],
             metadata=_json_load(row["metadata_json"], {}),
+            created_at=_dt(row["created_at"]) or datetime.utcnow(),
+            updated_at=_dt(row["updated_at"]) or datetime.utcnow(),
+        )
+
+
+class SQLiteNotificationChannelRepository(SQLiteRepositoryBase, NotificationChannelRepository):
+    def save(self, channel: NotificationChannelRecord) -> NotificationChannelRecord:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO notification_channels (
+                    id, name, channel_type, config_ciphertext, key_version, enabled, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    channel.id,
+                    channel.name,
+                    channel.channel_type,
+                    channel.config_ciphertext,
+                    channel.key_version,
+                    int(channel.enabled),
+                    channel.created_at.isoformat(),
+                    channel.updated_at.isoformat(),
+                ),
+            )
+        return channel
+
+    def get(self, channel_id: str) -> Optional[NotificationChannelRecord]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM notification_channels WHERE id = ?", (channel_id,)
+            ).fetchone()
+        return self._row_to_channel(row) if row else None
+
+    def list(self) -> List[NotificationChannelRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM notification_channels ORDER BY created_at ASC, id ASC"
+            ).fetchall()
+        return [self._row_to_channel(row) for row in rows]
+
+    def delete(self, channel_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute("DELETE FROM notification_channels WHERE id = ?", (channel_id,))
+            return cursor.rowcount > 0
+
+    @staticmethod
+    def _row_to_channel(row: sqlite3.Row) -> NotificationChannelRecord:
+        return NotificationChannelRecord(
+            id=row["id"],
+            name=row["name"],
+            channel_type=row["channel_type"],
+            config_ciphertext=row["config_ciphertext"],
+            key_version=row["key_version"],
+            enabled=bool(row["enabled"]),
             created_at=_dt(row["created_at"]) or datetime.utcnow(),
             updated_at=_dt(row["updated_at"]) or datetime.utcnow(),
         )

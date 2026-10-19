@@ -245,7 +245,13 @@ class JobRepository(ABC):
         return compute_job_stats(self.list(), tz_offset_minutes, now)
 
     @abstractmethod
-    def claim_pending_for_worker(self, worker_id: str, lease_duration_seconds: int = 300) -> List[JobRecord]:
+    def claim_pending_for_worker(
+        self,
+        worker_id: str,
+        lease_duration_seconds: int = 300,
+        priority_commands: Optional[Tuple[str, ...]] = None,
+    ) -> List[JobRecord]:
+        """Claim one oldest pending job, preferring listed commands, and start its lease."""
         raise NotImplementedError
 
     @abstractmethod

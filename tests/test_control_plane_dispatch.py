@@ -368,16 +368,21 @@ class ControlPlaneDispatchTests(unittest.TestCase):
 
     def test_interactive_fetch_prioritizes_explorer_jobs_and_search_is_bounded(self):
         service = self.make_service()
-        service.dispatch_job("worker-a", "backup.run", target_id="target-a")
+        backup = service.dispatch_job("worker-a", "backup.run", target_id="target-a")
         search = service.dispatch_snapshot_read(
             "target-a", "search", "abcdef12", query="needle", max_entries=1, request_id="search-1"
         )
 
         jobs = service.fetch_interactive_jobs_for_worker("worker-a")
 
+        self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].id, search["job_id"])
         self.assertEqual(jobs[0].command, "snapshot.search")
         self.assertEqual(jobs[0].owner_worker_id, "worker-a")
+        queued_backup = service.get_job(backup.id)
+        self.assertEqual(queued_backup.status, JobStatus.PENDING)
+        self.assertIsNone(queued_backup.lease_token)
+        self.assertIsNone(queued_backup.lease_expires_at)
 
         runtime = Mock()
         runtime.run_runtime_job.return_value = {
@@ -529,14 +534,17 @@ class ControlPlaneDispatchTests(unittest.TestCase):
         self.assertEqual(sync_jobs[0].payload["cache_generation"], 1)
 
         second_backup = service.dispatch_backup_for_target("target-a")
-        second_claim = next(
-            job for job in service.fetch_jobs_for_worker("worker-a") if job.id == second_backup.id
-        )
+        sync_claim = service.fetch_jobs_for_worker("worker-a")
+        self.assertEqual(len(sync_claim), 1)
+        self.assertEqual(sync_claim[0].command, "snapshots.list")
+        self.assertEqual(sync_claim[0].status, JobStatus.IN_PROGRESS)
+        second_claim = service.fetch_jobs_for_worker("worker-a")
+        self.assertEqual([job.id for job in second_claim], [second_backup.id])
         service.update_job_status(
             "worker-a",
             second_backup.id,
             JobStatus.SUCCEEDED,
-            lease_token=second_claim.lease_token,
+            lease_token=second_claim[0].lease_token,
         )
 
         sync_jobs = [

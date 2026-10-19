@@ -1574,7 +1574,7 @@ main().catch(error => {
             "diagnostic_code",
             "diagnostic_category",
             "last_renewal",
-            "No se demostro la causa raiz",
+            "Causa raíz no confirmada",
             "renderJobLeaseDiagnostics(job)",
             "job-lease-diagnostics",
         ):
@@ -1589,6 +1589,55 @@ main().catch(error => {
             "fmtDate(observed.worker_last_seen_at)",
         ):
             self.assertIn(marker, renderer.group(0))
+
+    def test_job_lease_error_copy_explains_timeout_without_claiming_a_root_cause(self):
+        renderer = re.search(r"function renderJobLeaseDiagnostics\(job\) \{.*?\n     \}", self.source, re.S)
+        self.assertIsNotNone(renderer)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = r'''
+const escapeHtml = value => String(value);
+const fmtDate = value => value || "No disponible";
+''' + renderer.group(0) + r'''
+const html = renderJobLeaseDiagnostics({
+  id: "job-1", target_id: "target-1", worker_id: "worker-1", command: "backup.run",
+  result_summary: { diagnostic_code: "worker_lease_expired", diagnostic_category: "worker_interrupted" },
+  diagnostics: {
+    code: "worker_lease_expired", category: "worker_interrupted",
+    message: "Control Plane observed lease expiry; worker/runtime cause unknown.",
+    unknown: ["terminal_result", "root_cause"],
+    observed: {
+      job_id: "job-1", target_id: "target-1", worker_id: "worker-1", command: "backup.run",
+      lease_issued_at: "2026-10-19T15:01:00Z", lease_expires_at: "2026-10-19T15:06:00Z",
+      last_repository_update_at: "2026-10-19T15:01:00Z", last_progress_at: null,
+      last_progress_sequence: 0, worker_last_seen_at: "2026-10-19T20:06:00Z",
+      worker_status: "online", last_renewal: null,
+    },
+  },
+});
+const expected = [
+  "El worker no confirmó el fin del job",
+  "El plazo de reserva (lease) venció antes de que el Control Plane recibiera el resultado final",
+  "Este diagnóstico no revela por sí solo qué ocurrió dentro del worker o del runtime",
+  "No se pudo determinar si el worker se detuvo, quedó esperando o perdió comunicación con el Control Plane",
+  "<summary>Detalles técnicos</summary>",
+  "worker_lease_expired",
+  "Sin evidencia de renovación recibida por el Control Plane",
+];
+const missing = expected.filter(text => !html.includes(text));
+if (missing.length) throw new Error(`missing user-facing lease explanation: ${missing.join("; ")}`);
+if (html.indexOf("<details") < 0 || html.indexOf("worker_lease_expired") < html.indexOf("<details")) throw new Error("technical details are not behind the disclosure");
+process.stdout.write("lease error explanation passed");
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "lease error explanation passed")
 
     def test_retention_guide_explains_union_prune_and_updates_draft_or_selected_policy_summary(self):
         retention = re.search(r"function renderRetention\(content\) \{.*?\n    \}\n\n    function renderSecrets", self.source, re.S)
@@ -2987,6 +3036,65 @@ const apiGet = async path => {
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class SettingsUiAdjustmentsTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UI_PATH.read_text(encoding="utf-8")
+        cls.css = UI_CSS_PATH.read_text(encoding="utf-8")
+        cls.app_css = UI_APP_CSS_PATH.read_text(encoding="utf-8")
+
+    def test_notifications_tab_hides_settings_save_controls_without_empty_separator(self):
+        initializer = re.search(r"function initializeSettingsSubmenus\(root\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(initializer)
+        self.assertIn("if (saveActions) saveActions.hidden = hideSave;", initializer.group(0))
+        self.assertIn("if (saveButton) saveButton.hidden = hideSave;", initializer.group(0))
+        self.assertRegex(
+            self.css,
+            r"#settingsFormSave\[hidden\]\s*,\s*#settingsFormActions\[hidden\]\s*\{\s*display:\s*none\s*!important\s*;",
+        )
+
+    def test_settings_sidebar_link_is_pinned_after_operations_and_before_session(self):
+        nav_items = re.search(r"const NAV_ITEMS = \[.*?\n    \];", self.source, re.S)
+        renderer = re.search(r"function renderSidebar\(\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(nav_items)
+        self.assertIsNotNone(renderer)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = nav_items.group(0) + r'''
+const ICONS = {};
+const state = { currentRole: "admin", currentView: "settings", systemVersion: "3.15.1" };
+const sidebar = { innerHTML: "", querySelector: () => ({ addEventListener() {} }) };
+const document = { getElementById: id => id === "sidebar" ? sidebar : null };
+const escapeHtml = value => String(value);
+''' + renderer.group(0) + r'''
+const failures = [];
+renderSidebar();
+let footerStart = sidebar.innerHTML.indexOf('<div class="footer">');
+let operations = sidebar.innerHTML.slice(0, footerStart);
+let footer = sidebar.innerHTML.slice(footerStart);
+let settingsIndex = footer.indexOf('data-view="settings"');
+let sessionIndex = footer.indexOf('<div class="section-label">Sesion</div>');
+if (operations.includes('data-view="settings"')) failures.push("Settings remains in the operations list");
+if (settingsIndex < 0 || settingsIndex > sessionIndex) failures.push("Settings is not placed before the Session section in the footer");
+if (!footer.includes('<a class="item active" href="#/settings" data-view="settings">')) failures.push("Settings lost its active state in the footer");
+state.currentRole = "viewer";
+renderSidebar();
+if (sidebar.innerHTML.includes('data-view="settings"')) failures.push("non-admin role sees the Settings link");
+if (failures.length) throw new Error(failures.join("; "));
+process.stdout.write("sidebar Settings placement passed");
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "sidebar Settings placement passed")
+        self.assertRegex(self.app_css, r"\.sidebar \.footer\s*\{\s*margin-top:\s*auto;")
 
 
 if __name__ == "__main__":

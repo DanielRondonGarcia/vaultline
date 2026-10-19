@@ -314,6 +314,56 @@ class JobOwnershipTests(unittest.TestCase):
             ["Job canceled by operator before terminal worker completion."],
         )
 
+    def test_fetch_jobs_leases_only_the_oldest_pending_job_until_next_poll(self):
+        def assert_one_at_a_time(job_repository):
+            service = self.make_service(job_repository)
+            first_job = service.dispatch_job("worker-a", "backup.run")
+            second_job = service.dispatch_job("worker-a", "backup.run")
+
+            first_claim = service.fetch_jobs_for_worker("worker-a")
+
+            self.assertEqual([job.id for job in first_claim], [first_job.id])
+            waiting_job = service.get_job(second_job.id)
+            self.assertEqual(waiting_job.status, JobStatus.PENDING)
+            self.assertIsNone(waiting_job.lease_token)
+            self.assertIsNone(waiting_job.lease_expires_at)
+            self.assertEqual(waiting_job.attempt_count, 0)
+
+            service.update_job_status(
+                worker_id="worker-a",
+                job_id=first_job.id,
+                status=JobStatus.SUCCEEDED,
+                lease_token=first_claim[0].lease_token,
+            )
+            second_claim = service.fetch_jobs_for_worker("worker-a")
+
+            self.assertEqual([job.id for job in second_claim], [second_job.id])
+            self.assertEqual(second_claim[0].status, JobStatus.IN_PROGRESS)
+            self.assertTrue(second_claim[0].lease_token)
+            self.assertEqual(second_claim[0].attempt_count, 1)
+
+        assert_one_at_a_time(InMemoryJobRepository())
+        with tempfile.TemporaryDirectory() as directory:
+            assert_one_at_a_time(SQLiteJobRepository(f"{directory}/control-plane.db"))
+
+    def test_interactive_claim_prefers_explorer_job_without_leasing_backup(self):
+        def assert_priority(job_repository):
+            service = self.make_service(job_repository)
+            backup = service.dispatch_job("worker-a", "backup.run")
+            explorer = service.dispatch_job("worker-a", "snapshot.search")
+
+            claimed = service.fetch_interactive_jobs_for_worker("worker-a")
+
+            self.assertEqual([job.id for job in claimed], [explorer.id])
+            queued_backup = service.get_job(backup.id)
+            self.assertEqual(queued_backup.status, JobStatus.PENDING)
+            self.assertIsNone(queued_backup.lease_token)
+            self.assertIsNone(queued_backup.lease_expires_at)
+
+        assert_priority(InMemoryJobRepository())
+        with tempfile.TemporaryDirectory() as directory:
+            assert_priority(SQLiteJobRepository(f"{directory}/control-plane.db"))
+
     def test_in_memory_claim_does_not_double_assign(self):
         repository = InMemoryJobRepository()
         repository.save(JobRecord(worker_id="worker-a", command="worker.self_check"))

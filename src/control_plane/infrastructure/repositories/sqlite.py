@@ -1138,7 +1138,12 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             finally:
                 connection.close()
 
-    def claim_pending_for_worker(self, worker_id: str, lease_duration_seconds: int = 300) -> List[JobRecord]:
+    def claim_pending_for_worker(
+        self,
+        worker_id: str,
+        lease_duration_seconds: int = 300,
+        priority_commands: Optional[Tuple[str, ...]] = None,
+    ) -> List[JobRecord]:
         if lease_duration_seconds <= 0:
             raise ValueError("lease duration must be positive")
         with self._lock:
@@ -1147,14 +1152,26 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 connection.execute("BEGIN IMMEDIATE")
                 now = utcnow()
                 self._reconcile_expired_leases_locked(connection, now)
-                rows = connection.execute(
+                preferred_commands = tuple(dict.fromkeys(priority_commands or ()))
+                if preferred_commands:
+                    placeholders = ", ".join("?" for _ in preferred_commands)
+                    query = f"""
+                        SELECT * FROM jobs
+                        WHERE worker_id = ? AND status = ?
+                        ORDER BY CASE WHEN command IN ({placeholders}) THEN 0 ELSE 1 END,
+                                 submitted_at ASC
+                        LIMIT 1
                     """
-                    SELECT * FROM jobs
-                    WHERE worker_id = ? AND status = ?
-                    ORDER BY submitted_at ASC
-                    """,
-                    (worker_id, JobStatus.PENDING),
-                ).fetchall()
+                    parameters = (worker_id, JobStatus.PENDING, *preferred_commands)
+                else:
+                    query = """
+                        SELECT * FROM jobs
+                        WHERE worker_id = ? AND status = ?
+                        ORDER BY submitted_at ASC
+                        LIMIT 1
+                    """
+                    parameters = (worker_id, JobStatus.PENDING)
+                rows = connection.execute(query, parameters).fetchall()
                 expires_at = now + timedelta(seconds=lease_duration_seconds)
                 claimed = []
                 for row in rows:

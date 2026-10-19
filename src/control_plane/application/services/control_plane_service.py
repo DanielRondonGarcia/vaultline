@@ -14,7 +14,7 @@ import time
 import urllib.request
 from datetime import datetime, timedelta
 from email.message import EmailMessage
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -1473,10 +1473,17 @@ class ControlPlaneService:
         ]
 
     def fetch_interactive_jobs_for_worker(self, worker_id: str) -> List[JobRecord]:
-        """Claim through the durable lease path, returning explorer work first."""
-        jobs = self.fetch_jobs_for_worker(worker_id)
-        interactive = {"snapshots.list", "snapshot.ls", "snapshot.search", "snapshot.find", "snapshot.dump", "snapshot.about", "stats.get"}
-        return sorted(jobs, key=lambda job: job.command not in interactive)
+        """Claim one explorer job first while preserving durable lease semantics."""
+        interactive = (
+            "snapshots.list",
+            "snapshot.ls",
+            "snapshot.search",
+            "snapshot.find",
+            "snapshot.dump",
+            "snapshot.about",
+            "stats.get",
+        )
+        return self.fetch_jobs_for_worker(worker_id, priority_commands=interactive)
 
     def dispatch_snapshot_ls(self, target_id: str, snapshot_id: str, path: str = "") -> Dict[str, Any]:
         target = self._require_target(target_id)
@@ -3179,10 +3186,17 @@ class ControlPlaneService:
             raise ValueError(f"secret is in use by: {refs}")
         self.secret_repository.delete(secret_id)
 
-    def fetch_jobs_for_worker(self, worker_id: str) -> List[JobRecord]:
+    def fetch_jobs_for_worker(
+        self,
+        worker_id: str,
+        priority_commands: Optional[Tuple[str, ...]] = None,
+    ) -> List[JobRecord]:
         self._require_eligible_worker(worker_id)
         self._reconcile_expired_jobs()
-        jobs = self.job_repository.claim_pending_for_worker(worker_id)
+        if priority_commands:
+            jobs = self.job_repository.claim_pending_for_worker(worker_id, priority_commands=priority_commands)
+        else:
+            jobs = self.job_repository.claim_pending_for_worker(worker_id)
         for job in jobs:
             self._publish_job_event(job)
         return jobs

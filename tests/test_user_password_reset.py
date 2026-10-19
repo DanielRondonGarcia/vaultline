@@ -201,10 +201,17 @@ const createValues = {
 let createHandler = null;
 const createForm = { addEventListener: (event, handler) => { if (event === "submit") createHandler = handler; } };
 let content;
+const makeDialog = () => ({ open: false, showModal() { this.open = true; }, close() { this.open = false; } });
+const selfPasswordDialog = makeDialog();
+const resetPasswordDialogs = [makeDialog(), makeDialog()];
 const document = {
-  getElementById: id => id === "createUserForm"
-    ? (content.innerHTML.includes('id="createUserForm"') ? createForm : null)
-    : (createValues[id] || null),
+  getElementById: id => {
+    if (id === "createUserForm") return content.innerHTML.includes('id="createUserForm"') ? createForm : null;
+    if (id === "changeMyPasswordDialog") return selfPasswordDialog;
+    if (id === "resetPasswordDialog0") return resetPasswordDialogs[0];
+    if (id === "resetPasswordDialog1") return resetPasswordDialogs[1];
+    return createValues[id] || null;
+  },
 };
 let refreshAllCalls = 0;
 const refreshAll = async () => { refreshAllCalls += 1; };
@@ -212,6 +219,7 @@ let submitHandler = null;
 let selfChangeHandler = null;
 const selfChangeFeedback = { textContent: "", style: {} };
 const selfChangeForm = {
+  dataset: { passwordDialogId: "changeMyPasswordDialog" },
   elements: {
     current_password: { value: "CurrentAdminPassword2026" },
     new_password: { value: "NewAdminPassword2026" },
@@ -221,15 +229,34 @@ const selfChangeForm = {
   addEventListener: (event, handler) => { if (event === "submit") selfChangeHandler = handler; },
 };
 const resetForm = {
-  dataset: { resetPasswordUser: "viewer1" },
+  dataset: { resetPasswordUser: "viewer1", passwordDialogId: "resetPasswordDialog0" },
   elements: { new_password: { value: "Synthetic%$Password2026" } },
   addEventListener: (event, handler) => { if (event === "submit") submitHandler = handler; },
 };
+let resetOpenHandler = null;
+let selfOpenHandler = null;
+let resetCloseHandler = null;
+let selfCloseHandler = null;
+const makeButton = (dataset, assignHandler) => ({
+  dataset,
+  addEventListener: (event, handler) => { if (event === "click") assignHandler(handler); },
+});
+const passwordActionButtons = [
+  makeButton({ openPasswordDialog: "resetPasswordDialog0" }, handler => { resetOpenHandler = handler; }),
+  makeButton({ openPasswordDialog: "resetPasswordDialog1" }, () => {}),
+  makeButton({ openPasswordDialog: "changeMyPasswordDialog" }, handler => { selfOpenHandler = handler; }),
+];
+const passwordDialogCloseButtons = [
+  makeButton({ closePasswordDialog: "resetPasswordDialog0" }, handler => { resetCloseHandler = handler; }),
+  makeButton({ closePasswordDialog: "changeMyPasswordDialog" }, handler => { selfCloseHandler = handler; }),
+];
 content = {
   innerHTML: "",
   querySelectorAll: selector => {
     if (selector === 'form[data-reset-password-user]' && content.innerHTML.includes('data-reset-password-user=')) return [resetForm];
     if (selector === 'form[data-self-change-password]' && content.innerHTML.includes('data-self-change-password')) return [selfChangeForm];
+    if (selector === 'button[data-open-password-dialog]' && content.innerHTML.includes('data-open-password-dialog=')) return passwordActionButtons;
+    if (selector === 'button[data-close-password-dialog]' && content.innerHTML.includes('data-close-password-dialog=')) return passwordDialogCloseButtons;
     return [];
   },
 };
@@ -245,6 +272,10 @@ const setView = view => { if (view === "users") setViewCalls += 1; };
   const failures = [];
   if (JSON.stringify(state.userManagement) !== JSON.stringify(response.management)) failures.push("users loader discarded management metadata");
   renderUsers(content);
+  if (!content.innerHTML.includes('<dialog id="changeMyPasswordDialog" class="modal user-password-modal"')) failures.push("password forms are not rendered as dialogs");
+  if (content.innerHTML.includes('<details class="form-section user-password-reset"')) failures.push("password forms are still expanded inline in the table");
+  if (!content.innerHTML.includes('data-open-password-dialog="resetPasswordDialog0"')) failures.push("non-admin reset action does not open its modal");
+  if (!content.innerHTML.includes('data-open-password-dialog="changeMyPasswordDialog"')) failures.push("self-change action does not open its modal");
   if (!content.innerHTML.includes('data-reset-password-user="viewer1"')) failures.push("manageable non-admin row has no reset action");
   if (!content.innerHTML.includes('data-reset-password-user="operator1"')) failures.push("operator row has no reset action");
   if (content.innerHTML.includes('data-reset-password-user="admin1"')) failures.push("admin row received a non-admin reset action");
@@ -256,12 +287,18 @@ const setView = view => { if (view === "users") setViewCalls += 1; };
   if (!content.innerHTML.includes('type="password"')) failures.push("password forms do not mask the new password");
   if (!content.innerHTML.includes("Restablecer contraseña")) failures.push("reset action is not clearly labeled");
   if (content.innerHTML.includes("Synthetic%$Password2026")) failures.push("password was rendered into the page markup");
+  if (!resetOpenHandler || !selfOpenHandler) failures.push("password action buttons have no modal open handlers");
+  if (resetOpenHandler) resetOpenHandler();
+  if (!resetPasswordDialogs[0].open) failures.push("clicking reset did not open the target user's modal");
   if (!submitHandler) failures.push("reset form has no submit handler");
   if (submitHandler) await submitHandler({ preventDefault() {}, submitter: {} });
+  if (resetPasswordDialogs[0].open) failures.push("successful reset did not close its modal");
   if (passwordCalls.length !== 1) failures.push(`expected one reset request, got ${passwordCalls.length}`);
   if (passwordCalls[0]?.path !== "/api/v1/admin/users/viewer1/reset-password") failures.push(`wrong reset endpoint: ${JSON.stringify(passwordCalls)}`);
   if (passwordCalls[0]?.body?.new_password !== "Synthetic%$Password2026") failures.push("reset request changed the literal password characters");
   if (passwordCalls[0]?.body && Object.prototype.hasOwnProperty.call(passwordCalls[0].body, "role")) failures.push("reset request unexpectedly edits the user's role");
+  if (selfOpenHandler) selfOpenHandler();
+  if (!selfPasswordDialog.open) failures.push("clicking self-change did not open the modal");
   if (!selfChangeHandler) failures.push("self-change form has no submit handler");
   if (selfChangeHandler) {
     selfChangeForm.elements.confirm_password.value = "MismatchedPassword2026";
@@ -283,6 +320,9 @@ const setView = view => { if (view === "users") setViewCalls += 1; };
   if (JSON.stringify(selfChangeCalls[1]?.body) !== JSON.stringify({ current_password: "CurrentAdminPassword2026", new_password: "NewAdminPassword2026" })) failures.push(`wrong self-change payload: ${JSON.stringify(selfChangeCalls[1]?.body)}`);
   if (selfChangeFeedback.textContent !== "Contraseña actualizada.") failures.push("successful self-change did not show confirmation");
   if (selfChangeForm.elements.current_password.value || selfChangeForm.elements.new_password.value || selfChangeForm.elements.confirm_password.value) failures.push("successful self-change did not clear password fields");
+  if (!selfCloseHandler) failures.push("self-change modal has no close control handler");
+  if (selfCloseHandler) selfCloseHandler();
+  if (selfPasswordDialog.open) failures.push("close control did not close the self-change modal");
   if (content.innerHTML.includes("CurrentAdminPassword2026") || content.innerHTML.includes("NewAdminPassword2026")) failures.push("self-change password was rendered into page markup");
   if (apiCalls.filter(path => path === "/api/v1/admin/users").length !== 2) failures.push("successful reset did not refresh the user list");
   if (setViewCalls !== 1) failures.push("successful reset did not rerender the Users view");

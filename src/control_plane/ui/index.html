@@ -434,7 +434,7 @@
          .map(item => escapeHtml(item));
        const renewalText = renewal
          ? `${renewal.outcome || "no informado"}${renewal.error_category ? ` · ${renewal.error_category}` : ""}${renewal.error_type ? ` · ${renewal.error_type}` : ""}`
-         : "No se recibio un resultado de renovacion";
+         : "Sin evidencia de renovación recibida por el Control Plane";
        const value = (item, fallback = "No disponible") => escapeHtml(item === undefined || item === null || item === "" ? fallback : String(item));
        const facts = [
          `Job: ${value(observed.job_id || job.id)}`,
@@ -448,7 +448,19 @@
          `Heartbeat worker: ${value(fmtDate(observed.worker_last_seen_at))} · estado ${value(observed.worker_status)}`,
          `Ultima renovacion: ${value(renewalText)}`,
        ];
-       return `<section class="job-lease-diagnostics" role="status" aria-live="polite"><div><strong>Diagnostico de lease del worker</strong> <code>${value(diagnosticCode)}</code> · ${value(diagnosticCategory)}</div><div>${value(summary.diagnostic_message || diagnostic.message)}</div><div><strong>Observado:</strong></div><div class="job-lease-diagnostics-detail">${facts.map(item => `<span>${item}</span>`).join("")}</div><div><strong>No se demostro la causa raiz:</strong> ${unknown.length ? unknown.join(" · ") : "resultado terminal o motivo de interrupcion"}. Revise el worker y el runtime.</div></section>`;
+       return `<section class="job-lease-diagnostics" role="status" aria-live="polite">
+         <div><strong>El worker no confirmó el fin del job</strong></div>
+         <div>El plazo de reserva (lease) venció antes de que el Control Plane recibiera el resultado final, así que marcó el job como fallido. Este diagnóstico no revela por sí solo qué ocurrió dentro del worker o del runtime.</div>
+         <div>No se pudo determinar si el worker se detuvo, quedó esperando o perdió comunicación con el Control Plane.</div>
+         <details class="job-lease-diagnostics-technical">
+           <summary>Detalles técnicos</summary>
+           <div><strong>Código:</strong> <code>${value(diagnosticCode)}</code> · ${value(diagnosticCategory)}</div>
+           <div><strong>Mensaje interno:</strong> ${value(summary.diagnostic_message || diagnostic.message)}</div>
+           <div><strong>Datos observados:</strong></div>
+           <div class="job-lease-diagnostics-detail">${facts.map(item => `<span>${item}</span>`).join("")}</div>
+           <div><strong>Causa raíz no confirmada:</strong> ${unknown.length ? unknown.join(" · ") : "resultado terminal o motivo de interrupción"}. Revise los logs del worker y del runtime en ese intervalo.</div>
+         </details>
+       </section>`;
      }
 
     function jobTriggerInfo(trigger) {
@@ -573,7 +585,9 @@
 
     function renderSidebar() {
       const sidebar = document.getElementById("sidebar");
-      const items = NAV_ITEMS.filter(item => !state.currentRole || item.roles.includes(state.currentRole));
+      const settingsItem = NAV_ITEMS.find(item => item.id === "settings");
+      const showSettings = settingsItem && (!state.currentRole || settingsItem.roles.includes(state.currentRole));
+      const items = NAV_ITEMS.filter(item => item.id !== "settings" && (!state.currentRole || item.roles.includes(state.currentRole)));
       sidebar.innerHTML = `
         <div class="workspace"><img src="/favicon.ico" class="sidebar-logo" alt="logo" /><span>Vaultline</span></div>
         <div class="section-label">Operacion</div>
@@ -585,6 +599,7 @@
           `).join("")}
         </nav>
         <div class="footer">
+          ${showSettings ? `<nav class="section"><a class="item ${state.currentView === settingsItem.id ? "active" : ""}" href="#/${settingsItem.id}" data-view="${settingsItem.id}">${ICONS[settingsItem.icon] || ""}<span>${escapeHtml(settingsItem.label)}</span></a></nav>` : ""}
           <div class="section-label">Sesion</div>
           <nav class="section">
             <a class="item" href="#" id="logoutBtn">${ICONS.logout}<span>Cerrar sesion</span></a>
@@ -8168,13 +8183,19 @@ docker compose up -d
     function renderUsers(content) {
       const canManage = state.currentRole === "admin";
       const canResetPasswords = canManage && state.userManagement?.manageable === true;
-      const renderUserActions = user => {
+      const renderUserActions = (user, index) => {
         if (!canResetPasswords) return "";
-        if (user.role === "admin") {
-          if (user.username !== state.currentUser) return '<td><span class="muted">—</span></td>';
-          return `<td><details class="form-section user-password-reset"><summary>Cambiar mi contraseña</summary><div class="form-body"><form class="user-password-change-form" data-self-change-password><div class="field"><label>Contraseña actual</label><input name="current_password" type="password" required autocomplete="current-password" /></div><div class="field"><label>Nueva contraseña</label><input name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="field"><label>Confirmar nueva contraseña</label><input name="confirm_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper">Debes ingresar tu contraseña actual. No puedes cambiar la contraseña de otra cuenta admin desde aquí.</div><div class="btn-row"><button type="submit" class="btn primary sm">Actualizar contraseña</button></div><div class="helper" role="status" aria-live="polite" data-password-change-feedback></div></form></div></details></td>`;
-        }
-        return `<td><details class="form-section user-password-reset"><summary>Restablecer contraseña</summary><div class="form-body"><form class="user-password-reset-form" data-reset-password-user="${escapeHtml(user.username)}"><div class="field"><label>Nueva contraseña</label><input name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper">El usuario deberá cambiarla al iniciar sesión.</div><div class="btn-row"><button type="submit" class="btn primary sm">Guardar contraseña</button></div></form></div></details></td>`;
+        const isSelfAdmin = user.role === "admin" && user.username === state.currentUser;
+        if (user.role === "admin" && !isSelfAdmin) return '<td><span class="muted">—</span></td>';
+        const dialogId = isSelfAdmin ? "changeMyPasswordDialog" : `resetPasswordDialog${index}`;
+        const titleId = `${dialogId}Title`;
+        const helpId = `${dialogId}Help`;
+        const title = isSelfAdmin ? "Cambiar mi contraseña" : `Restablecer contraseña · ${escapeHtml(user.username)}`;
+        const form = isSelfAdmin
+          ? `<form class="user-password-change-form" data-self-change-password data-password-dialog-id="${dialogId}"><div class="modal-body"><div class="field"><label for="${dialogId}CurrentPassword">Contraseña actual</label><input id="${dialogId}CurrentPassword" name="current_password" type="password" required autocomplete="current-password" /></div><div class="field"><label for="${dialogId}NewPassword">Nueva contraseña</label><input id="${dialogId}NewPassword" name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="field"><label for="${dialogId}ConfirmPassword">Confirmar nueva contraseña</label><input id="${dialogId}ConfirmPassword" name="confirm_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper" id="${helpId}">Debes ingresar tu contraseña actual. No puedes cambiar la contraseña de otra cuenta admin desde aquí.</div><div class="helper" role="status" aria-live="polite" data-password-change-feedback></div></div><div class="modal-footer"><button type="button" class="btn ghost" data-close-password-dialog="${dialogId}">Cancelar</button><button type="submit" class="btn primary">Actualizar contraseña</button></div></form>`
+          : `<form class="user-password-reset-form" data-reset-password-user="${escapeHtml(user.username)}" data-password-dialog-id="${dialogId}"><div class="modal-body"><div class="field"><label for="${dialogId}NewPassword">Nueva contraseña</label><input id="${dialogId}NewPassword" name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper" id="${helpId}">El usuario deberá cambiarla al iniciar sesión.</div></div><div class="modal-footer"><button type="button" class="btn ghost" data-close-password-dialog="${dialogId}">Cancelar</button><button type="submit" class="btn primary">Guardar contraseña</button></div></form>`;
+        const actionLabel = isSelfAdmin ? "Cambiar mi contraseña" : "Restablecer contraseña";
+        return `<td><button type="button" class="btn ghost sm" data-open-password-dialog="${dialogId}">${actionLabel}</button><dialog id="${dialogId}" class="modal user-password-modal" aria-labelledby="${titleId}" aria-describedby="${helpId}"><div class="modal-header"><h3 id="${titleId}">${title}</h3><button type="button" class="close" aria-label="Cerrar" data-close-password-dialog="${dialogId}">&times;</button></div>${form}</dialog></td>`;
       };
       content.innerHTML = `
         <div class="page-header"><div><h2>Usuarios</h2><div class="subtitle">Usuarios locales del Control Plane</div></div></div>
@@ -8191,7 +8212,7 @@ docker compose up -d
         <div class="page-header"><div><h2>Usuarios configurados</h2></div></div>
         <div class="table-wrap"><div class="sheet"><table class="table">
           <thead><tr><th>Usuario</th><th>Rol</th><th>Cambio obligatorio</th><th>Creado</th>${canResetPasswords ? "<th>Acciones</th>" : ""}</tr></thead>
-          <tbody>${state.localUsers.length ? state.localUsers.map(u => `<tr><td>${escapeHtml(u.username)}</td><td><span class="pill muted">${escapeHtml(u.role)}</span></td><td>${u.must_change_password ? '<span class="pill warn">si</span>' : '<span class="pill ok">no</span>'}</td><td class="mono">${fmtDate(u.created_at)}</td>${renderUserActions(u)}</tr>`).join("") : `<tr><td colspan="${canResetPasswords ? 5 : 4}" class="empty-state">Sin usuarios</td></tr>`}</tbody>
+          <tbody>${state.localUsers.length ? state.localUsers.map((u, index) => `<tr><td>${escapeHtml(u.username)}</td><td><span class="pill muted">${escapeHtml(u.role)}</span></td><td>${u.must_change_password ? '<span class="pill warn">si</span>' : '<span class="pill ok">no</span>'}</td><td class="mono">${fmtDate(u.created_at)}</td>${renderUserActions(u, index)}</tr>`).join("") : `<tr><td colspan="${canResetPasswords ? 5 : 4}" class="empty-state">Sin usuarios</td></tr>`}</tbody>
         </table></div></div>
       `;
       const form = document.getElementById("createUserForm");
@@ -8208,6 +8229,18 @@ docker compose up -d
           }, "Creando...").catch(() => {});
         });
       }
+      content.querySelectorAll("button[data-open-password-dialog]").forEach(button => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(button.dataset.openPasswordDialog);
+          if (dialog && !dialog.open && typeof dialog.showModal === "function") dialog.showModal();
+        });
+      });
+      content.querySelectorAll("button[data-close-password-dialog]").forEach(button => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(button.dataset.closePasswordDialog);
+          if (dialog && dialog.open && typeof dialog.close === "function") dialog.close();
+        });
+      });
       content.querySelectorAll("form[data-reset-password-user]").forEach(form => {
         form.addEventListener("submit", async (e) => {
           e.preventDefault();
@@ -8215,6 +8248,8 @@ docker compose up -d
           const newPassword = form.elements.new_password.value;
           await withBtnLoading(e.submitter, async () => {
             await apiPost(`/api/v1/admin/users/${encodeURIComponent(username)}/reset-password`, { new_password: newPassword });
+            const dialog = document.getElementById(form.dataset.passwordDialogId);
+            if (dialog && dialog.open && typeof dialog.close === "function") dialog.close();
             await loadPageData("users", true);
             setView("users");
           }, "Restableciendo...").catch(() => {});

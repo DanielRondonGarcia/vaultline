@@ -395,7 +395,12 @@ class InMemoryJobRepository(JobRepository):
             job.updated_at = now
             return job
 
-    def claim_pending_for_worker(self, worker_id: str, lease_duration_seconds: int = 300) -> List[JobRecord]:
+    def claim_pending_for_worker(
+        self,
+        worker_id: str,
+        lease_duration_seconds: int = 300,
+        priority_commands: Optional[Tuple[str, ...]] = None,
+    ) -> List[JobRecord]:
         if lease_duration_seconds <= 0:
             raise ValueError("lease duration must be positive")
         with self._lock:
@@ -403,7 +408,11 @@ class InMemoryJobRepository(JobRepository):
             self._reconcile_expired_leases_locked(now)
             expires_at = now + timedelta(seconds=lease_duration_seconds)
             claimed = []
-            for job in sorted(self._items.values(), key=lambda item: item.submitted_at):
+            preferred_commands = set(priority_commands or ())
+            for job in sorted(
+                self._items.values(),
+                key=lambda item: (item.command not in preferred_commands, item.submitted_at),
+            ):
                 if job.worker_id != worker_id or job.status != JobStatus.PENDING:
                     continue
                 job.status = JobStatus.IN_PROGRESS
@@ -426,6 +435,7 @@ class InMemoryJobRepository(JobRepository):
                 summary["lease_context"] = context
                 job.result_summary = summary
                 claimed.append(job)
+                break
             return claimed
 
 

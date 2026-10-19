@@ -634,6 +634,13 @@ details.form-section[open] > .form-body { border-top: 1px solid var(--border); p
 .cron-error { color: #dc2626; font-size: 12px; }
 
 .settings-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; max-width: 1100px; }
+.settings-form { max-width: 1100px; }
+.settings-subnav { display: flex; flex-wrap: wrap; gap: 6px; max-width: 1100px; margin-bottom: 18px; border-bottom: 1px solid var(--border); }
+.settings-subnav [role="tab"] { border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 10px 14px; background: transparent; color: var(--muted-foreground); font: inherit; font-weight: 600; cursor: pointer; white-space: nowrap; }
+.settings-subnav [role="tab"][aria-selected="true"] { color: var(--foreground); border-bottom-color: var(--primary); }
+.settings-subnav [role="tab"]:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.settings-tab-panel[hidden] { display: none; }
+.settings-form .settings-actions { margin-top: 16px; }
 .settings-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; display: flex; flex-direction: column; gap: 8px; }
 .settings-card-header { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 4px; }
 .settings-card-header h3 { margin: 0; font-size: 15px; font-weight: 700; }

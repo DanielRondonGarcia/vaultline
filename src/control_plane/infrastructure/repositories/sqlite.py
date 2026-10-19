@@ -290,6 +290,13 @@ class SQLiteRepositoryBase:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS notification_delivery_attempts (
+                    job_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    PRIMARY KEY (job_id, channel_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS snapshots (
                     id TEXT PRIMARY KEY,
                     target_id TEXT NOT NULL,
@@ -1351,6 +1358,17 @@ class SQLiteSecretRepository(SQLiteRepositoryBase, SecretRepository):
 
 
 class SQLiteNotificationChannelRepository(SQLiteRepositoryBase, NotificationChannelRepository):
+    def claim_delivery_attempt(self, job_id: str, channel_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO notification_delivery_attempts (job_id, channel_id, claimed_at)
+                VALUES (?, ?, ?)
+                """,
+                (job_id, channel_id, utcnow().isoformat()),
+            )
+            return cursor.rowcount > 0
+
     def save(self, channel: NotificationChannelRecord) -> NotificationChannelRecord:
         with self._lock, self._connect() as connection:
             connection.execute(

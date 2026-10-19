@@ -2403,6 +2403,120 @@ class WorkerUiStateTests(unittest.TestCase):
         self.assertIsNotNone(workers)
         self.assertIn("openRenewWorkerModal(btn.dataset.renewEnrollment)", workers.group(0))
 
+    def test_settings_submenus_group_options_and_switch_panels_accessibly(self):
+        for marker in (
+            'role="tablist" aria-label="Secciones de configuración"',
+            'data-settings-tab="backups"',
+            'data-settings-tab="control-plane"',
+            'data-settings-tab="notifications"',
+            'data-settings-panel="backups"',
+            'data-settings-panel="control-plane"',
+            'data-settings-panel="notifications"',
+            'id="notificationChannelManager"',
+        ):
+            self.assertIn(marker, self.source)
+
+        for panel_id, expected_controls in (
+            ("settingsPanelBackups", ("settingsRepoBase", "settingsRcloneSecret", "settingsGlobalCron", "settingsPasswordSecret")),
+            ("settingsPanelControlPlane", ("settingsPublicUrl", "settingsSnapshotListingMaxOutput")),
+            ("settingsPanelNotifications", ("notificationChannelManager",)),
+        ):
+            panel = re.search(rf'<section id="{panel_id}".*?</section>', self.source, re.S)
+            self.assertIsNotNone(panel)
+            for control in expected_controls:
+                self.assertIn(f'id="{control}"', panel.group(0))
+
+        helper = re.search(r"function initializeSettingsSubmenus\(root\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(helper)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = helper.group(0) + r'''
+const tabs = ["backups", "control-plane", "notifications"].map((name, index) => {
+  const attributes = { "aria-selected": String(index === 0) };
+  const listeners = {};
+  return {
+    dataset: { settingsTab: name },
+    tabIndex: index === 0 ? 0 : -1,
+    addEventListener(type, listener) { listeners[type] = listener; },
+    setAttribute(name, value) { attributes[name] = value; },
+    getAttribute(name) { return attributes[name]; },
+    focus() { this.focused = true; },
+    attributes,
+    listeners,
+  };
+});
+const panels = ["backups", "control-plane", "notifications"].map((name, index) => ({
+  dataset: { settingsPanel: name },
+  hidden: index !== 0,
+}));
+const saveActions = { hidden: false };
+const root = {
+  querySelectorAll(selector) {
+    if (selector === '[role="tab"][data-settings-tab]') return tabs;
+    if (selector === '[role="tabpanel"][data-settings-panel]') return panels;
+    return [];
+  },
+  querySelector(selector) { return selector === "#settingsFormActions" ? saveActions : null; },
+};
+const assert = (condition, message) => { if (!condition) throw new Error(message); };
+initializeSettingsSubmenus(root);
+assert(tabs[0].getAttribute("aria-selected") === "true" && tabs[0].tabIndex === 0, "backups should be selected by default");
+assert(!panels[0].hidden && panels[1].hidden && panels[2].hidden, "only the selected panel should be visible");
+tabs[2].listeners.click();
+assert(tabs[2].getAttribute("aria-selected") === "true" && panels[2].hidden === false, "click should open notifications");
+assert(saveActions.hidden, "global settings save action should be hidden on notifications");
+let prevented = false;
+tabs[2].listeners.keydown({ key: "ArrowLeft", preventDefault() { prevented = true; } });
+assert(prevented && tabs[1].getAttribute("aria-selected") === "true", "ArrowLeft should select the previous tab");
+assert(tabs[1].focused && !panels[1].hidden && !saveActions.hidden, "keyboard selection should focus the panel tab and restore save actions");
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_hidden_settings_validation_reveals_control_before_focus(self):
+        form = re.search(r'<form id="settingsForm"[^>]*>', self.source)
+        self.assertIsNotNone(form)
+        self.assertIn("novalidate", form.group(0))
+        for marker in (
+            'focusSettingsControl("settingsTabBackups", "settingsRepoBase")',
+            'focusSettingsControl("settingsTabControlPlane", "settingsSnapshotListingMaxOutput")',
+        ):
+            self.assertIn(marker, self.source)
+
+        helper = re.search(r"function focusSettingsControl\(tabId, controlId\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(helper)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = helper.group(0) + r'''
+let tabSelected = false;
+let panelVisible = false;
+let fieldFocused = false;
+const tab = {
+  getAttribute(name) { return name === "aria-selected" && tabSelected ? "true" : "false"; },
+  click() { tabSelected = true; panelVisible = true; },
+};
+const field = { focus() { if (!panelVisible) throw new Error("focused a hidden control"); fieldFocused = true; } };
+global.document = { getElementById(id) {
+  if (id === "settingsTabControlPlane") return tab;
+  if (id === "settingsSnapshotListingMaxOutput") return field;
+  return null;
+} };
+focusSettingsControl("settingsTabControlPlane", "settingsSnapshotListingMaxOutput");
+if (!tabSelected || !fieldFocused) throw new Error("validation target was not revealed before focus");
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_settings_exposes_snapshot_listing_limit_in_mib_and_wires_bytes_patch(self):
         settings = re.search(
             r"function renderSettings\(content\) \{.*?\n    \}\n\n    async function refreshAll",

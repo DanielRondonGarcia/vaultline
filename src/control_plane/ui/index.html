@@ -8214,6 +8214,50 @@ docker compose up -d
       });
     }
 
+    function focusSettingsControl(tabId, controlId) {
+      const tab = document.getElementById(tabId);
+      if (tab && tab.getAttribute("aria-selected") !== "true") tab.click();
+      const control = document.getElementById(controlId);
+      if (control) control.focus();
+    }
+
+    function initializeSettingsSubmenus(root) {
+      const tabs = Array.from(root.querySelectorAll('[role="tab"][data-settings-tab]'));
+      const panels = Array.from(root.querySelectorAll('[role="tabpanel"][data-settings-panel]'));
+      const saveActions = root.querySelector("#settingsFormActions");
+      const saveButton = root.querySelector("#settingsFormSave");
+      const activate = (tab, moveFocus = false) => {
+        const selectedPanel = tab.dataset.settingsTab;
+        tabs.forEach((candidate) => {
+          const selected = candidate === tab;
+          candidate.setAttribute("aria-selected", String(selected));
+          candidate.tabIndex = selected ? 0 : -1;
+        });
+        panels.forEach((panel) => {
+          panel.hidden = panel.dataset.settingsPanel !== selectedPanel;
+        });
+        const hideSave = selectedPanel === "notifications";
+        if (saveActions) saveActions.hidden = hideSave;
+        if (saveButton) saveButton.hidden = hideSave;
+        if (moveFocus) tab.focus();
+      };
+      tabs.forEach((tab, index) => {
+        tab.addEventListener("click", () => activate(tab));
+        tab.addEventListener("keydown", (event) => {
+          let nextIndex;
+          if (event.key === "ArrowRight") nextIndex = (index + 1) % tabs.length;
+          else if (event.key === "ArrowLeft") nextIndex = (index - 1 + tabs.length) % tabs.length;
+          else if (event.key === "Home") nextIndex = 0;
+          else if (event.key === "End") nextIndex = tabs.length - 1;
+          else return;
+          event.preventDefault();
+          activate(tabs[nextIndex], true);
+        });
+      });
+      const initiallySelected = tabs.find((tab) => tab.getAttribute("aria-selected") === "true") || tabs[0];
+      if (initiallySelected) activate(initiallySelected);
+    }
+
     function renderSettings(content) {
       const settings = state.settings || {};
       const hasDefaultPassword = !!(settings.restic_password_secret_id);
@@ -8222,8 +8266,14 @@ docker compose up -d
       const passwordSecretOptions = state.secrets.map(s => `<option value="${escapeHtml(s.id)}" ${s.id === settings.restic_password_secret_id ? "selected" : ""}>${escapeHtml(s.name)}</option>`).join("");
       const rcloneSecretOptions = state.secrets.filter(s => s.secret_type === "file").map(s => `<option value="${escapeHtml(s.id)}" ${s.id === settings.rclone_conf_secret_id ? "selected" : ""}>${escapeHtml(s.name)}</option>`).join("");
       content.innerHTML = `
-        <div class="page-header"><div><h2>Settings</h2><div class="subtitle">Configuracion global del Control Plane para backups restic</div></div><div class="header-actions"><button type="submit" class="btn primary" form="settingsForm">Guardar configuracion</button></div></div>
-        <form id="settingsForm" class="settings-grid">
+        <div class="page-header"><div><h2>Settings</h2><div class="subtitle">Configuracion global del Control Plane para backups restic</div></div><div class="header-actions"><button type="submit" class="btn primary" form="settingsForm" id="settingsFormSave">Guardar configuracion</button></div></div>
+        <nav class="settings-subnav" role="tablist" aria-label="Secciones de configuración">
+          <button id="settingsTabBackups" type="button" role="tab" aria-selected="true" tabindex="0" aria-controls="settingsPanelBackups" data-settings-tab="backups">Backups y almacenamiento</button>
+          <button id="settingsTabControlPlane" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="settingsPanelControlPlane" data-settings-tab="control-plane">Control Plane</button>
+          <button id="settingsTabNotifications" type="button" role="tab" aria-selected="false" tabindex="-1" aria-controls="settingsPanelNotifications" data-settings-tab="notifications">Notificaciones</button>
+        </nav>
+        <form id="settingsForm" class="settings-form" novalidate>
+          <section id="settingsPanelBackups" class="settings-grid settings-tab-panel" role="tabpanel" aria-labelledby="settingsTabBackups" data-settings-panel="backups">
           <div class="settings-card">
             <div class="settings-card-header">
               <span class="settings-icon">📦</span>
@@ -8291,6 +8341,8 @@ docker compose up -d
             </div>
           </div>
 
+          </section>
+          <section id="settingsPanelControlPlane" class="settings-grid settings-tab-panel" role="tabpanel" aria-labelledby="settingsTabControlPlane" data-settings-panel="control-plane" hidden>
           <div class="settings-card">
             <div class="settings-card-header">
               <span class="settings-icon">🌐</span>
@@ -8323,12 +8375,15 @@ docker compose up -d
               <div id="settingsSnapshotListingMaxOutputError" role="alert" aria-live="polite" style="margin-top:6px; color:var(--destructive); font-size:12px;"></div>
             </div>
           </div>
+          </section>
 
-          <div class="settings-actions">
+          <div class="settings-actions" id="settingsFormActions">
             <div id="settingsFeedback"></div>
           </div>
         </form>
-        <div id="notificationChannelManager"></div>
+        <section id="settingsPanelNotifications" class="settings-tab-panel" role="tabpanel" aria-labelledby="settingsTabNotifications" data-settings-panel="notifications" hidden>
+          <div id="notificationChannelManager"></div>
+        </section>
       `;
       const feedbackEl = () => document.getElementById("settingsFeedback");
       const showFeedback = (msg, type) => {
@@ -8382,12 +8437,12 @@ docker compose up -d
         const listingLimitMiB = Number(listingLimitInput.value);
         if (!repoBase) {
           showFeedback("La ruta base del repositorio es obligatoria.", "error");
-          document.getElementById("settingsRepoBase").focus();
+          focusSettingsControl("settingsTabBackups", "settingsRepoBase");
           return;
         }
         if (/^\//.test(repoBase) || /\/$/.test(repoBase)) {
           showFeedback("La ruta base no debe tener slash al inicio ni al final.", "error");
-          document.getElementById("settingsRepoBase").focus();
+          focusSettingsControl("settingsTabBackups", "settingsRepoBase");
           return;
         }
         if (!Number.isInteger(listingLimitMiB) || listingLimitMiB < 1 || listingLimitMiB > 16) {
@@ -8395,7 +8450,7 @@ docker compose up -d
           listingLimitInput.setAttribute("aria-invalid", "true");
           listingLimitError.textContent = message;
           showFeedback(message, "error");
-          listingLimitInput.focus();
+          focusSettingsControl("settingsTabControlPlane", "settingsSnapshotListingMaxOutput");
           return;
         }
         listingLimitInput.setAttribute("aria-invalid", "false");
@@ -8415,6 +8470,7 @@ docker compose up -d
           showFeedback(`Error guardando configuracion: ${error.message}`, "error");
         });
       });
+      initializeSettingsSubmenus(content);
       renderNotificationChannelManager();
     }
 

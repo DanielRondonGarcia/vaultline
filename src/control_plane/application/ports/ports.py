@@ -329,6 +329,11 @@ class NotificationChannelRepository(ABC):
     def delete(self, channel_id: str) -> bool:
         raise NotImplementedError
 
+    @abstractmethod
+    def claim_delivery_attempt(self, job_id: str, channel_id: str) -> bool:
+        """Return true only when this job/channel pair is claimed for delivery."""
+        raise NotImplementedError
+
 
 class SnapshotRepository(ABC):
     @abstractmethod

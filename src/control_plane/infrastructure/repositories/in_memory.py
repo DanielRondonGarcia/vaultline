@@ -474,6 +474,7 @@ class InMemorySecretRepository(SecretRepository):
 class InMemoryNotificationChannelRepository(NotificationChannelRepository):
     def __init__(self):
         self._items: Dict[str, NotificationChannelRecord] = {}
+        self._delivery_attempts = set()
         self._lock = Lock()
 
     def save(self, channel: NotificationChannelRecord) -> NotificationChannelRecord:
@@ -492,6 +493,14 @@ class InMemoryNotificationChannelRepository(NotificationChannelRepository):
     def delete(self, channel_id: str) -> bool:
         with self._lock:
             return self._items.pop(channel_id, None) is not None
+
+    def claim_delivery_attempt(self, job_id: str, channel_id: str) -> bool:
+        key = (job_id, channel_id)
+        with self._lock:
+            if key in self._delivery_attempts:
+                return False
+            self._delivery_attempts.add(key)
+            return True
 
 
 class InMemorySnapshotRepository(SnapshotRepository):

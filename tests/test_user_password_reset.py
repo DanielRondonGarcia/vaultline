@@ -156,6 +156,7 @@ class UserPasswordResetUiTests(unittest.TestCase):
             + r"""
 const state = {
   currentRole: "admin",
+  currentUser: "admin1",
   localUsers: [],
   userManagement: null,
   pageDataLoaded: {},
@@ -164,11 +165,14 @@ const state = {
 const apiCalls = [];
 const apiRequests = [];
 const passwordCalls = [];
+const selfChangeCalls = [];
+let selfChangeFailure = null;
 const response = {
   items: [
     { username: "viewer1", role: "viewer", must_change_password: false, created_at: "2026-01-01" },
     { username: "operator1", role: "operator", must_change_password: true, created_at: "2026-01-01" },
     { username: "admin1", role: "admin", must_change_password: false, created_at: "2026-01-01" },
+    { username: "admin2", role: "admin", must_change_password: false, created_at: "2026-01-01" },
   ],
   management: { manageable: true, source: "file" },
 };
@@ -176,6 +180,14 @@ const apiGet = async path => { apiCalls.push(path); return response; };
 const apiPost = async (path, body) => {
   apiRequests.push({ path, body });
   if (path.endsWith("/reset-password")) passwordCalls.push({ path, body });
+  if (path === "/api/v1/auth/change-password") {
+    selfChangeCalls.push({ path, body });
+    if (selfChangeFailure) {
+      const error = selfChangeFailure;
+      selfChangeFailure = null;
+      throw error;
+    }
+  }
   return { ok: true };
 };
 const escapeHtml = value => String(value);
@@ -197,6 +209,17 @@ const document = {
 let refreshAllCalls = 0;
 const refreshAll = async () => { refreshAllCalls += 1; };
 let submitHandler = null;
+let selfChangeHandler = null;
+const selfChangeFeedback = { textContent: "", style: {} };
+const selfChangeForm = {
+  elements: {
+    current_password: { value: "CurrentAdminPassword2026" },
+    new_password: { value: "NewAdminPassword2026" },
+    confirm_password: { value: "NewAdminPassword2026" },
+  },
+  querySelector: selector => selector === "[data-password-change-feedback]" ? selfChangeFeedback : null,
+  addEventListener: (event, handler) => { if (event === "submit") selfChangeHandler = handler; },
+};
 const resetForm = {
   dataset: { resetPasswordUser: "viewer1" },
   elements: { new_password: { value: "Synthetic%$Password2026" } },
@@ -204,7 +227,11 @@ const resetForm = {
 };
 content = {
   innerHTML: "",
-  querySelectorAll: selector => selector === 'form[data-reset-password-user]' && content.innerHTML.includes('data-reset-password-user=') ? [resetForm] : [],
+  querySelectorAll: selector => {
+    if (selector === 'form[data-reset-password-user]' && content.innerHTML.includes('data-reset-password-user=')) return [resetForm];
+    if (selector === 'form[data-self-change-password]' && content.innerHTML.includes('data-self-change-password')) return [selfChangeForm];
+    return [];
+  },
 };
 let setViewCalls = 0;
 const setView = view => { if (view === "users") setViewCalls += 1; };
@@ -221,7 +248,12 @@ const setView = view => { if (view === "users") setViewCalls += 1; };
   if (!content.innerHTML.includes('data-reset-password-user="viewer1"')) failures.push("manageable non-admin row has no reset action");
   if (!content.innerHTML.includes('data-reset-password-user="operator1"')) failures.push("operator row has no reset action");
   if (content.innerHTML.includes('data-reset-password-user="admin1"')) failures.push("admin row received a non-admin reset action");
-  if (!content.innerHTML.includes('type="password"')) failures.push("reset form does not mask the new password");
+  if (!content.innerHTML.includes('data-self-change-password')) failures.push("signed-in admin row has no self-change password action");
+  if ((content.innerHTML.match(/data-self-change-password/g) || []).length !== 1) failures.push("another admin row received the self-change password action");
+  if (!content.innerHTML.includes("Cambiar mi contraseña")) failures.push("self-change action is not clearly labeled");
+  if (!content.innerHTML.includes('name="current_password"')) failures.push("self-change form does not request the current password");
+  if (!content.innerHTML.includes('name="confirm_password"')) failures.push("self-change form does not confirm the new password");
+  if (!content.innerHTML.includes('type="password"')) failures.push("password forms do not mask the new password");
   if (!content.innerHTML.includes("Restablecer contraseña")) failures.push("reset action is not clearly labeled");
   if (content.innerHTML.includes("Synthetic%$Password2026")) failures.push("password was rendered into the page markup");
   if (!submitHandler) failures.push("reset form has no submit handler");
@@ -230,6 +262,28 @@ const setView = view => { if (view === "users") setViewCalls += 1; };
   if (passwordCalls[0]?.path !== "/api/v1/admin/users/viewer1/reset-password") failures.push(`wrong reset endpoint: ${JSON.stringify(passwordCalls)}`);
   if (passwordCalls[0]?.body?.new_password !== "Synthetic%$Password2026") failures.push("reset request changed the literal password characters");
   if (passwordCalls[0]?.body && Object.prototype.hasOwnProperty.call(passwordCalls[0].body, "role")) failures.push("reset request unexpectedly edits the user's role");
+  if (!selfChangeHandler) failures.push("self-change form has no submit handler");
+  if (selfChangeHandler) {
+    selfChangeForm.elements.confirm_password.value = "MismatchedPassword2026";
+    await selfChangeHandler({ preventDefault() {}, submitter: {} });
+    if (selfChangeCalls.length !== 0) failures.push("mismatched confirmation submitted a password change");
+    if (selfChangeFeedback.textContent !== "La confirmación no coincide con la nueva contraseña.") failures.push("mismatched confirmation did not explain the validation error");
+    selfChangeForm.elements.confirm_password.value = "NewAdminPassword2026";
+    selfChangeForm.elements.current_password.value = "WrongAdminPassword2026";
+    selfChangeFailure = new Error("invalid current password");
+    await selfChangeHandler({ preventDefault() {}, submitter: {} });
+    if (selfChangeCalls.length !== 1) failures.push("failed self-change was retried automatically");
+    if (selfChangeFeedback.textContent !== "invalid current password") failures.push("server rejection was not shown to the user");
+    if (selfChangeForm.elements.current_password.value !== "WrongAdminPassword2026" || selfChangeForm.elements.new_password.value !== "NewAdminPassword2026" || selfChangeForm.elements.confirm_password.value !== "NewAdminPassword2026") failures.push("failed self-change cleared the password fields");
+    selfChangeForm.elements.current_password.value = "CurrentAdminPassword2026";
+    await selfChangeHandler({ preventDefault() {}, submitter: {} });
+  }
+  if (selfChangeCalls.length !== 2) failures.push(`expected one failed request and one explicit retry, got ${selfChangeCalls.length}`);
+  if (selfChangeCalls[0]?.path !== "/api/v1/auth/change-password" || selfChangeCalls[1]?.path !== "/api/v1/auth/change-password") failures.push(`wrong self-change endpoint: ${JSON.stringify(selfChangeCalls)}`);
+  if (JSON.stringify(selfChangeCalls[1]?.body) !== JSON.stringify({ current_password: "CurrentAdminPassword2026", new_password: "NewAdminPassword2026" })) failures.push(`wrong self-change payload: ${JSON.stringify(selfChangeCalls[1]?.body)}`);
+  if (selfChangeFeedback.textContent !== "Contraseña actualizada.") failures.push("successful self-change did not show confirmation");
+  if (selfChangeForm.elements.current_password.value || selfChangeForm.elements.new_password.value || selfChangeForm.elements.confirm_password.value) failures.push("successful self-change did not clear password fields");
+  if (content.innerHTML.includes("CurrentAdminPassword2026") || content.innerHTML.includes("NewAdminPassword2026")) failures.push("self-change password was rendered into page markup");
   if (apiCalls.filter(path => path === "/api/v1/admin/users").length !== 2) failures.push("successful reset did not refresh the user list");
   if (setViewCalls !== 1) failures.push("successful reset did not rerender the Users view");
   if (!content.innerHTML.includes('id="createUserForm"')) failures.push("existing admin create-user form disappeared");
@@ -243,10 +297,12 @@ const setView = view => { if (view === "users") setViewCalls += 1; };
   state.userManagement = { manageable: false, source: "environment" };
   renderUsers(content);
   if (content.innerHTML.includes("data-reset-password-user=")) failures.push("environment-backed users showed an unavailable reset action");
+  if (content.innerHTML.includes("data-self-change-password")) failures.push("environment-backed admin saw an unsupported self-change action");
   state.userManagement = { manageable: true, source: "file" };
   state.currentRole = "viewer";
   renderUsers(content);
   if (content.innerHTML.includes("data-reset-password-user=")) failures.push("non-admin viewer saw a password-reset action");
+  if (content.innerHTML.includes("data-self-change-password")) failures.push("non-admin viewer saw an admin self-change action");
   if (failures.length) throw new Error(failures.join("; "));
   process.stdout.write("password reset UI behavior passed");
 })().catch(error => { console.error(error); process.exitCode = 1; });

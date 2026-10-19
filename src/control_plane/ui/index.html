@@ -8168,6 +8168,14 @@ docker compose up -d
     function renderUsers(content) {
       const canManage = state.currentRole === "admin";
       const canResetPasswords = canManage && state.userManagement?.manageable === true;
+      const renderUserActions = user => {
+        if (!canResetPasswords) return "";
+        if (user.role === "admin") {
+          if (user.username !== state.currentUser) return '<td><span class="muted">—</span></td>';
+          return `<td><details class="form-section user-password-reset"><summary>Cambiar mi contraseña</summary><div class="form-body"><form class="user-password-change-form" data-self-change-password><div class="field"><label>Contraseña actual</label><input name="current_password" type="password" required autocomplete="current-password" /></div><div class="field"><label>Nueva contraseña</label><input name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="field"><label>Confirmar nueva contraseña</label><input name="confirm_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper">Debes ingresar tu contraseña actual. No puedes cambiar la contraseña de otra cuenta admin desde aquí.</div><div class="btn-row"><button type="submit" class="btn primary sm">Actualizar contraseña</button></div><div class="helper" role="status" aria-live="polite" data-password-change-feedback></div></form></div></details></td>`;
+        }
+        return `<td><details class="form-section user-password-reset"><summary>Restablecer contraseña</summary><div class="form-body"><form class="user-password-reset-form" data-reset-password-user="${escapeHtml(user.username)}"><div class="field"><label>Nueva contraseña</label><input name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper">El usuario deberá cambiarla al iniciar sesión.</div><div class="btn-row"><button type="submit" class="btn primary sm">Guardar contraseña</button></div></form></div></details></td>`;
+      };
       content.innerHTML = `
         <div class="page-header"><div><h2>Usuarios</h2><div class="subtitle">Usuarios locales del Control Plane</div></div></div>
         ${canManage ? `<details class="form-section"><summary>Crear usuario</summary><div class="form-body">
@@ -8183,7 +8191,7 @@ docker compose up -d
         <div class="page-header"><div><h2>Usuarios configurados</h2></div></div>
         <div class="table-wrap"><div class="sheet"><table class="table">
           <thead><tr><th>Usuario</th><th>Rol</th><th>Cambio obligatorio</th><th>Creado</th>${canResetPasswords ? "<th>Acciones</th>" : ""}</tr></thead>
-          <tbody>${state.localUsers.length ? state.localUsers.map(u => `<tr><td>${escapeHtml(u.username)}</td><td><span class="pill muted">${escapeHtml(u.role)}</span></td><td>${u.must_change_password ? '<span class="pill warn">si</span>' : '<span class="pill ok">no</span>'}</td><td class="mono">${fmtDate(u.created_at)}</td>${canResetPasswords ? `<td>${u.role === "admin" ? '<span class="muted">—</span>' : `<details class="form-section user-password-reset"><summary>Restablecer contraseña</summary><div class="form-body"><form class="user-password-reset-form" data-reset-password-user="${escapeHtml(u.username)}"><div class="field"><label>Nueva contraseña</label><input name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper">El usuario deberá cambiarla al iniciar sesión.</div><div class="btn-row"><button type="submit" class="btn primary sm">Guardar contraseña</button></div></form></div></details>`}</td>` : ""}</tr>`).join("") : `<tr><td colspan="${canResetPasswords ? 5 : 4}" class="empty-state">Sin usuarios</td></tr>`}</tbody>
+          <tbody>${state.localUsers.length ? state.localUsers.map(u => `<tr><td>${escapeHtml(u.username)}</td><td><span class="pill muted">${escapeHtml(u.role)}</span></td><td>${u.must_change_password ? '<span class="pill warn">si</span>' : '<span class="pill ok">no</span>'}</td><td class="mono">${fmtDate(u.created_at)}</td>${renderUserActions(u)}</tr>`).join("") : `<tr><td colspan="${canResetPasswords ? 5 : 4}" class="empty-state">Sin usuarios</td></tr>`}</tbody>
         </table></div></div>
       `;
       const form = document.getElementById("createUserForm");
@@ -8210,6 +8218,44 @@ docker compose up -d
             await loadPageData("users", true);
             setView("users");
           }, "Restableciendo...").catch(() => {});
+        });
+      });
+      content.querySelectorAll("form[data-self-change-password]").forEach(form => {
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          const currentPassword = form.elements.current_password.value;
+          const newPassword = form.elements.new_password.value;
+          const confirmPassword = form.elements.confirm_password.value;
+          const feedback = form.querySelector("[data-password-change-feedback]");
+          if (feedback) {
+            feedback.textContent = "";
+            feedback.style.color = "";
+          }
+          if (newPassword !== confirmPassword) {
+            if (feedback) {
+              feedback.textContent = "La confirmación no coincide con la nueva contraseña.";
+              feedback.style.color = "var(--destructive)";
+            }
+            return;
+          }
+          await withBtnLoading(e.submitter, async () => {
+            await apiPost("/api/v1/auth/change-password", {
+              current_password: currentPassword,
+              new_password: newPassword,
+            });
+            form.elements.current_password.value = "";
+            form.elements.new_password.value = "";
+            form.elements.confirm_password.value = "";
+            if (feedback) {
+              feedback.textContent = "Contraseña actualizada.";
+              feedback.style.color = "var(--success)";
+            }
+          }, "Actualizando...").catch(error => {
+            if (feedback) {
+              feedback.textContent = error.message;
+              feedback.style.color = "var(--destructive)";
+            }
+          });
         });
       });
     }

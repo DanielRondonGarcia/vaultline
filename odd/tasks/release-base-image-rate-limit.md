@@ -80,4 +80,13 @@ The release workflow initially pulled `python:3.11-slim-bookworm` anonymously fr
 
 ## Next step
 
-No release action remains. Monitor the Node.js 20 deprecation annotations separately; they did not fail this release workflow.
+No release action remained for the completed 3.7.4 task. Monitor the Node.js 20 deprecation annotations separately; they did not fail that workflow.
+
+## Follow-up: v3.15.1 base-image source (2026-10-19)
+
+- Release run `39315180349` failed while resolving `public.ecr.aws/docker/library/python:3.11-slim-bookworm` with HTTP 429 `Data limit exceeded`; no release tag was created.
+- AWS ECR Public pricing documents a 500 GB/month anonymous internet-transfer allowance. Repeated failures are consistent with exhausted monthly quota, not a short cooldown.
+- The owner authorized changing the release base-image source. An unauthenticated manifest request to `mirror.gcr.io/library/python:3.11-slim-bookworm` returned HTTP 200 and digest `sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89`, matching the failed ECR manifest digest.
+- Release image builds now reference that Google mirror digest for backup runtime, Control Plane, and Worker. The Dockerfile's Docker Hub default for local builds is unchanged.
+- Google documents `mirror.gcr.io` as a best-effort cache, not a permanent mirror; the exact digest is currently available, but future cache availability remains an external dependency.
+- Verification: `PYTHONDONTWRITEBYTECODE=1 python -m unittest tests.test_release_asset_workflow` passed 16 tests; independent read-only verification passed. The corrected v3.15.1 release workflow has not yet been dispatched.

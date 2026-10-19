@@ -247,7 +247,7 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertEqual(image_job.count("docker build"), 3)
         self.assertEqual(image_job.count('docker push "$tag"'), 3)
 
-    def test_release_image_builds_use_ecr_public_python_base_image(self):
+    def test_release_image_builds_use_mirror_pinned_python_base_image(self):
         self.assertRegex(
             self.dockerfile,
             r"(?m)^ARG PYTHON_BASE_IMAGE=python:3\.11-slim-bookworm$",
@@ -278,9 +278,10 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
                 self.assertIn('docker_args+=(--tag "$tag")', step)
                 self.assertIn('docker push "$tag"', step)
                 self.assertIn(
-                    "PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm",
+                    "PYTHON_BASE_IMAGE=mirror.gcr.io/library/python@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89",
                     step,
                 )
+                self.assertNotIn("PYTHON_BASE_IMAGE=public.ecr.aws", step)
                 self.assertIn("APP_VERSION: ${{ needs.prepare.outputs.new_version }}", step)
                 if target == "worker":
                     self.assertIn('INSTALL_DOCKER_CLI=true"', step)

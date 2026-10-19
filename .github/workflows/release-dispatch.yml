@@ -337,6 +337,9 @@ jobs:
           persist-credentials: false
 
       # ── Docker build & push ──
+      # ECR Public's anonymous transfer quota was exhausted. Use Google's
+      # cached Docker Hub mirror, pinned to the same official Python manifest.
+      # The Dockerfile's Docker Hub default remains unchanged for local builds.
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -406,7 +409,7 @@ jobs:
             --platform linux/amd64 \
             --target backup-runtime \
             --build-arg "APP_VERSION=${APP_VERSION}" \
-            --build-arg "PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm" \
+            --build-arg "PYTHON_BASE_IMAGE=mirror.gcr.io/library/python@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89" \
             "${docker_args[@]}" \
             .
           for tag in "${image_tags[@]}"; do
@@ -439,7 +442,7 @@ jobs:
             --platform linux/amd64 \
             --target control-plane \
             --build-arg "APP_VERSION=${APP_VERSION}" \
-            --build-arg "PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm" \
+            --build-arg "PYTHON_BASE_IMAGE=mirror.gcr.io/library/python@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89" \
             "${docker_args[@]}" \
             .
           for tag in "${image_tags[@]}"; do
@@ -475,7 +478,7 @@ jobs:
             --target worker \
             --build-arg "APP_VERSION=${APP_VERSION}" \
             --build-arg "INSTALL_DOCKER_CLI=true" \
-            --build-arg "PYTHON_BASE_IMAGE=public.ecr.aws/docker/library/python:3.11-slim-bookworm" \
+            --build-arg "PYTHON_BASE_IMAGE=mirror.gcr.io/library/python@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89" \
             "${docker_args[@]}" \
             .
           for tag in "${image_tags[@]}"; do

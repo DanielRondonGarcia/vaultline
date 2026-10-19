@@ -93,6 +93,50 @@ class UserPasswordResetRouteTests(unittest.TestCase):
         self.assertIsNotNone(service.authenticate("viewer1", "InitialPassword2026"))
         self.assertIsNone(service.authenticate("viewer1", "ReplacementPassword2026"))
 
+    @staticmethod
+    def _admin_target_service():
+        service = AuthService(
+            users={
+                "admin1": AuthUser(
+                    username="admin1",
+                    password="InitialAdminPassword2026",
+                    role=ROLE_ADMIN,
+                    must_change_password=False,
+                    password_scheme="plain",
+                )
+            },
+            session_secret=b"test-session-secret",
+            users_file_path=Path("in-memory-users.json"),
+        )
+        service._save_users_file = Mock()
+        return service
+
+    def test_reset_route_rejects_resetting_an_admin_password(self):
+        service = self._admin_target_service()
+        handler = self.make_handler(
+            "/api/v1/admin/users/admin1/reset-password",
+            json.dumps({"new_password": "ReplacementPassword2026"}),
+            service,
+        )
+
+        handler.do_POST()
+
+        handler.send_response.assert_called_once_with(403)
+        response_body = json.loads(handler.wfile.getvalue().decode("utf-8"))
+        self.assertEqual(response_body["error"], "admin passwords must be changed by the account owner")
+        self.assertIsNotNone(service.authenticate("admin1", "InitialAdminPassword2026"))
+        self.assertIsNone(service.authenticate("admin1", "ReplacementPassword2026"))
+
+    def test_auth_service_rejects_admin_reset_password_for_admin_target(self):
+        service = self._admin_target_service()
+        with self.assertRaises(ValueError):
+            service.admin_reset_password(
+                username="admin1",
+                new_password="ReplacementPassword2026",
+            )
+        self.assertIsNotNone(service.authenticate("admin1", "InitialAdminPassword2026"))
+        self.assertIsNone(service.authenticate("admin1", "ReplacementPassword2026"))
+
 
 class UserPasswordResetUiTests(unittest.TestCase):
     @classmethod

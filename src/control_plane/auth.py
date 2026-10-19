@@ -178,6 +178,8 @@ class AuthService:
         user = self.users.get(normalized_username)
         if user is None:
             raise ValueError("user not found")
+        if user.role == ROLE_ADMIN:
+            raise ValueError("admin passwords must be changed by the account owner")
         effective_role = role or user.role
         _validate_role(effective_role)
         _validate_new_password(new_password, username=normalized_username)

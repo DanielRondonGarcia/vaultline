@@ -1176,6 +1176,9 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             ):
                 if not self._require_auth(ROLE_ADMIN, api_mode=True):
                     return
+                target = self._auth_service().get_user(parts[4])
+                if target is not None and target.role == ROLE_ADMIN:
+                    return self._write_json(403, {"error": "admin passwords must be changed by the account owner"})
                 user = self._auth_service().admin_reset_password(
                     username=parts[4],
                     new_password=body.get("new_password", ""),

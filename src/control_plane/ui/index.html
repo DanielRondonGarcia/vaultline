@@ -8222,7 +8222,7 @@ docker compose up -d
       const passwordSecretOptions = state.secrets.map(s => `<option value="${escapeHtml(s.id)}" ${s.id === settings.restic_password_secret_id ? "selected" : ""}>${escapeHtml(s.name)}</option>`).join("");
       const rcloneSecretOptions = state.secrets.filter(s => s.secret_type === "file").map(s => `<option value="${escapeHtml(s.id)}" ${s.id === settings.rclone_conf_secret_id ? "selected" : ""}>${escapeHtml(s.name)}</option>`).join("");
       content.innerHTML = `
-        <div class="page-header"><div><h2>Settings</h2><div class="subtitle">Configuracion global del Control Plane para backups restic</div></div></div>
+        <div class="page-header"><div><h2>Settings</h2><div class="subtitle">Configuracion global del Control Plane para backups restic</div></div><div class="header-actions"><button type="submit" class="btn primary" form="settingsForm">Guardar configuracion</button></div></div>
         <form id="settingsForm" class="settings-grid">
           <div class="settings-card">
             <div class="settings-card-header">
@@ -8325,7 +8325,6 @@ docker compose up -d
           </div>
 
           <div class="settings-actions">
-            <button type="submit" class="btn primary">Guardar configuracion</button>
             <div id="settingsFeedback"></div>
           </div>
         </form>
@@ -8462,12 +8461,11 @@ docker compose up -d
       `;
       const editorMarkup = !editor ? "" : `
         <div class="settings-card notification-channel-editor">
-          <div class="settings-card-header"><div><h3>${isEditing ? "Editar canal" : "Agregar canal"}</h3><div class="settings-card-sub">${isEditing ? "Los campos secretos no se rellenan ni se vuelven a mostrar." : "Las credenciales se cifran antes de guardarse."}</div></div></div>
+          <div class="settings-card-header"><div><h3>${isEditing ? "Editar canal" : "Agregar canal"}</h3><div class="settings-card-sub">${isEditing ? "Los campos secretos no se rellenan ni se vuelven a mostrar." : "Las credenciales se cifran antes de guardarse."}</div></div><div class="header-actions"><button type="submit" class="btn primary sm" form="notificationChannelForm">${isEditing ? "Guardar cambios" : "Crear canal"}</button><button type="button" class="btn secondary sm" id="cancelNotificationChannelEdit">Cancelar</button></div></div>
           <form id="notificationChannelForm" class="form-grid">
             <div class="field"><label for="notificationChannelName">Nombre</label><input id="notificationChannelName" name="name" value="${escapeHtml(editor.name || editingChannel?.name || "")}" required maxlength="100" placeholder="Operaciones" /></div>
             <div class="field"><label for="notificationChannelType">Tipo</label><select id="notificationChannelType" name="channel_type" ${isEditing ? "disabled" : ""}><option value="webhook" ${channelType === "webhook" ? "selected" : ""}>Webhook</option><option value="smtp" ${channelType === "smtp" ? "selected" : ""}>Correo SMTP</option></select></div>
             ${editorFields}
-            <div class="settings-actions"><button type="submit" class="btn primary">${isEditing ? "Guardar cambios" : "Crear canal"}</button><button type="button" class="btn secondary" id="cancelNotificationChannelEdit">Cancelar</button></div>
           </form>
         </div>`;
       const feedback = state.notificationChannelFeedback;

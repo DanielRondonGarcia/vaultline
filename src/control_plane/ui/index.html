@@ -8588,8 +8588,20 @@ docker compose up -d
                 <form data-notification-test-form="${escapeHtml(channel.id)}">
                   <div class="modal-header"><h3 id="notificationTestTitle-${escapeHtml(channel.id)}">Enviar correo de prueba</h3><button type="button" class="close" data-notification-test-close aria-label="Cerrar">&times;</button></div>
                   <div class="modal-body">
-                    <p>Se enviará el correo a estos destinatarios:</p>
-                    <ul class="notification-test-recipient-list">${Array.isArray(summary.to) && summary.to.length ? summary.to.map(recipient => `<li><span class="notification-test-recipient">${escapeHtml(recipient)}</span></li>`).join("") : '<li class="helper">No hay destinatarios configurados.</li>'}</ul>
+                    <fieldset class="notification-test-recipients">
+                      <legend>Destinatarios de esta prueba</legend>
+                      <div class="notification-test-mode-options">
+                        <label class="notification-test-mode-option"><input type="radio" name="testRecipientsMode-${escapeHtml(channel.id)}" value="configured" data-notification-test-mode="configured" checked /> Destinatarios configurados</label>
+                        <label class="notification-test-mode-option"><input type="radio" name="testRecipientsMode-${escapeHtml(channel.id)}" value="custom" data-notification-test-mode="custom" /> Correo personalizado</label>
+                      </div>
+                      <div class="notification-test-recipient-list">${Array.isArray(summary.to) && summary.to.length ? summary.to.map(recipient => `<label class="notification-test-recipient-option"><input type="checkbox" value="${escapeHtml(recipient)}" data-notification-test-recipient /><span class="notification-test-recipient">${escapeHtml(recipient)}</span></label>`).join("") : '<p class="helper">No hay destinatarios configurados; usa un correo personalizado.</p>'}</div>
+                      <div class="field notification-test-custom-field" data-notification-test-custom-group hidden>
+                        <label for="notificationTestCustom-${escapeHtml(channel.id)}">Correo personalizado</label>
+                        <input id="notificationTestCustom-${escapeHtml(channel.id)}" type="email" data-notification-test-custom autocomplete="email" disabled placeholder="tu@correo.com" />
+                        <div class="helper">Se enviará solo a esta dirección en este envío de prueba.</div>
+                      </div>
+                      <p class="helper">La selección aplica solo a este envío de prueba; no modifica los destinatarios del canal.</p>
+                    </fieldset>
                     <div class="helper">Se utilizará la configuración SMTP guardada. Esta prueba no modifica el canal ni inicia un backup.</div>
                     <div class="form-error" data-notification-test-error role="alert" hidden></div>
                   </div>
@@ -8669,6 +8681,10 @@ docker compose up -d
         state.notificationChannelEditor = { channel, channelType: channel.channel_type, name: channel.name };
         renderNotificationChannelManager();
       }));
+      container.querySelectorAll("[data-notification-test-close]").forEach(button => button.addEventListener("click", () => {
+        const dialog = button.closest("dialog");
+        if (dialog?.open) dialog.close();
+      }));
       container.querySelectorAll("[data-notification-test-open]").forEach(button => button.addEventListener("click", () => {
         const dialog = document.getElementById(`notificationTestDialog-${button.dataset.notificationTestOpen}`);
         if (!dialog || dialog.open) return;
@@ -8677,46 +8693,109 @@ docker compose up -d
           errorElement.hidden = true;
           errorElement.textContent = "";
         }
+        const form = dialog.querySelector("[data-notification-test-form]");
+        if (form) {
+          (form.querySelectorAll ? form.querySelectorAll("[data-notification-test-mode]") : []).forEach(radio => {
+            radio.checked = radio.dataset.notificationTestMode === "configured";
+          });
+          (form.querySelectorAll ? form.querySelectorAll("[data-notification-test-recipient]") : []).forEach(box => {
+            box.checked = false;
+            box.disabled = false;
+          });
+          const customInput = form.querySelector("[data-notification-test-custom]");
+          if (customInput) {
+            customInput.value = "";
+            customInput.disabled = true;
+          }
+          const customGroup = form.querySelector("[data-notification-test-custom-group]");
+          if (customGroup) customGroup.hidden = true;
+        }
         dialog.showModal();
       }));
-      container.querySelectorAll("[data-notification-test-close]").forEach(button => button.addEventListener("click", () => {
-        const dialog = button.closest("dialog");
-        if (dialog?.open) dialog.close();
-      }));
-      container.querySelectorAll("[data-notification-test-form]").forEach(form => form.addEventListener("submit", async event => {
-        event.preventDefault();
-        const channelId = form.dataset.notificationTestForm;
-        const sendButton = form.querySelector("[data-notification-test-submit]");
-        const errorElement = form.querySelector("[data-notification-test-error]");
-        const dialog = form.closest("dialog");
-        if (!channelId || !sendButton || sendButton.disabled) return;
-        sendButton.disabled = true;
-        sendButton.textContent = "Enviando...";
-        if (errorElement) {
-          errorElement.hidden = true;
-          errorElement.textContent = "";
-        }
-        try {
-          const result = await apiPost(`/api/v1/notification-channels/${encodeURIComponent(channelId)}/test-email`, {});
-          const recipients = Array.isArray(result?.recipients) ? result.recipients : [];
-          if (dialog?.open) dialog.close();
-          state.notificationChannelFeedback = {
-            message: `Correo de prueba enviado a ${recipients.join(", ")}.`,
-            type: "success",
+      container.querySelectorAll("[data-notification-test-form]").forEach(form => {
+        const testEmailPattern = /^[^\s@\r\n]+@[^\s@\r\n]+\.[^\s@\r\n]+$/;
+        form.addEventListener("change", event => {
+          const modeRadio = event?.target;
+          if (!modeRadio || modeRadio.dataset?.notificationTestMode === undefined) return;
+          const isCustom = modeRadio.dataset.notificationTestMode === "custom";
+          (form.querySelectorAll ? form.querySelectorAll("[data-notification-test-recipient]") : []).forEach(box => {
+            box.disabled = isCustom;
+          });
+          const customInput = form.querySelector("[data-notification-test-custom]");
+          if (customInput) customInput.disabled = !isCustom;
+          const customGroup = form.querySelector("[data-notification-test-custom-group]");
+          if (customGroup) customGroup.hidden = !isCustom;
+        });
+        form.addEventListener("submit", async event => {
+          event.preventDefault();
+          const channelId = form.dataset.notificationTestForm;
+          const sendButton = form.querySelector("[data-notification-test-submit]");
+          const errorElement = form.querySelector("[data-notification-test-error]");
+          const dialog = form.closest("dialog");
+          if (!channelId || !sendButton || sendButton.disabled) return;
+          const showTestError = message => {
+            if (errorElement) {
+              errorElement.textContent = message;
+              errorElement.hidden = false;
+            }
           };
-          renderNotificationChannelManager();
-        } catch (error) {
+          const modes = form.querySelectorAll ? Array.from(form.querySelectorAll("[data-notification-test-mode]")) : [];
+          const activeMode = modes.find(radio => radio.checked)?.dataset.notificationTestMode || "configured";
+          let selectedRecipients;
+          if (activeMode === "custom") {
+            const customInput = form.querySelector("[data-notification-test-custom]");
+            const customValue = String(customInput?.value || "").trim();
+            if (!customValue) {
+              showTestError("Escribe el correo personalizado al que quieres enviar la prueba.");
+              return;
+            }
+            if (!testEmailPattern.test(customValue)) {
+              showTestError("Escribe una dirección de correo válida.");
+              return;
+            }
+            selectedRecipients = [customValue];
+          } else {
+            // querySelectorAll returns a NodeList on real browsers: snapshot to an array first.
+            const recipientBoxes = form.querySelectorAll ? Array.from(form.querySelectorAll("[data-notification-test-recipient]")) : [];
+            selectedRecipients = recipientBoxes
+              .filter(box => box.checked && !box.disabled)
+              .map(box => String(box.value || "").trim())
+              .filter(Boolean);
+            if (!selectedRecipients.length) {
+              showTestError("Selecciona al menos un destinatario configurado o usa un correo personalizado.");
+              return;
+            }
+          }
+          sendButton.disabled = true;
+          sendButton.textContent = "Enviando...";
           if (errorElement) {
-            errorElement.textContent = `No se pudo enviar el correo de prueba: ${error.message}`;
-            errorElement.hidden = false;
+            errorElement.hidden = true;
+            errorElement.textContent = "";
           }
-        } finally {
-          if (sendButton.isConnected) {
-            sendButton.disabled = false;
-            sendButton.textContent = "Enviar prueba";
+          try {
+            const result = await apiPost(`/api/v1/notification-channels/${encodeURIComponent(channelId)}/test-email`, {
+              recipients: selectedRecipients,
+            });
+            const recipients = Array.isArray(result?.recipients) ? result.recipients : [];
+            if (dialog?.open) dialog.close();
+            state.notificationChannelFeedback = {
+              message: `Correo de prueba enviado a ${recipients.join(", ")}.`,
+              type: "success",
+            };
+            renderNotificationChannelManager();
+          } catch (error) {
+            if (errorElement) {
+              errorElement.textContent = `No se pudo enviar el correo de prueba: ${error.message}`;
+              errorElement.hidden = false;
+            }
+          } finally {
+            if (sendButton.isConnected) {
+              sendButton.disabled = false;
+              sendButton.textContent = "Enviar prueba";
+            }
           }
-        }
-      }));
+        });
+      });
       container.querySelectorAll("[data-notification-toggle]").forEach(button => button.addEventListener("click", async () => {
         const channel = channels.find(item => item.id === button.dataset.notificationToggle);
         if (!channel) return;

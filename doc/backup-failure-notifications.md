@@ -7,7 +7,7 @@ Configura uno o más webhooks o destinos de correo en **Settings → Notificacio
 1. Inicia sesión con una cuenta **administradora** y abre **Settings**.
 2. En **Notificaciones de backups fallidos**, selecciona **Agregar canal** y elige **Webhook** o **Correo SMTP**.
 3. Completa los datos del destino y guarda. Repite para añadir otros destinos; cada canal puede activarse o desactivarse por separado.
-4. Para validar un canal SMTP, selecciona **Enviar correo de prueba** en su tarjeta. La ventana modal muestra todos los destinatarios configurados y solicita confirmación antes de enviar; utiliza las credenciales guardadas y no modifica el canal ni inicia un backup. Los webhooks no tienen envío de prueba en la interfaz.
+4. Para validar un canal SMTP, selecciona **Enviar correo de prueba** en su tarjeta. La ventana modal permite elegir los destinatarios solo para ese envío: marca uno o varios de los configurados (inicialmente ninguno marcado) o cambia a **Correo personalizado** y escribe una única dirección propia, por ejemplo para probar con otro correo sin molestar al resto. Los modos son excluyentes: al elegir el correo personalizado se ignoran los marcados. El envío se bloquea si no hay ninguna selección, reabrir la ventana la limpia, y el sistema indica los destinatarios reales a los que llegó el correo. La selección no edita los destinatarios del canal; utiliza las credenciales guardadas y no inicia un backup. Los webhooks no tienen envío de prueba en la interfaz.
 
 ## Webhook
 
@@ -26,7 +26,9 @@ Configura uno o más webhooks o destinos de correo en **Settings → Notificacio
 | Seguridad | `STARTTLS` (por defecto y recomendado), `SSL/TLS` o `Sin TLS`. Usa Sin TLS solo en una red confiable. |
 | Usuario y contraseña | Opcionales, pero deben configurarse juntos. Se cifran al guardarse; nunca se devuelven a la interfaz. En edición, déjalos vacíos para conservar las credenciales guardadas; para rotarlas, indica ambos valores. |
 
-La prueba SMTP se envía de forma inmediata al confirmar y puede llegar a todas las direcciones configuradas. Comprueba los destinatarios en la ventana modal antes de enviarla.
+En la ventana modal de prueba elige al menos un destinatario: marcas sobre los configurados o un correo personalizado (modos excluyentes; sin selección no se envía nada). Las direcciones elegidas van solo para ese envío y el aviso muestra los destinatarios reales del envío. Los avisos reales de `backup.failed` y los webhooks siguen llegando a todos los destinatarios configurados.
+
+El endpoint de administrador `POST /api/v1/notification-channels/{id}/test-email` acepta un cuerpo JSON objeto con un campo opcional `recipients`: si se omite se envía a los destinatarios configurados (comportamiento anterior); si se incluye, debe ser una lista no vacía de direcciones válidas y solo se envía a esas direcciones, sin modificar el canal. Un cuerpo que no sea un objeto JSON se rechaza con HTTP 400 (`request body must be a JSON object`), igual que una lista vacía, nula o con direcciones inválidas; ambas validaciones ocurren antes de intentar el envío.
 
 ## Qué se envía y cómo se comporta
 

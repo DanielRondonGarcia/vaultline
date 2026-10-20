@@ -67,6 +67,13 @@ class WorkerDeletionConflict(ValueError):
     """Raised when deleting a worker would orphan active work."""
 
 
+# Distinguishes an omitted `recipients` argument (send to the configured
+# recipients, legacy behavior) from an explicit list (send exactly to those,
+# validated first) on the SMTP test path. JSON null must not collapse into the
+# omitted case.
+SMTP_TEST_RECIPIENTS_OMITTED = object()
+
+
 class ControlPlaneService:
     SUPPORTED_SECRET_TYPES = {"generic", "env", "file"}
     SUPPORTED_RUNTIME_TYPES = frozenset({"docker", "kubernetes", "native"})
@@ -2988,7 +2995,11 @@ class ControlPlaneService:
             "updated_at": channel.updated_at,
         }
 
-    def send_test_notification_email(self, channel_id: str) -> Dict[str, Any]:
+    def send_test_notification_email(
+        self,
+        channel_id: str,
+        recipients: Any = SMTP_TEST_RECIPIENTS_OMITTED,
+    ) -> Dict[str, Any]:
         channel = self.get_notification_channel(channel_id)
         if channel is None:
             raise ValueError("notification channel not found")
@@ -2996,14 +3007,36 @@ class ControlPlaneService:
             raise ValueError("test email is only supported for SMTP channels")
 
         config = self._notification_channel_config(channel)
-        recipients = list(config["to"])
+        recipient_override = (
+            None if recipients is SMTP_TEST_RECIPIENTS_OMITTED else self._normalize_test_recipients(recipients)
+        )
+        actual_recipients = list(config["to"]) if recipient_override is None else list(recipient_override)
         payload = {
             "event": "notification.test",
             "channel_name": channel.name,
             "message": "This is a test email from Vaultline notification settings.",
         }
-        self._send_notification_channel(channel, payload, subject="Vaultline SMTP test email")
-        return {"recipients": recipients}
+        self._send_notification_channel(
+            channel,
+            payload,
+            subject="Vaultline SMTP test email",
+            recipient_override=recipient_override,
+        )
+        return {"recipients": actual_recipients}
+
+    def _normalize_test_recipients(self, recipients: Any) -> List[str]:
+        if not isinstance(recipients, list):
+            raise ValueError("test recipients must be a non-empty list of valid email addresses")
+        normalized: List[str] = []
+        for value in recipients:
+            if not self._is_notification_email(value):
+                raise ValueError("test recipients must be a non-empty list of valid email addresses")
+            address = str(value).strip()
+            if address not in normalized:
+                normalized.append(address)
+        if not normalized:
+            raise ValueError("test recipients must be a non-empty list of valid email addresses")
+        return normalized
 
     def update_notification_channel(
         self,
@@ -3380,7 +3413,11 @@ class ControlPlaneService:
         payload: Dict[str, Any],
         subject: Optional[str] = None,
         email_log_lines: Optional[List[str]] = None,
+        recipient_override: Optional[List[str]] = None,
     ) -> None:
+        # `recipient_override` is accepted only from the SMTP test path
+        # (`notification.test`); scheduled backup/webhook deliveries always pass
+        # none and keep using the stored channel recipients.
         config = self._notification_channel_config(channel)
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
@@ -3413,7 +3450,8 @@ class ControlPlaneService:
             message["Subject"] = f"Backup failed: {payload.get('job_id', 'unknown')}"
 
         message["From"] = config["from"]
-        message["To"] = ", ".join(config["to"])
+        smtp_recipients = list(config["to"]) if recipient_override is None else list(recipient_override)
+        message["To"] = ", ".join(smtp_recipients)
 
         # Get the control plane public URL for the deep link
         control_plane_url = ""
@@ -3477,7 +3515,7 @@ class ControlPlaneService:
             ) as client:
                 if config.get("username"):
                     client.login(config["username"], config["password"])
-                client.send_message(message)
+                client.send_message(message, to_addrs=smtp_recipients)
             return
 
         with smtplib.SMTP(
@@ -3489,7 +3527,7 @@ class ControlPlaneService:
                 client.ehlo()
             if config.get("username"):
                 client.login(config["username"], config["password"])
-            client.send_message(message)
+            client.send_message(message, to_addrs=smtp_recipients)
 
     def find_secret_usages(self, secret_id: str) -> List[Dict[str, Any]]:
         usages: List[Dict[str, Any]] = []

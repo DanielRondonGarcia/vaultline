@@ -22,7 +22,11 @@ except ImportError:
 from src.control_plane.auth import AuthService, ROLE_ADMIN, ROLE_OPERATOR, ROLE_VIEWER
 from src.control_plane.application.ports.ports import JOB_LISTING_SORT_KEYS
 from src.control_plane.application.services.backup_audit_exports import render_backup_audit_export
-from src.control_plane.application.services.control_plane_service import ControlPlaneService, WorkerDeletionConflict
+from src.control_plane.application.services.control_plane_service import (
+    ControlPlaneService,
+    SMTP_TEST_RECIPIENTS_OMITTED,
+    WorkerDeletionConflict,
+)
 from src.control_plane.application.services.live_file_service import (
     LiveCursorError,
     LiveFileService,
@@ -1159,14 +1163,24 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             if len(parts) == 5 and parts[:3] == ["api", "v1", "notification-channels"] and parts[4] == "test-email":
                 if not self._require_auth(ROLE_ADMIN, api_mode=True):
                     return
+                if not isinstance(body, dict):
+                    return self._write_json(400, {"error": "request body must be a JSON object"})
+                service = self._control_plane_service()
+                body_recipients = body.get("recipients", SMTP_TEST_RECIPIENTS_OMITTED)
                 try:
-                    result = self._control_plane_service().send_test_notification_email(parts[3])
+                    if body_recipients is SMTP_TEST_RECIPIENTS_OMITTED:
+                        result = service.send_test_notification_email(parts[3])
+                    else:
+                        result = service.send_test_notification_email(parts[3], recipients=body_recipients)
                 except Exception as exc:
                     if isinstance(exc, ValueError):
                         message = str(exc)
                         if message == "notification channel not found":
                             return self._write_json(404, {"error": message})
-                        if message == "test email is only supported for SMTP channels":
+                        if message in (
+                            "test email is only supported for SMTP channels",
+                            "test recipients must be a non-empty list of valid email addresses",
+                        ):
                             return self._write_json(400, {"error": message})
                     logger.warning("SMTP test delivery failed for channel %s (%s)", parts[3], type(exc).__name__)
                     return self._write_json(

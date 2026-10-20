@@ -434,6 +434,105 @@ class NotificationDeliveryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "SMTP"):
             self.service.send_test_notification_email(self.channel.id)
 
+    def _smtp_channel(self, recipients):
+        return self.service.create_notification_channel(
+            name="On-call email",
+            channel_type="smtp",
+            config={
+                "host": "mail.internal",
+                "port": 587,
+                "from": "backup@example.test",
+                "to": recipients,
+                "security": "starttls",
+                "username": "smtp-user",
+                "password": "smtp-password",
+            },
+        )
+
+    def _smtp_client_manager(self):
+        client = Mock()
+        manager = Mock()
+        manager.__enter__ = Mock(return_value=client)
+        manager.__exit__ = Mock(return_value=False)
+        return client, manager
+
+    def test_test_email_with_explicit_recipients_sends_only_to_those_for_one_call(self):
+        channel = self._smtp_channel(["oncall@example.test", "admin@example.test"])
+        before = self.service.notification_channel_public_view(channel)
+        client, manager = self._smtp_client_manager()
+
+        with patch("smtplib.SMTP", return_value=manager) as smtp:
+            result = self.service.send_test_notification_email(channel.id, recipients=["admin@example.test"])
+
+        self.assertEqual(result, {"recipients": ["admin@example.test"]})
+        smtp.assert_called_once_with("mail.internal", 587, timeout=5)
+        message = client.send_message.call_args.args[0]
+        self.assertEqual(message["To"], "admin@example.test")
+        self.assertEqual(client.send_message.call_args.kwargs["to_addrs"], ["admin@example.test"])
+        self.assertNotIn("oncall@example.test", str(client.send_message.call_args))
+        after = next(
+            self.service.notification_channel_public_view(item)
+            for item in self.service.list_notification_channels()
+            if item.id == channel.id
+        )
+        self.assertEqual(after, before)
+
+    def test_test_email_with_custom_recipient_sends_one_address_without_touching_saved_config(self):
+        channel = self._smtp_channel(["oncall@example.test"])
+        ciphertext_before = channel.config_ciphertext
+        client, manager = self._smtp_client_manager()
+
+        with patch("smtplib.SMTP", return_value=manager) as smtp:
+            result = self.service.send_test_notification_email(channel.id, recipients=["externo@example.test"])
+
+        self.assertEqual(result, {"recipients": ["externo@example.test"]})
+        message = client.send_message.call_args.args[0]
+        self.assertEqual(message["To"], "externo@example.test")
+        self.assertEqual(client.send_message.call_args.kwargs["to_addrs"], ["externo@example.test"])
+        stored = self.service.notification_channel_public_view(channel)
+        self.assertEqual(stored["config_summary"]["to"], ["oncall@example.test"])
+        self.assertEqual(channel.config_ciphertext, ciphertext_before)
+
+    def test_test_email_trims_and_deduplicates_recipients_in_stable_order(self):
+        channel = self._smtp_channel(["oncall@example.test"])
+        client, manager = self._smtp_client_manager()
+
+        with patch("smtplib.SMTP", return_value=manager):
+            result = self.service.send_test_notification_email(
+                channel.id,
+                recipients=[" admin@example.test ", "admin@example.test", "oncall@example.test", "admin@example.test"],
+            )
+
+        self.assertEqual(result, {"recipients": ["admin@example.test", "oncall@example.test"]})
+        message = client.send_message.call_args.args[0]
+        self.assertEqual(message["To"], "admin@example.test, oncall@example.test")
+
+    def test_test_email_rejects_empty_or_invalid_recipients_without_smtp_call(self):
+        channel = self._smtp_channel(["oncall@example.test"])
+        before = self.service.notification_channel_public_view(channel)
+        rejected = [
+            [],
+            None,
+            "oncall@example.test",
+            {"to": ["oncall@example.test"]},
+            ["bad@@example.test"],
+            ["oncall@example\r.test"],
+            [None],
+        ]
+
+        for recipients in rejected:
+            with self.subTest(recipients=recipients):
+                client, manager = self._smtp_client_manager()
+                with patch("smtplib.SMTP", return_value=manager) as smtp, patch("smtplib.SMTP_SSL") as smtp_ssl:
+                    with self.assertRaisesRegex(
+                        ValueError, "test recipients must be a non-empty list of valid email addresses"
+                    ):
+                        self.service.send_test_notification_email(channel.id, recipients=recipients)
+                    smtp.assert_not_called()
+                    smtp_ssl.assert_not_called()
+
+        self.assertEqual(self.service.notification_channel_public_view(channel), before)
+
     def test_html_email_includes_control_plane_link_when_configured(self):
         """Verify that a configured control_plane_public_url appears in the HTML body link."""
         channel = self.service.create_notification_channel(

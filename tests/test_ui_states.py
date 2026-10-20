@@ -13,6 +13,99 @@ README_PATH = Path(__file__).resolve().parents[1] / "README.md"
 NOTIFICATION_GUIDE_PATH = Path(__file__).resolve().parents[1] / "doc" / "backup-failure-notifications.md"
 
 
+SMTP_TEST_DIALOG_MOCK_PRELUDE = r'''
+const escapeHtml = value => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
+const state = {
+  notificationChannels: [
+    { id: "smtp-1", name: "Sistemas", channel_type: "smtp", enabled: true,
+      config_summary: { host: "mail.internal", port: 587, from: "backup@example.test", to: ["oncall@example.test", "admin@example.test"], security: "starttls" } },
+    { id: "webhook-1", name: "Webhook", channel_type: "webhook", enabled: true,
+      config_summary: { destination: "https://hooks.example.test" } },
+  ],
+  notificationChannelEditor: null,
+  notificationChannelFeedback: { message: "Canal creado.", type: "success" },
+};
+let markup = "";
+const events = {};
+const apiCalls = [];
+const errorElement = { hidden: true, textContent: "" };
+const sendButton = { disabled: false, textContent: "", isConnected: true };
+const customInput = { value: "", disabled: true, isConnected: true };
+const customGroup = { hidden: true, isConnected: true };
+const modeRadios = [
+  { dataset: { notificationTestMode: "configured" }, checked: true },
+  { dataset: { notificationTestMode: "custom" }, checked: false },
+];
+const checkboxes = [
+  { value: "oncall@example.test", checked: false, disabled: false },
+  { value: "admin@example.test", checked: false, disabled: false },
+];
+const toNodeList = values => {
+  const list = { length: values.length };
+  list.forEach = callback => { for (let index = 0; index < list.length; index += 1) callback(list[index], index, list); };
+  list.item = index => (index >= 0 && index < list.length) ? list[index] : null;
+  for (let index = 0; index < values.length; index += 1) list[index] = values[index];
+  return list;
+};
+const form = {
+  dataset: { notificationTestForm: "smtp-1" },
+  querySelector(selector) {
+    if (selector === "[data-notification-test-submit]") return sendButton;
+    if (selector === "[data-notification-test-error]") return errorElement;
+    if (selector === "[data-notification-test-custom]") return customInput;
+    if (selector === "[data-notification-test-custom-group]") return customGroup;
+    return null;
+  },
+  querySelectorAll(selector) {
+    if (selector === "[data-notification-test-mode]") return toNodeList(modeRadios);
+    if (selector === "[data-notification-test-recipient]") return toNodeList(checkboxes);
+    return toNodeList([]);
+  },
+  closest() { return dialog; },
+  addEventListener(name, handler) { events[name] = handler; },
+};
+const dialog = {
+  open: false,
+  showModal() { this.open = true; },
+  close() { this.open = false; },
+  querySelector(selector) {
+    if (selector === "[data-notification-test-error]") return errorElement;
+    if (selector.startsWith("[data-notification-test-form]")) return form;
+    return null;
+  },
+};
+const openButton = {
+  dataset: { notificationTestOpen: "smtp-1" },
+  addEventListener(name, handler) { events[`open:${name}`] = handler; },
+};
+const closeButton = {
+  closest() { return dialog; },
+  addEventListener(name, handler) { events[`close:${name}`] = handler; },
+};
+const container = {
+  set innerHTML(value) { markup = value; },
+  querySelector() { return null; },
+  querySelectorAll(selector) {
+    if (selector === "[data-notification-test-open]") return [openButton];
+    if (selector === "[data-notification-test-close]") return [closeButton];
+    if (selector === "[data-notification-test-form]") return [form];
+    return [];
+  },
+};
+const document = {
+  getElementById(id) {
+    if (id === "notificationChannelManager") return container;
+    if (id === "notificationTestDialog-smtp-1") return dialog;
+    return null;
+  },
+};
+const apiPost = async (path, body) => {
+  apiCalls.push({ path, body });
+  return { recipients: ["oncall@example.test", "admin@example.test"] };
+};
+'''
+
+
 class SnapshotExplorerUiStateTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -2618,74 +2711,25 @@ if (!tabSelected || !fieldFocused) throw new Error("validation target was not re
         for marker in (".notification-feedback", ".notification-feedback.is-error", ".notification-test-modal:not([open])"):
             self.assertIn(marker, self.css)
 
-    def test_smtp_test_dialog_shows_recipients_and_created_feedback_as_a_chip(self):
+    def _run_smtp_test_dialog_node_check(self, assertions, expected_stdout):
         renderer = re.search(r"function renderNotificationChannelManager\(.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(renderer)
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
-        script = r'''
-const escapeHtml = value => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
-const state = {
-  notificationChannels: [
-    { id: "smtp-1", name: "Sistemas", channel_type: "smtp", enabled: true,
-      config_summary: { host: "mail.internal", port: 587, from: "backup@example.test", to: ["oncall@example.test", "admin@example.test"], security: "starttls" } },
-    { id: "webhook-1", name: "Webhook", channel_type: "webhook", enabled: true,
-      config_summary: { destination: "https://hooks.example.test" } },
-  ],
-  notificationChannelEditor: null,
-  notificationChannelFeedback: { message: "Canal creado.", type: "success" },
-};
-let markup = "";
-const events = {};
-const apiCalls = [];
-const errorElement = { hidden: true, textContent: "" };
-const sendButton = { disabled: false, textContent: "", isConnected: true };
-const dialog = {
-  open: false,
-  showModal() { this.open = true; },
-  close() { this.open = false; },
-  querySelector(selector) { return selector === "[data-notification-test-error]" ? errorElement : null; },
-};
-const form = {
-  dataset: { notificationTestForm: "smtp-1" },
-  querySelector(selector) {
-    if (selector === "[data-notification-test-submit]") return sendButton;
-    if (selector === "[data-notification-test-error]") return errorElement;
-    return null;
-  },
-  closest() { return dialog; },
-  addEventListener(name, handler) { events[`form:${name}`] = handler; },
-};
-const openButton = {
-  dataset: { notificationTestOpen: "smtp-1" },
-  addEventListener(name, handler) { events[`open:${name}`] = handler; },
-};
-const closeButton = {
-  closest() { return dialog; },
-  addEventListener(name, handler) { events[`close:${name}`] = handler; },
-};
-const container = {
-  set innerHTML(value) { markup = value; },
-  querySelector() { return null; },
-  querySelectorAll(selector) {
-    if (selector === "[data-notification-test-open]") return [openButton];
-    if (selector === "[data-notification-test-close]") return [closeButton];
-    if (selector === "[data-notification-test-form]") return [form];
-    return [];
-  },
-};
-const document = {
-  getElementById(id) {
-    if (id === "notificationChannelManager") return container;
-    if (id === "notificationTestDialog-smtp-1") return dialog;
-    return null;
-  },
-};
-const apiPost = async (path, body) => {
-  apiCalls.push({ path, body });
-  return { recipients: ["oncall@example.test", "admin@example.test"] };
-};
-''' + renderer.group(0) + r'''
+        script = SMTP_TEST_DIALOG_MOCK_PRELUDE + renderer.group(0) + assertions
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, expected_stdout)
+
+    def test_notification_smtp_test_dialog_sends_explicit_configured_subset_and_feedback(self):
+        self._run_smtp_test_dialog_node_check(
+            r'''
 (async () => {
   renderNotificationChannelManager();
   const expected = [
@@ -2696,34 +2740,102 @@ const apiPost = async (path, body) => {
     'admin@example.test',
     'Canal creado.',
     'notification-feedback is-success',
+    'data-notification-test-recipient',
+    'type="checkbox"',
+    'data-notification-test-mode="configured"',
+    'data-notification-test-mode="custom"',
+    'type="email"',
+    'for="notificationTestCustom-smtp-1"',
+    'id="notificationTestCustom-smtp-1"',
+    'envío de prueba',
   ];
   const missing = expected.filter(value => !markup.includes(value));
   if (missing.length) throw new Error(`missing rendered notification UI: ${missing.join("; ")}`);
   if ((markup.match(/data-notification-test-open=/g) || []).length !== 1) throw new Error("only SMTP channels should offer a test email");
   if (!markup.includes("notification-test-modal")) throw new Error("SMTP test confirmation is not in a modal");
+  const checkboxTags = markup.match(/<input[^>]*data-notification-test-recipient[^>]*>/g) || [];
+  if (checkboxTags.length !== 2) throw new Error("configured recipients must render as selectable checkboxes");
+  if (checkboxTags.some(tag => tag.includes("checked"))) throw new Error("configured recipients must start unchecked");
+  if (markup.includes("type=" + '"email" checked')) throw new Error("unexpected preselection");
   if (apiCalls.length) throw new Error("test email sent before explicit modal confirmation");
   events["open:click"]();
   if (!dialog.open) throw new Error("test email button did not open its confirmation modal");
   events["close:click"]();
   if (dialog.open) throw new Error("cancel did not close the confirmation modal");
   events["open:click"]();
-  await events["form:submit"]({ preventDefault() {} });
+  checkboxes[0].checked = true;
+  await events["submit"]({ preventDefault() {} });
   if (dialog.open) throw new Error("successful test send did not close the modal");
-  if (apiCalls.length !== 1 || apiCalls[0].path !== "/api/v1/notification-channels/smtp-1/test-email" || JSON.stringify(apiCalls[0].body) !== "{}") throw new Error(`wrong test email request: ${JSON.stringify(apiCalls)}`);
+  if (apiCalls.length !== 1 || apiCalls[0].path !== "/api/v1/notification-channels/smtp-1/test-email") throw new Error(`wrong test email request: ${JSON.stringify(apiCalls)}`);
+  if (JSON.stringify(apiCalls[0].body) !== JSON.stringify({ recipients: ["oncall@example.test"] })) throw new Error("explicit selection must be sent, not {}; got " + JSON.stringify(apiCalls[0].body));
   if (state.notificationChannelFeedback.message !== "Correo de prueba enviado a oncall@example.test, admin@example.test.") throw new Error("success feedback did not report the actual recipient list");
   if (!markup.includes("notification-feedback is-success")) throw new Error("send success was not rendered as a styled feedback chip");
-  process.stdout.write("notification modal, send action, and feedback chip passed");
+  process.stdout.write("configured subset payload and feedback chip passed");
 })().catch(error => { console.error(error); process.exitCode = 1; });
-'''
-        result = subprocess.run(
-            ["node", "--input-type=commonjs", "--eval", script],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            check=False,
+''',
+            "configured subset payload and feedback chip passed",
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "notification modal, send action, and feedback chip passed")
+
+    def test_notification_smtp_test_dialog_blocks_empty_selection_and_clears_transient_state_on_reopen(self):
+        self._run_smtp_test_dialog_node_check(
+            r'''
+(async () => {
+  renderNotificationChannelManager();
+  events["open:click"]();
+  checkboxes[0].checked = true;
+  checkboxes[1].checked = true;
+  modeRadios[1].checked = true;
+  modeRadios[0].checked = false;
+  events["change"]({ target: modeRadios[1] });
+  customInput.value = "externo@example.test";
+  events["close:click"]();
+  events["open:click"]();
+  if (checkboxes.some(box => box.checked || box.disabled)) throw new Error("reopen must clear recipient checkbox transient state");
+  if (customInput.value !== "" || customInput.disabled !== true) throw new Error("reopen must clear the custom email field");
+  if (customGroup.hidden !== true) throw new Error("reopen must hide the custom email field");
+  if (modeRadios[0].checked !== true || modeRadios[1].checked) throw new Error("reopen must return to the configured mode");
+  await events["submit"]({ preventDefault() {} });
+  if (apiCalls.length) throw new Error("empty selection must not send a test email");
+  if (errorElement.hidden === true || !errorElement.textContent) throw new Error("empty selection must be reported in the modal error area");
+  if (sendButton.disabled) throw new Error("send button must be re-enabled after a blocked send");
+  if (dialog.open !== true) throw new Error("blocked send must keep the modal open");
+  process.stdout.write("empty selection blocked and reopened modal cleared passed");
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''',
+            "empty selection blocked and reopened modal cleared passed",
+        )
+
+    def test_notification_smtp_test_dialog_custom_mode_is_exclusive_and_sends_single_custom_email(self):
+        self._run_smtp_test_dialog_node_check(
+            r'''
+(async () => {
+  renderNotificationChannelManager();
+  events["open:click"]();
+  checkboxes[0].checked = true;
+  modeRadios[1].checked = true;
+  modeRadios[0].checked = false;
+  events["change"]({ target: modeRadios[1] });
+  if (customInput.disabled !== false) throw new Error("custom field must be enabled in custom mode");
+  if (checkboxes.some(box => box.disabled !== true)) throw new Error("configured checkboxes must be disabled in custom mode");
+  customInput.value = "sin-arroba";
+  await events["submit"]({ preventDefault() {} });
+  if (apiCalls.length) throw new Error("invalid custom email must not reach the server");
+  if (errorElement.hidden === true || !errorElement.textContent) throw new Error("invalid custom email must show a modal error");
+  if (sendButton.disabled) throw new Error("send button must be re-enabled after an invalid custom email");
+  if (dialog.open !== true) throw new Error("invalid custom email must keep the modal open");
+  customInput.value = "externo@example.test";
+  await events["submit"]({ preventDefault() {} });
+  if (dialog.open) throw new Error("successful custom send did not close the modal");
+  if (apiCalls.length !== 1) throw new Error(`wrong number of custom sends: ${JSON.stringify(apiCalls)}`);
+  const payload = apiCalls[0].body;
+  if (JSON.stringify(payload) !== JSON.stringify({ recipients: ["externo@example.test"] })) throw new Error("custom mode must send only the custom email; got " + JSON.stringify(payload));
+  if (JSON.stringify(payload).includes("oncall@example.test")) throw new Error("custom mode must not include configured addresses");
+  if (state.notificationChannelFeedback.message !== "Correo de prueba enviado a oncall@example.test, admin@example.test.") throw new Error("success feedback did not report the actual recipients returned by the server");
+  process.stdout.write("exclusive custom mode sent one custom email passed");
+})().catch(error => { console.error(error); process.exitCode = 1; });
+''',
+            "exclusive custom mode sent one custom email passed",
+        )
 
     def test_notification_setup_guide_documents_channels_and_is_linked(self):
         guide = NOTIFICATION_GUIDE_PATH.read_text(encoding="utf-8")

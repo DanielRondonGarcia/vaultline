@@ -673,6 +673,12 @@ details.form-section[open] > .form-body { border-top: 1px solid var(--border); p
 .notification-test-modal .modal-body { gap: 12px; }
 .notification-test-modal .modal-body > p { margin: 0; }
 .notification-test-recipient-list { display: flex; flex-direction: column; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.notification-test-recipients { display: flex; flex-direction: column; gap: 10px; margin: 0; padding: 0; border: 0; min-width: 0; }
+.notification-test-recipients legend { padding: 0; font-weight: 600; }
+.notification-test-mode-options { display: flex; flex-wrap: wrap; gap: 14px; }
+.notification-test-mode-option, .notification-test-recipient-option { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.notification-test-recipient-option input:disabled + .notification-test-recipient { opacity: 0.55; }
+.notification-test-custom-field[data-notification-test-custom-group] { margin: 0; }
 .notification-test-recipient { display: block; max-width: 100%; padding: 8px 10px; border-radius: 8px; background: var(--muted); color: var(--foreground); font-family: var(--mono-font, monospace); font-size: 12px; overflow-wrap: anywhere; }
 .notification-test-modal .modal-footer .btn.primary { margin-left: auto; }
 #settingsFormSave[hidden], #settingsFormActions[hidden] { display: none !important; }

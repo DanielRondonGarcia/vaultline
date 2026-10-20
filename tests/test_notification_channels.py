@@ -3,7 +3,7 @@ import smtplib
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from cryptography.fernet import Fernet
 
@@ -261,6 +261,155 @@ class NotificationChannelRouteTests(unittest.TestCase):
             {"error": "No se pudo enviar el correo de prueba. Verifica la configuración SMTP."},
         )
         self.assertNotIn("INTERNAL_SMTP_DETAIL_SENTINEL", str(invalid._write_json.call_args))
+
+    def test_test_email_rejects_non_object_request_body_with_400(self):
+        service = Mock()
+        non_object_bodies = [[1, 2], [], "invalid", None, 7]
+
+        for body in non_object_bodies:
+            with self.subTest(body=body):
+                handler = self._handler(
+                    "/api/v1/notification-channels/channel-1/test-email",
+                    service,
+                )
+                handler._read_json_body = Mock(return_value=body)
+
+                handler.do_POST()
+
+                handler._require_auth.assert_called_once_with(ROLE_ADMIN, api_mode=True)
+                handler._write_json.assert_called_once_with(400, {"error": "request body must be a JSON object"})
+                handler._control_plane_service.assert_not_called()
+                service.send_test_notification_email.assert_not_called()
+
+    def test_test_email_empty_request_body_keeps_configured_recipients_contract(self):
+        service = Mock()
+        service.send_test_notification_email.return_value = {"recipients": ["oncall@example.test"]}
+        handler = self._handler(
+            "/api/v1/notification-channels/channel-1/test-email",
+            service,
+        )
+        handler._read_json_body = Mock(return_value={})
+
+        handler.do_POST()
+
+        handler._require_auth.assert_called_once_with(ROLE_ADMIN, api_mode=True)
+        service.send_test_notification_email.assert_called_once_with("channel-1")
+        handler._write_json.assert_called_once_with(200, {"recipients": ["oncall@example.test"]})
+
+    def test_test_email_forwards_explicit_recipient_body_to_service(self):
+        passed_service = Mock()
+        passed_service.send_test_notification_email.return_value = {"recipients": ["admin@example.test"]}
+        passed = self._handler(
+            "/api/v1/notification-channels/channel-1/test-email",
+            passed_service,
+            {"recipients": ["admin@example.test"]},
+        )
+
+        passed.do_POST()
+
+        passed._require_auth.assert_called_once_with(ROLE_ADMIN, api_mode=True)
+        passed_service.send_test_notification_email.assert_called_once_with(
+            "channel-1", recipients=["admin@example.test"]
+        )
+        passed._write_json.assert_called_once_with(200, {"recipients": ["admin@example.test"]})
+
+    def test_test_email_rejects_invalid_recipient_bodies_with_400_before_smtp(self):
+        service = self._real_service()
+        channel = service.create_notification_channel(
+            name="On-call",
+            channel_type="smtp",
+            config={
+                "host": "mail.internal",
+                "port": 587,
+                "from": "backup@example.test",
+                "to": ["oncall@example.test"],
+                "security": "starttls",
+            },
+        )
+        before = service.notification_channel_public_view(channel)
+        invalid_bodies = [
+            {"recipients": None},
+            {"recipients": []},
+            {"recipients": "oncall@example.test"},
+            {"recipients": [None]},
+            {"recipients": ["oncall@example\r.test"]},
+            {"recipients": ["not-an-email"]},
+            {"recipients": ["oncall@example.test", "bad@@example.test"]},
+        ]
+
+        for body in invalid_bodies:
+            with self.subTest(body=body), patch("smtplib.SMTP") as smtp, patch("smtplib.SMTP_SSL") as smtp_ssl:
+                handler = self._handler(
+                    f"/api/v1/notification-channels/{channel.id}/test-email",
+                    service,
+                    body,
+                )
+
+                handler.do_POST()
+
+                handler._write_json.assert_called_once_with(
+                    400, {"error": "test recipients must be a non-empty list of valid email addresses"}
+                )
+                smtp.assert_not_called()
+                smtp_ssl.assert_not_called()
+
+        self.assertEqual(service.notification_channel_public_view(channel), before)
+
+    def test_test_email_with_valid_explicit_recipients_sends_trimmed_list_and_keeps_channel(self):
+        service = self._real_service()
+        channel = service.create_notification_channel(
+            name="On-call",
+            channel_type="smtp",
+            config={
+                "host": "mail.internal",
+                "port": 587,
+                "from": "backup@example.test",
+                "to": ["oncall@example.test"],
+                "security": "starttls",
+            },
+        )
+        client = Mock()
+        manager = Mock()
+        manager.__enter__ = Mock(return_value=client)
+        manager.__exit__ = Mock(return_value=False)
+        handler = self._handler(
+            f"/api/v1/notification-channels/{channel.id}/test-email",
+            service,
+            {"recipients": [" admin@example.test ", "admin@example.test"]},
+        )
+
+        with patch("smtplib.SMTP", return_value=manager) as smtp:
+            handler.do_POST()
+
+        handler._write_json.assert_called_once_with(200, {"recipients": ["admin@example.test"]})
+        smtp.assert_called_once()
+        message = client.send_message.call_args.args[0]
+        self.assertEqual(message["To"], "admin@example.test")
+        self.assertEqual(client.send_message.call_args.kwargs["to_addrs"], ["admin@example.test"])
+        self.assertEqual(
+            service.notification_channel_public_view(channel)["config_summary"]["to"],
+            ["oncall@example.test"],
+        )
+
+    @staticmethod
+    def _real_service():
+        service = ControlPlaneService(
+            worker_repository=InMemoryWorkerRepository(),
+            inventory_repository=InMemoryInventoryRepository(),
+            target_repository=InMemoryTargetRepository(),
+            job_repository=InMemoryJobRepository(),
+            storage_profile_repository=InMemoryStorageProfileRepository(),
+            secret_repository=InMemorySecretRepository(),
+            snapshot_repository=InMemorySnapshotRepository(),
+            retention_policy_repository=InMemoryRetentionPolicyRepository(),
+            target_stats_repository=InMemoryTargetStatsRepository(),
+            secret_codec=SecretCodec(Fernet.generate_key()),
+            settings_repository=InMemorySettingsRepository(),
+            cache_repository=InMemoryCacheRepository(),
+            index_repository=InMemoryIndexRepository(),
+        )
+        service.notification_channel_repository = _NotificationRepository()
+        return service
 
     def test_channel_collection_requires_admin_before_loading_configuration(self):
         handler = object.__new__(ControlPlaneRequestHandler)

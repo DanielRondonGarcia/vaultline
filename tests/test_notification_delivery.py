@@ -488,6 +488,40 @@ class NotificationDeliveryTests(unittest.TestCase):
         self.assertIn("job-abc123", html_body)
         self.assertIn("Ver trabajos en el sistema de backups", html_body)
 
+    def test_html_email_missing_dates_render_the_same_utf8_em_dash(self):
+        """Missing started/finished timestamps fall back to the literal U+2014 em dash."""
+        channel = self.service.create_notification_channel(
+            name="On-call email",
+            channel_type="smtp",
+            config={
+                "host": "mail.internal",
+                "port": 587,
+                "from": "backup@example.test",
+                "to": ["oncall@example.test"],
+                "security": "starttls",
+                "username": "smtp-user",
+                "password": "smtp-password",
+            },
+        )
+        payload = {"event": "backup.failed", "job_id": "job-nodates", "target_id": "target-a", "summary": {"error": "worker lease expired"}}
+        client = Mock()
+        manager = Mock()
+        manager.__enter__ = Mock(return_value=client)
+        manager.__exit__ = Mock(return_value=False)
+
+        with patch("smtplib.SMTP", return_value=manager) as smtp:
+            self.service._send_notification_channel(channel, payload)
+
+        smtp.assert_called_once()
+        message = client.send_message.call_args.args[0]
+        html_parts = [part for part in message.get_payload() if part.get_content_type() == "text/html"]
+        self.assertEqual(len(html_parts), 1)
+        html_body = html_parts[0].get_content()
+        # The em dash is a real UTF-8 character in the rendered markup, not an
+        # escaped placeholder; it appears in the missing Inicio/Finalización cells.
+        self.assertIn("\u2014", html_body)
+        self.assertEqual(html_parts[0].get_content_charset(), "utf-8")
+
 
 if __name__ == "__main__":
     unittest.main()

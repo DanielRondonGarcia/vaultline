@@ -130,8 +130,9 @@ class RestoreMetadataTests(unittest.TestCase):
             ("85ce8467", "restic-0.19.1"),
         ):
             with self.subTest(variant=variant):
+                record = line(path="/data/ni\u00f1o")
                 evidence = parse_restic_ls_long(
-                    f"{header(snapshot, variant)}\n{line(path='/data/ni\u00f1o')}", snapshot=snapshot
+                    f"{header(snapshot, variant)}\n{record}", snapshot=snapshot
                 )
                 self.assertEqual([item.path for item in evidence.files], ["/data/ni\u00f1o"])
 

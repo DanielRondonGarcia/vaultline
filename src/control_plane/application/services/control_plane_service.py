@@ -3318,6 +3318,11 @@ class ControlPlaneService:
         if status_code is not None:
             code_row = f'<tr><td style="padding:8px 0;color:#6c757d;">Código</td><td style="padding:8px 0;font-weight:600;">{status_code}</td></tr>'
 
+        # Missing timestamps render a literal UTF-8 em dash. The dash is
+        # computed outside the f-string below: on CPython 3.11 no expression
+        # inside an f-string may contain a backslash (SyntaxError).
+        missing_date = "\u2014"
+
         html = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3348,8 +3353,8 @@ class ControlPlaneService:
                 {state_row}
                 {code_row}
                 {source_row}
-                <tr><td style="padding:8px 0;color:#6c757d;">Inicio</td><td style="padding:8px 0;">{self._escape_html(started_at) if started_at else "\u2014"}</td></tr>
-                <tr><td style="padding:8px 0;color:#6c757d;">Finalización</td><td style="padding:8px 0;">{self._escape_html(finished_at) if finished_at else "\u2014"}</td></tr>
+                <tr><td style="padding:8px 0;color:#6c757d;">Inicio</td><td style="padding:8px 0;">{self._escape_html(started_at) if started_at else missing_date}</td></tr>
+                <tr><td style="padding:8px 0;color:#6c757d;">Finalización</td><td style="padding:8px 0;">{self._escape_html(finished_at) if finished_at else missing_date}</td></tr>
               </table>
               {f'<div style="margin-bottom:16px;padding:12px 16px;background:#f8d7da;border-left:4px solid #dc3545;border-radius:4px;"><strong>Error:</strong> <span style="color:#721c24;">{self._escape_html(error)}{diag_badge}</span></div>' if error else ''}
               {recovery_html}

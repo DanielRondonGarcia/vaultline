@@ -2839,6 +2839,16 @@ class ControlPlaneService:
     SMTP_LOG_PREVIEW_ERROR_RESERVE_BYTES = 2048
     SMTP_LOG_PREVIEW_OMISSION_MARKER = "Contenido omitido"
     SMTP_SECURITY_MODES = frozenset({"starttls", "ssl", "none"})
+    # Synthetic constants for the SMTP test email: it renders the real report
+    # template with clearly fictitious TESTING data so administrators can
+    # preview the layout without running a backup or reading real logs.
+    SMTP_TEST_REPORT_TESTING_TITLE = "PRUEBA / TESTING"
+    SMTP_TEST_REPORT_SUBJECT = "PRUEBA / TESTING: reporte de backup fallido (datos ficticios)"
+    SMTP_TEST_SAMPLE_LOG_NOTICE = "=== PRUEBA / TESTING - Datos ficticios; no se ha ejecutado un backup real ==="
+    SMTP_TEST_SAMPLE_JOB_ID = "TESTING-preview-job-0001"
+    SMTP_TEST_SAMPLE_TARGET_ID = "TESTING-target-ejemplo"
+    SMTP_TEST_SAMPLE_STARTED_AT = "2025-01-15T08:14:14+00:00"
+    SMTP_TEST_SAMPLE_FINISHED_AT = "2025-01-15T08:39:39+00:00"
     SMTP_EMAIL_PATTERN = re.compile(
         r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
         r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
@@ -3011,16 +3021,15 @@ class ControlPlaneService:
             None if recipients is SMTP_TEST_RECIPIENTS_OMITTED else self._normalize_test_recipients(recipients)
         )
         actual_recipients = list(config["to"]) if recipient_override is None else list(recipient_override)
-        payload = {
-            "event": "notification.test",
-            "channel_name": channel.name,
-            "message": "This is a test email from Vaultline notification settings.",
-        }
+        # Preview of the real backup-failure report template with clearly
+        # fictitious TESTING data; the event stays notification.test.
         self._send_notification_channel(
             channel,
-            payload,
-            subject="Vaultline SMTP test email",
+            self._smtp_test_report_payload(channel.name),
+            subject=self.SMTP_TEST_REPORT_SUBJECT,
+            email_log_lines=self._smtp_test_sample_log_lines(),
             recipient_override=recipient_override,
+            report_template_testing=True,
         )
         return {"recipients": actual_recipients}
 
@@ -3037,6 +3046,41 @@ class ControlPlaneService:
         if not normalized:
             raise ValueError("test recipients must be a non-empty list of valid email addresses")
         return normalized
+
+    def _smtp_test_report_payload(self, channel_name: str) -> Dict[str, Any]:
+        """Synthetic fictitious payload that keeps the notification.test event but
+        drives the shared backup-failure HTML/plain template so administrators
+        preview the real report layout without running a backup."""
+        return {
+            "event": "notification.test",
+            "channel_name": channel_name,
+            "message": "Correo de prueba con datos ficticios: no se ha ejecutado un backup real.",
+            "job_id": self.SMTP_TEST_SAMPLE_JOB_ID,
+            "target_id": self.SMTP_TEST_SAMPLE_TARGET_ID,
+            "command": "backup.run",
+            "status": "failed",
+            "started_at": self.SMTP_TEST_SAMPLE_STARTED_AT,
+            "finished_at": self.SMTP_TEST_SAMPLE_FINISHED_AT,
+            "summary": {
+                "error": "PRUEBA / TESTING - Error ficticio de ejemplo (datos de ejemplo)",
+                "status_code": 1,
+                "state": "fallido (ejemplo)",
+                "source": "ejemplo",
+                "recovery": "Ejemplo ficticio: revisa la configuración del target y vuelve a ejecutar el backup.",
+                "diagnostic_code": "TESTING-000",
+                "diagnostic_category": "prueba",
+                "diagnostic_message": "Mensaje de diagnóstico ficticio con datos de ejemplo para la vista previa.",
+            },
+        }
+
+    def _smtp_test_sample_log_lines(self) -> List[str]:
+        """Synthetic benign log demonstrating the retained-log preview with an
+        omitted middle, so the sample attachment never contains real output."""
+        lines = [self.SMTP_TEST_SAMPLE_LOG_NOTICE]
+        lines.extend(f"INFO: paso {index}: operación ficticia de ejemplo completada" for index in range(1, 51))
+        lines.append("ERROR: error ficticio de ejemplo para la vista previa de la plantilla")
+        lines.extend(f"INFO: cierre {index}: operación ficticia de ejemplo completada" for index in range(51, 71))
+        return lines
 
     def update_notification_channel(
         self,
@@ -3259,6 +3303,47 @@ class ControlPlaneService:
             preview.append(error_line)
         return preview
 
+    def _smtp_plain_email_text(
+        self,
+        payload: Dict[str, Any],
+        control_plane_url: str,
+        preview: List[str],
+        attachment_name: str,
+        testing: bool = False,
+    ) -> str:
+        """Readable plain-text alternative shared by real failures and the SMTP test preview."""
+        job_id = payload.get("job_id", "unknown")
+        target = payload.get("target_id", "")
+        target_display = f" ({target})" if target and target != "None" else ""
+        if testing:
+            plain_text = (
+                "PRUEBA / TESTING - Datos ficticios: no se ha ejecutado un backup real.\n"
+                "Las fechas y los datos solo son de ejemplo para previsualizar la plantilla.\n\n"
+                f"Backup fallido (simulado): {job_id}{target_display}\n"
+            )
+        else:
+            plain_text = f"Backup fallido: {job_id}{target_display}\n"
+        if control_plane_url:
+            plain_text += f"Ver detalles: {control_plane_url}/#/jobs\n"
+        plain_text += "\nResumen del error:\n"
+        summary = payload.get("summary") or {}
+        error = summary.get("error", "")
+        if error:
+            plain_text += f"Error: {error}\n"
+        diag_msg = summary.get("diagnostic_message", "")
+        if diag_msg:
+            plain_text += f"Diagnóstico: {diag_msg}\n"
+        recovery = summary.get("recovery", "")
+        if recovery:
+            plain_text += f"Recuperación: {recovery}\n"
+        # Bounded first/last preview; the full retained log goes as attachment.
+        if preview:
+            plain_text += "\nRegistro de error:\n"
+            for line in preview:
+                plain_text += f"{line}\n"
+            plain_text += f"El registro completo va en el archivo adjunto {attachment_name}\n"
+        return plain_text
+
     @staticmethod
     def _escape_html(text: str) -> str:
         """Minimal HTML escaping."""
@@ -3270,8 +3355,14 @@ class ControlPlaneService:
         control_plane_url: str,
         log_preview: Optional[List[str]] = None,
         attachment_name: Optional[str] = None,
+        testing: bool = False,
     ) -> str:
-        """Build a professional HTML email body for backup failure notifications."""
+        """Build a professional HTML email body for backup failure notifications.
+
+        With `testing=True` (only the SMTP test path), the same layout, link and
+        log styling is rendered but the header, caption and a banner clearly
+        label the email as PRUEBA / TESTING with fictitious data.
+        """
         job_id = payload.get("job_id", "unknown")
         target_id = payload.get("target_id", "unknown")
         started_at = payload.get("started_at", "")
@@ -3356,6 +3447,16 @@ class ControlPlaneService:
         # inside an f-string may contain a backslash (SyntaxError).
         missing_date = "\u2014"
 
+        # Only the test-specific caption/banner/text varies; the whole layout,
+        # link and log styling stays shared with real failure alerts.
+        header_title = "PRUEBA / TESTING" if testing else "Backup fallido"
+        intro_html = (
+            '<div style="margin:0 0 20px;padding:12px 16px;background:#fff3cd;border:1px solid #ffc;border-left:4px solid #ffc107;border-radius:4px;font-size:13px;color:#856404;line-height:1.5;"><strong>PRUEBA / TESTING</strong> - Datos ficticios (fechas de ejemplo). No se ha ejecutado un backup real.</div>'
+            '<p style="margin:0 0 20px;color:#495057;font-size:15px;line-height:1.5;">Correo de prueba con datos ficticios (fechas de ejemplo): no se ha ejecutado un backup real. A continuación se muestra cómo se ve la plantilla del reporte:</p>'
+            if testing
+            else '<p style="margin:0 0 20px;color:#495057;font-size:15px;line-height:1.5;">Se ha detectado un fallo en un trabajo de backup. A continuación se muestra el resumen:</p>'
+        )
+
         html = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3371,7 +3472,7 @@ class ControlPlaneService:
             <td style="background:#dc3545;padding:20px 24px;color:#fff;">
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
                 <tr>
-                  <td style="font-size:18px;font-weight:700;">Backup fallido</td>
+                  <td style="font-size:18px;font-weight:700;">{header_title}</td>
                   <td align="right" style="font-size:13px;opacity:.9;">{self._escape_html(finished_at) if finished_at else ""}</td>
                 </tr>
               </table>
@@ -3379,7 +3480,7 @@ class ControlPlaneService:
           </tr>
           <tr>
             <td style="padding:24px;">
-              <p style="margin:0 0 20px;color:#495057;font-size:15px;line-height:1.5;">Se ha detectado un fallo en un trabajo de backup. A continuación se muestra el resumen:</p>
+              {intro_html}
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
                 <tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Identificador del trabajo</td><td style="padding:8px 0;border-bottom:1px solid #eee;"><code style="background:#f1f3f5;padding:3px 8px;border-radius:4px;font-size:13px;">{self._escape_html(job_id)}</code></td></tr>
                 <tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Target</td><td style="padding:8px 0;border-bottom:1px solid #eee;font-weight:600;">{target_display}</td></tr>
@@ -3414,10 +3515,13 @@ class ControlPlaneService:
         subject: Optional[str] = None,
         email_log_lines: Optional[List[str]] = None,
         recipient_override: Optional[List[str]] = None,
+        report_template_testing: bool = False,
     ) -> None:
         # `recipient_override` is accepted only from the SMTP test path
         # (`notification.test`); scheduled backup/webhook deliveries always pass
-        # none and keep using the stored channel recipients.
+        # none and keep using the stored channel recipients. The same applies to
+        # `report_template_testing`: only the SMTP test path marks the report as
+        # PRUEBA / TESTING, and webhook deliveries ignore it.
         config = self._notification_channel_config(channel)
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
@@ -3462,38 +3566,19 @@ class ControlPlaneService:
         except Exception:
             pass
 
-        # Build HTML body for backup failures
-        if payload.get("event") == "backup.failed":
+        # Build HTML body for backup failures (and the SMTP test preview, which
+        # renders the same report template marked as PRUEBA / TESTING).
+        if payload.get("event") == "backup.failed" or report_template_testing:
             # The already-sanitized job log only travels to SMTP channels.
             preview = self._smtp_log_preview_lines(email_log_lines) if email_log_lines else []
             attachment_name = self._smtp_log_attachment_name(payload.get("job_id")) if preview else ""
             html_body = self._build_html_email_body(
-                payload, control_plane_url, log_preview=preview, attachment_name=attachment_name
+                payload, control_plane_url, log_preview=preview, attachment_name=attachment_name,
+                testing=report_template_testing,
             )
-            # Plain text fallback
-            job_id = payload.get("job_id", "unknown")
-            target = payload.get("target_id", "")
-            target_display = f" ({target})" if target and target != "None" else ""
-            plain_text = f"Backup fallido: {job_id}{target_display}\n"
-            if control_plane_url:
-                plain_text += f"Ver detalles: {control_plane_url}/#/jobs\n"
-            plain_text += "\nResumen del error:\n"
-            summary = payload.get("summary") or {}
-            error = summary.get("error", "")
-            if error:
-                plain_text += f"Error: {error}\n"
-            diag_msg = summary.get("diagnostic_message", "")
-            if diag_msg:
-                plain_text += f"Diagnóstico: {diag_msg}\n"
-            recovery = summary.get("recovery", "")
-            if recovery:
-                plain_text += f"Recuperación: {recovery}\n"
-            # Bounded first/last preview; the full retained log goes as attachment.
-            if preview:
-                plain_text += "\nRegistro de error:\n"
-                for line in preview:
-                    plain_text += f"{line}\n"
-                plain_text += f"El registro completo va en el archivo adjunto {attachment_name}\n"
+            plain_text = self._smtp_plain_email_text(
+                payload, control_plane_url, preview, attachment_name or "", testing=report_template_testing
+            )
 
             message.set_content(plain_text)
             message.add_alternative(html_body, subtype="html")

@@ -9,6 +9,8 @@ Configura uno o más webhooks o destinos de correo en **Settings → Notificacio
 3. Completa los datos del destino y guarda. Repite para añadir otros destinos; cada canal puede activarse o desactivarse por separado.
 4. Para validar un canal SMTP, selecciona **Enviar correo de prueba** en su tarjeta. La ventana modal permite elegir los destinatarios solo para ese envío: marca uno o varios de los configurados (inicialmente ninguno marcado) o cambia a **Correo personalizado** y escribe una única dirección propia, por ejemplo para probar con otro correo sin molestar al resto. Los modos son excluyentes: al elegir el correo personalizado se ignoran los marcados. El envío se bloquea si no hay ninguna selección, reabrir la ventana la limpia, y el sistema indica los destinatarios reales a los que llegó el correo. La selección no edita los destinatarios del canal; utiliza las credenciales guardadas y no inicia un backup. Los webhooks no tienen envío de prueba en la interfaz.
 
+El correo de prueba es una vista previa de la plantilla: llega marcado como **PRUEBA / TESTING** con datos ficticios (fechas de ejemplo), un log de muestra y un adjunto claramente marcado como prueba; no refleja un fallo real y no deja ningún estado guardado.
+
 ## Webhook
 
 - Usa una URL absoluta `http://` o `https://`, sin usuario/contraseña embebidos ni fragmento `#`.
@@ -45,7 +47,7 @@ Los avisos SMTP llegan como correo HTML con alternativa de texto plano (no JSON)
 - Con la URL pública del Control Plane configurada (`control_plane_public_url` en Settings, por ejemplo `https://backups.miempresa.com`), el correo incluye el enlace **Ver trabajos en el sistema de backups** hacia la lista de jobs; los links solo se generan con URLs absolutas `http://` o `https://`.
 - Al final del correo, después del enlace, va la sección **Registro de error**: una vista previa acotada con las primeras y últimas líneas del log (máx. 50 líneas o 4 KiB en total). Si se cortaron líneas del medio, aparece un marcador `Contenido omitido`; la última línea `ERROR` se conserva siempre, incluso con líneas Unicode muy largas, y el texto indica que el registro completo va en el archivo adjunto.
 - El log completo retenido del job se adjunta como `backup-<id-del-job>.log.txt` en UTF-8 (`text/plain`); el log se redacta igual que la vista previa. Solo incluye el log aún retenido por el Control Plane (límite actual: 1000 líneas / 512 Ki caracteres), no el historial que ya se descartó.
-- El correo de prueba SMTP sigue siendo una notificación `notification.test` sin log ni adjunto; los webhooks no cambian su comportamiento.
+- El correo de prueba SMTP mantiene el evento `notification.test` pero ya no envía JSON: usa la misma plantilla HTML/plano de `backup.failed` con un asunto y un encabezado **PRUEBA / TESTING** y datos ficticios (job, target, fechas de ejemplo, estado, error, recuperación, diagnóstico), una vista previa de un log de muestra con el marcador `Contenido omitido` y el adjunto de ejemplo `backup-TESTING-....log.txt` claramente marcado como prueba. Nunca lee logs ni jobs reales ni deja estado guardado (sin `claim_delivery_attempt` ni hilos de entrega). Los webhooks no cambian su comportamiento.
 
 ## Seguridad operativa
 

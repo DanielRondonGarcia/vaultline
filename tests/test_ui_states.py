@@ -2748,6 +2748,7 @@ if (!tabSelected || !fieldFocused) throw new Error("validation target was not re
     'for="notificationTestCustom-smtp-1"',
     'id="notificationTestCustom-smtp-1"',
     'envío de prueba',
+    'reporte ficticio de TESTING',
   ];
   const missing = expected.filter(value => !markup.includes(value));
   if (missing.length) throw new Error(`missing rendered notification UI: ${missing.join("; ")}`);

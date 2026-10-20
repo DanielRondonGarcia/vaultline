@@ -389,6 +389,11 @@ class NotificationDeliveryTests(unittest.TestCase):
         self.assertIn("Backup fallido", html_body)
         self.assertIn("safe failure", html_body)
         self.assertIn("job-1", html_body)
+        # A real failure alert never masquerades as the testing report preview.
+        self.assertNotIn("PRUEBA / TESTING", plain_text)
+        self.assertNotIn("PRUEBA / TESTING", html_body)
+        self.assertNotIn("datos ficticios", plain_text)
+        self.assertNotIn("datos ficticios", html_body)
 
 
     def test_test_email_sends_to_configured_recipients_without_mutating_channel(self):
@@ -411,20 +416,29 @@ class NotificationDeliveryTests(unittest.TestCase):
         manager.__enter__ = Mock(return_value=client)
         manager.__exit__ = Mock(return_value=False)
 
-        with patch("smtplib.SMTP", return_value=manager) as smtp:
+        with patch("smtplib.SMTP", return_value=manager) as smtp, patch.object(
+            self.service, "_send_notification_channel", wraps=self.service._send_notification_channel
+        ) as relay:
             result = self.service.send_test_notification_email(channel.id)
 
         self.assertEqual(result, {"recipients": ["oncall@example.test", "admin@example.test"]})
         smtp.assert_called_once_with("mail.internal", 587, timeout=5)
         client.starttls.assert_called_once()
         client.login.assert_called_once_with("smtp-user", "smtp-password")
+        # The event stays notification.test even though the rendered template is a report.
+        self.assertEqual(relay.call_args.args[1]["event"], "notification.test")
+        self.assertEqual(relay.call_args.args[1]["channel_name"], "On-call email")
         message = client.send_message.call_args.args[0]
-        self.assertEqual(message["Subject"], "Vaultline SMTP test email")
+        self.assertEqual(message["Subject"], "PRUEBA / TESTING: reporte de backup fallido (datos ficticios)")
         self.assertEqual(message["To"], "oncall@example.test, admin@example.test")
-        payload = json.loads(message.get_content())
-        self.assertEqual(payload["event"], "notification.test")
-        self.assertEqual(payload["channel_name"], "On-call email")
-        self.assertNotIn("smtp-password", message.get_content())
+        # The report template plus the sample attachment; alternative sits inside.
+        self.assertEqual(message.get_content_type(), "multipart/mixed")
+        self.assertTrue(any(part.get_content_type() == "multipart/alternative" for part in message.get_payload()))
+        plain = message.get_body(preferencelist=("plain",)).get_content()
+        html = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("PRUEBA / TESTING", plain)
+        self.assertIn("PRUEBA / TESTING", html)
+        self.assertNotIn("smtp-password", plain + html)
         after = next(
             self.service.notification_channel_public_view(item)
             for item in self.service.list_notification_channels()
@@ -433,6 +447,76 @@ class NotificationDeliveryTests(unittest.TestCase):
         self.assertEqual(after, before)
         with self.assertRaisesRegex(ValueError, "SMTP"):
             self.service.send_test_notification_email(self.channel.id)
+
+    def test_test_email_uses_the_report_template_with_fictitious_testing_data(self):
+        self.service.update_settings(control_plane_public_url="https://backups.example.test/")
+        channel = self._smtp_channel(["oncall@example.test"])
+        before_channels = [
+            self.service.notification_channel_public_view(item) for item in self.service.list_notification_channels()
+        ]
+        client, manager = self._smtp_client_manager()
+
+        with patch("threading.Thread") as thread_factory, patch.object(
+            self.channels, "claim_delivery_attempt", wraps=self.channels.claim_delivery_attempt
+        ) as claim, patch("smtplib.SMTP", return_value=manager) as smtp, patch.object(
+            self.service, "_send_notification_channel", wraps=self.service._send_notification_channel
+        ) as relay:
+            result = self.service.send_test_notification_email(channel.id)
+
+        self.assertEqual(result, {"recipients": ["oncall@example.test"]})
+        smtp.assert_called_once()
+        # Persistent state stays untouched: no attempt claims, no notification threads.
+        self.assertEqual(claim.call_args_list, [])
+        thread_factory.assert_not_called()
+        payload = relay.call_args.args[1]
+        self.assertEqual(payload["event"], "notification.test")
+        self.assertIn("TESTING-preview-job-0001", payload["job_id"])
+        message = client.send_message.call_args.args[0]
+        self.assertEqual(message["Subject"], "PRUEBA / TESTING: reporte de backup fallido (datos ficticios)")
+        # The report template plus the sample attachment; alternative sits inside.
+        self.assertEqual(message.get_content_type(), "multipart/mixed")
+        self.assertTrue(any(part.get_content_type() == "multipart/alternative" for part in message.get_payload()))
+        plain = message.get_body(preferencelist=("plain",)).get_content()
+        html = message.get_body(preferencelist=("html",)).get_content()
+        # Prominent testing labels in subject, headline and body; never a real failure.
+        self.assertTrue(plain.lstrip().startswith("PRUEBA / TESTING"))
+        self.assertIn("Datos ficticios", plain)
+        self.assertIn("no se ha ejecutado un backup real", plain)
+        self.assertIn("PRUEBA / TESTING", html)
+        self.assertIn("datos ficticios", html)
+        self.assertIn("no se ha ejecutado un backup real", html)
+        # Readable plain fallback, not the raw JSON payload.
+        self.assertNotIn('"event"', plain)
+        # Same layout/link/log styling as a real failure, with example data.
+        self.assertIn("https://backups.example.test/#/jobs", html)
+        self.assertIn("Ver trabajos en el sistema de backups", html)
+        self.assertIn("TESTING-preview-job-0001", html)
+        self.assertIn("TESTING-preview-job-0001", plain)
+        self.assertIn("2025-01-15T08:14:14+00:00", html)
+        self.assertIn("2025-01-15T08:39:39+00:00", html)
+        self.assertIn("fechas de ejemplo", html)
+        self.assertIn("Error ficticio", plain)
+        self.assertIn("Registro de error", html)
+        self.assertGreater(html.index("Registro de error"), html.index("Ver trabajos"))
+        self.assertIn("Contenido omitido", plain)
+        self.assertIn("Contenido omitido", html)
+        attachments = list(message.iter_attachments())
+        self.assertEqual(len(attachments), 1)
+        attachment = attachments[0]
+        self.assertEqual(attachment.get_filename(), "backup-TESTING-preview-job-0001.log.txt")
+        self.assertEqual(attachment.get_content_type(), "text/plain")
+        attachment_content = attachment.get_content()
+        self.assertIn("Datos ficticios", attachment_content)
+        self.assertIn("no se ha ejecutado un backup real", attachment_content)
+        self.assertIn("INFO: paso 1:", attachment_content)
+        self.assertIn("ERROR: error ficticio", attachment_content)
+        for secret in ("smtp-password",):
+            for part in (plain, html, attachment_content):
+                self.assertNotIn(secret, part)
+        self.assertEqual(
+            [self.service.notification_channel_public_view(item) for item in self.service.list_notification_channels()],
+            before_channels,
+        )
 
     def _smtp_channel(self, recipients):
         return self.service.create_notification_channel(
@@ -469,6 +553,8 @@ class NotificationDeliveryTests(unittest.TestCase):
         message = client.send_message.call_args.args[0]
         self.assertEqual(message["To"], "admin@example.test")
         self.assertEqual(client.send_message.call_args.kwargs["to_addrs"], ["admin@example.test"])
+        html = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("PRUEBA / TESTING", html)
         self.assertNotIn("oncall@example.test", str(client.send_message.call_args))
         after = next(
             self.service.notification_channel_public_view(item)
@@ -506,6 +592,7 @@ class NotificationDeliveryTests(unittest.TestCase):
         self.assertEqual(result, {"recipients": ["admin@example.test", "oncall@example.test"]})
         message = client.send_message.call_args.args[0]
         self.assertEqual(message["To"], "admin@example.test, oncall@example.test")
+        self.assertEqual(message["Subject"], "PRUEBA / TESTING: reporte de backup fallido (datos ficticios)")
 
     def test_test_email_rejects_empty_or_invalid_recipients_without_smtp_call(self):
         channel = self._smtp_channel(["oncall@example.test"])

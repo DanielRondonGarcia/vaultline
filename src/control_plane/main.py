@@ -1156,6 +1156,25 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                 )
                 return self._write_json(201, service.notification_channel_public_view(channel))
 
+            if len(parts) == 5 and parts[:3] == ["api", "v1", "notification-channels"] and parts[4] == "test-email":
+                if not self._require_auth(ROLE_ADMIN, api_mode=True):
+                    return
+                try:
+                    result = self._control_plane_service().send_test_notification_email(parts[3])
+                except Exception as exc:
+                    if isinstance(exc, ValueError):
+                        message = str(exc)
+                        if message == "notification channel not found":
+                            return self._write_json(404, {"error": message})
+                        if message == "test email is only supported for SMTP channels":
+                            return self._write_json(400, {"error": message})
+                    logger.warning("SMTP test delivery failed for channel %s (%s)", parts[3], type(exc).__name__)
+                    return self._write_json(
+                        502,
+                        {"error": "No se pudo enviar el correo de prueba. Verifica la configuración SMTP."},
+                    )
+                return self._write_json(200, result)
+
             if path == "/api/v1/secrets":
                 if not self._require_auth(ROLE_ADMIN, api_mode=True):
                     return

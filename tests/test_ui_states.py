@@ -2608,10 +2608,122 @@ if (!tabSelected || !fieldFocused) throw new Error("validation target was not re
             "STARTTLS",
             "Nueva contraseña SMTP",
             "URL del webhook",
+            "dialog.showModal()",
+            "data-notification-test-form",
+            "test-email",
         ):
             self.assertIn(marker, manager_source)
         self.assertNotIn("config_ciphertext", manager_source)
         self.assertIn("renderNotificationChannelManager()", self.source)
+        for marker in (".notification-feedback", ".notification-feedback.is-error", ".notification-test-modal:not([open])"):
+            self.assertIn(marker, self.css)
+
+    def test_smtp_test_dialog_shows_recipients_and_created_feedback_as_a_chip(self):
+        renderer = re.search(r"function renderNotificationChannelManager\(.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(renderer)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = r'''
+const escapeHtml = value => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
+const state = {
+  notificationChannels: [
+    { id: "smtp-1", name: "Sistemas", channel_type: "smtp", enabled: true,
+      config_summary: { host: "mail.internal", port: 587, from: "backup@example.test", to: ["oncall@example.test", "admin@example.test"], security: "starttls" } },
+    { id: "webhook-1", name: "Webhook", channel_type: "webhook", enabled: true,
+      config_summary: { destination: "https://hooks.example.test" } },
+  ],
+  notificationChannelEditor: null,
+  notificationChannelFeedback: { message: "Canal creado.", type: "success" },
+};
+let markup = "";
+const events = {};
+const apiCalls = [];
+const errorElement = { hidden: true, textContent: "" };
+const sendButton = { disabled: false, textContent: "", isConnected: true };
+const dialog = {
+  open: false,
+  showModal() { this.open = true; },
+  close() { this.open = false; },
+  querySelector(selector) { return selector === "[data-notification-test-error]" ? errorElement : null; },
+};
+const form = {
+  dataset: { notificationTestForm: "smtp-1" },
+  querySelector(selector) {
+    if (selector === "[data-notification-test-submit]") return sendButton;
+    if (selector === "[data-notification-test-error]") return errorElement;
+    return null;
+  },
+  closest() { return dialog; },
+  addEventListener(name, handler) { events[`form:${name}`] = handler; },
+};
+const openButton = {
+  dataset: { notificationTestOpen: "smtp-1" },
+  addEventListener(name, handler) { events[`open:${name}`] = handler; },
+};
+const closeButton = {
+  closest() { return dialog; },
+  addEventListener(name, handler) { events[`close:${name}`] = handler; },
+};
+const container = {
+  set innerHTML(value) { markup = value; },
+  querySelector() { return null; },
+  querySelectorAll(selector) {
+    if (selector === "[data-notification-test-open]") return [openButton];
+    if (selector === "[data-notification-test-close]") return [closeButton];
+    if (selector === "[data-notification-test-form]") return [form];
+    return [];
+  },
+};
+const document = {
+  getElementById(id) {
+    if (id === "notificationChannelManager") return container;
+    if (id === "notificationTestDialog-smtp-1") return dialog;
+    return null;
+  },
+};
+const apiPost = async (path, body) => {
+  apiCalls.push({ path, body });
+  return { recipients: ["oncall@example.test", "admin@example.test"] };
+};
+''' + renderer.group(0) + r'''
+(async () => {
+  renderNotificationChannelManager();
+  const expected = [
+    'data-notification-test-open="smtp-1"',
+    'data-notification-test-form="smtp-1"',
+    'Enviar correo de prueba',
+    'oncall@example.test',
+    'admin@example.test',
+    'Canal creado.',
+    'notification-feedback is-success',
+  ];
+  const missing = expected.filter(value => !markup.includes(value));
+  if (missing.length) throw new Error(`missing rendered notification UI: ${missing.join("; ")}`);
+  if ((markup.match(/data-notification-test-open=/g) || []).length !== 1) throw new Error("only SMTP channels should offer a test email");
+  if (!markup.includes("notification-test-modal")) throw new Error("SMTP test confirmation is not in a modal");
+  if (apiCalls.length) throw new Error("test email sent before explicit modal confirmation");
+  events["open:click"]();
+  if (!dialog.open) throw new Error("test email button did not open its confirmation modal");
+  events["close:click"]();
+  if (dialog.open) throw new Error("cancel did not close the confirmation modal");
+  events["open:click"]();
+  await events["form:submit"]({ preventDefault() {} });
+  if (dialog.open) throw new Error("successful test send did not close the modal");
+  if (apiCalls.length !== 1 || apiCalls[0].path !== "/api/v1/notification-channels/smtp-1/test-email" || JSON.stringify(apiCalls[0].body) !== "{}") throw new Error(`wrong test email request: ${JSON.stringify(apiCalls)}`);
+  if (state.notificationChannelFeedback.message !== "Correo de prueba enviado a oncall@example.test, admin@example.test.") throw new Error("success feedback did not report the actual recipient list");
+  if (!markup.includes("notification-feedback is-success")) throw new Error("send success was not rendered as a styled feedback chip");
+  process.stdout.write("notification modal, send action, and feedback chip passed");
+})().catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "notification modal, send action, and feedback chip passed")
 
     def test_notification_setup_guide_documents_channels_and_is_linked(self):
         guide = NOTIFICATION_GUIDE_PATH.read_text(encoding="utf-8")
@@ -2620,6 +2732,7 @@ if (!tabSelected || !fieldFocused) throw new Error("validation target was not re
             "Webhook",
             "SMTP",
             "STARTTLS",
+            "correo de prueba",
             "backup.failed",
             "logs completos",
             "un intento",

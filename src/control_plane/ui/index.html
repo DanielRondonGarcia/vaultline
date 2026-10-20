@@ -8579,9 +8579,23 @@ docker compose up -d
             ${channel.channel_type === "smtp" && summary.authentication_configured ? '<div class="helper">Autenticación configurada; las credenciales no se muestran.</div>' : ""}
             <div class="settings-actions">
               <button type="button" class="btn secondary" data-notification-edit="${escapeHtml(channel.id)}">Editar</button>
+              ${channel.channel_type === "smtp" ? `<button type="button" class="btn secondary" data-notification-test-open="${escapeHtml(channel.id)}">Enviar correo de prueba</button>` : ""}
               <button type="button" class="btn secondary" data-notification-toggle="${escapeHtml(channel.id)}">${channel.enabled ? "Desactivar" : "Activar"}</button>
               <button type="button" class="btn danger" data-notification-delete="${escapeHtml(channel.id)}">Eliminar</button>
             </div>
+            ${channel.channel_type === "smtp" ? `
+              <dialog id="notificationTestDialog-${escapeHtml(channel.id)}" class="modal notification-test-modal" aria-labelledby="notificationTestTitle-${escapeHtml(channel.id)}">
+                <form data-notification-test-form="${escapeHtml(channel.id)}">
+                  <div class="modal-header"><h3 id="notificationTestTitle-${escapeHtml(channel.id)}">Enviar correo de prueba</h3><button type="button" class="close" data-notification-test-close aria-label="Cerrar">&times;</button></div>
+                  <div class="modal-body">
+                    <p>Se enviará el correo a estos destinatarios:</p>
+                    <ul class="notification-test-recipient-list">${Array.isArray(summary.to) && summary.to.length ? summary.to.map(recipient => `<li><span class="notification-test-recipient">${escapeHtml(recipient)}</span></li>`).join("") : '<li class="helper">No hay destinatarios configurados.</li>'}</ul>
+                    <div class="helper">Se utilizará la configuración SMTP guardada. Esta prueba no modifica el canal ni inicia un backup.</div>
+                    <div class="form-error" data-notification-test-error role="alert" hidden></div>
+                  </div>
+                  <div class="modal-footer"><button type="button" class="btn secondary" data-notification-test-close>Cancelar</button><button type="submit" class="btn primary" data-notification-test-submit>Enviar prueba</button></div>
+                </form>
+              </dialog>` : ""}
           </article>`;
       }).join("") : '<div class="settings-card"><div class="helper">Aún no hay canales. Agrega un webhook o un destino de correo SMTP.</div></div>';
       const editorFields = !editor ? "" : channelType === "webhook" ? `
@@ -8615,15 +8629,23 @@ docker compose up -d
           </div>
           <div class="settings-card"><h3>Canales configurados</h3><div class="notification-channel-list">${channelCards}</div></div>
           ${editorMarkup}
-          <div id="notificationChannelFeedback" class="helper" role="status" aria-live="polite" style="${feedback?.type === "error" ? "color:var(--destructive);" : "color:var(--success);"}">${escapeHtml(feedback?.message || "")}</div>
+          <span id="notificationChannelFeedback" class="notification-feedback ${feedback?.type === "error" ? "is-error" : "is-success"}" role="status" aria-live="polite" ${feedback?.message ? "" : "hidden"}>
+            <span class="notification-feedback-icon" data-notification-feedback-icon aria-hidden="true">${feedback?.type === "error" ? "!" : "✓"}</span>
+            <span data-notification-feedback-message>${escapeHtml(feedback?.message || "")}</span>
+          </span>
         </section>`;
 
       const showFeedback = (message, type = "success") => {
         state.notificationChannelFeedback = { message, type };
         const feedbackElement = container.querySelector("#notificationChannelFeedback");
         if (feedbackElement) {
-          feedbackElement.textContent = message;
-          feedbackElement.style.color = type === "error" ? "var(--destructive)" : "var(--success)";
+          feedbackElement.classList.toggle("is-error", type === "error");
+          feedbackElement.classList.toggle("is-success", type !== "error");
+          feedbackElement.hidden = false;
+          const icon = feedbackElement.querySelector("[data-notification-feedback-icon]");
+          const text = feedbackElement.querySelector("[data-notification-feedback-message]");
+          if (icon) icon.textContent = type === "error" ? "!" : "✓";
+          if (text) text.textContent = message;
         }
       };
       const reloadChannels = async () => {
@@ -8646,6 +8668,54 @@ docker compose up -d
         state.notificationChannelFeedback = null;
         state.notificationChannelEditor = { channel, channelType: channel.channel_type, name: channel.name };
         renderNotificationChannelManager();
+      }));
+      container.querySelectorAll("[data-notification-test-open]").forEach(button => button.addEventListener("click", () => {
+        const dialog = document.getElementById(`notificationTestDialog-${button.dataset.notificationTestOpen}`);
+        if (!dialog || dialog.open) return;
+        const errorElement = dialog.querySelector("[data-notification-test-error]");
+        if (errorElement) {
+          errorElement.hidden = true;
+          errorElement.textContent = "";
+        }
+        dialog.showModal();
+      }));
+      container.querySelectorAll("[data-notification-test-close]").forEach(button => button.addEventListener("click", () => {
+        const dialog = button.closest("dialog");
+        if (dialog?.open) dialog.close();
+      }));
+      container.querySelectorAll("[data-notification-test-form]").forEach(form => form.addEventListener("submit", async event => {
+        event.preventDefault();
+        const channelId = form.dataset.notificationTestForm;
+        const sendButton = form.querySelector("[data-notification-test-submit]");
+        const errorElement = form.querySelector("[data-notification-test-error]");
+        const dialog = form.closest("dialog");
+        if (!channelId || !sendButton || sendButton.disabled) return;
+        sendButton.disabled = true;
+        sendButton.textContent = "Enviando...";
+        if (errorElement) {
+          errorElement.hidden = true;
+          errorElement.textContent = "";
+        }
+        try {
+          const result = await apiPost(`/api/v1/notification-channels/${encodeURIComponent(channelId)}/test-email`, {});
+          const recipients = Array.isArray(result?.recipients) ? result.recipients : [];
+          if (dialog?.open) dialog.close();
+          state.notificationChannelFeedback = {
+            message: `Correo de prueba enviado a ${recipients.join(", ")}.`,
+            type: "success",
+          };
+          renderNotificationChannelManager();
+        } catch (error) {
+          if (errorElement) {
+            errorElement.textContent = `No se pudo enviar el correo de prueba: ${error.message}`;
+            errorElement.hidden = false;
+          }
+        } finally {
+          if (sendButton.isConnected) {
+            sendButton.disabled = false;
+            sendButton.textContent = "Enviar prueba";
+          }
+        }
       }));
       container.querySelectorAll("[data-notification-toggle]").forEach(button => button.addEventListener("click", async () => {
         const channel = channels.find(item => item.id === button.dataset.notificationToggle);

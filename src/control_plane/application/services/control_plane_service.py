@@ -2983,6 +2983,23 @@ class ControlPlaneService:
             "updated_at": channel.updated_at,
         }
 
+    def send_test_notification_email(self, channel_id: str) -> Dict[str, Any]:
+        channel = self.get_notification_channel(channel_id)
+        if channel is None:
+            raise ValueError("notification channel not found")
+        if channel.channel_type != "smtp":
+            raise ValueError("test email is only supported for SMTP channels")
+
+        config = self._notification_channel_config(channel)
+        recipients = list(config["to"])
+        payload = {
+            "event": "notification.test",
+            "channel_name": channel.name,
+            "message": "This is a test email from Vaultline notification settings.",
+        }
+        self._send_notification_channel(channel, payload, subject="Vaultline SMTP test email")
+        return {"recipients": recipients}
+
     def update_notification_channel(
         self,
         channel_id: str,
@@ -3111,7 +3128,12 @@ class ControlPlaneService:
                     type(exc).__name__,
                 )
 
-    def _send_notification_channel(self, channel: NotificationChannelRecord, payload: Dict[str, Any]) -> None:
+    def _send_notification_channel(
+        self,
+        channel: NotificationChannelRecord,
+        payload: Dict[str, Any],
+        subject: Optional[str] = None,
+    ) -> None:
         config = self._notification_channel_config(channel)
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
@@ -3132,7 +3154,7 @@ class ControlPlaneService:
             return
 
         message = EmailMessage()
-        message["Subject"] = f"Backup failed: {payload['job_id']}"
+        message["Subject"] = subject if subject is not None else f"Backup failed: {payload['job_id']}"
         message["From"] = config["from"]
         message["To"] = ", ".join(config["to"])
         message.set_content(serialized.decode("utf-8"))

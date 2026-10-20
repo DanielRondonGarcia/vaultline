@@ -1,4 +1,5 @@
 import json
+import smtplib
 import tempfile
 import unittest
 from pathlib import Path
@@ -200,6 +201,66 @@ class NotificationChannelRouteTests(unittest.TestCase):
         delete_handler._require_auth.assert_called_once_with(ROLE_ADMIN, api_mode=True)
         service.delete_notification_channel.assert_called_once_with("channel-1")
         delete_handler._write_json.assert_called_once_with(204, {})
+
+    def test_admin_can_send_test_email_and_non_admin_cannot(self):
+        recipients = ["oncall@example.test", "admin@example.test"]
+        service = Mock()
+        service.send_test_notification_email.return_value = {"recipients": recipients}
+        handler = self._handler(
+            "/api/v1/notification-channels/channel-1/test-email",
+            service,
+        )
+
+        handler.do_POST()
+
+        handler._require_auth.assert_called_once_with(ROLE_ADMIN, api_mode=True)
+        service.send_test_notification_email.assert_called_once_with("channel-1")
+        handler._write_json.assert_called_once_with(200, {"recipients": recipients})
+
+        denied_service = Mock()
+        denied = self._handler(
+            "/api/v1/notification-channels/channel-1/test-email",
+            denied_service,
+        )
+        denied._require_auth.return_value = False
+
+        denied.do_POST()
+
+        denied._require_auth.assert_called_once_with(ROLE_ADMIN, api_mode=True)
+        denied._control_plane_service.assert_not_called()
+        denied_service.send_test_notification_email.assert_not_called()
+
+        failed_service = Mock()
+        failed_service.send_test_notification_email.side_effect = smtplib.SMTPRecipientsRefused(
+            {"oncall@example.test": (550, b"private-smtp-detail")}
+        )
+        failed = self._handler(
+            "/api/v1/notification-channels/channel-1/test-email",
+            failed_service,
+        )
+
+        failed.do_POST()
+
+        failed._write_json.assert_called_once_with(
+            502,
+            {"error": "No se pudo enviar el correo de prueba. Verifica la configuración SMTP."},
+        )
+        self.assertNotIn("private-smtp-detail", str(failed._write_json.call_args))
+
+        invalid_service = Mock()
+        invalid_service.send_test_notification_email.side_effect = ValueError("INTERNAL_SMTP_DETAIL_SENTINEL")
+        invalid = self._handler(
+            "/api/v1/notification-channels/channel-1/test-email",
+            invalid_service,
+        )
+
+        invalid.do_POST()
+
+        invalid._write_json.assert_called_once_with(
+            502,
+            {"error": "No se pudo enviar el correo de prueba. Verifica la configuración SMTP."},
+        )
+        self.assertNotIn("INTERNAL_SMTP_DETAIL_SENTINEL", str(invalid._write_json.call_args))
 
     def test_channel_collection_requires_admin_before_loading_configuration(self):
         handler = object.__new__(ControlPlaneRequestHandler)

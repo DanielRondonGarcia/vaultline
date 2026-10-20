@@ -7,7 +7,7 @@ Configura uno o más webhooks o destinos de correo en **Settings → Notificacio
 1. Inicia sesión con una cuenta **administradora** y abre **Settings**.
 2. En **Notificaciones de backups fallidos**, selecciona **Agregar canal** y elige **Webhook** o **Correo SMTP**.
 3. Completa los datos del destino y guarda. Repite para añadir otros destinos; cada canal puede activarse o desactivarse por separado.
-4. Comprueba la entrega con el siguiente backup que falle. La interfaz no envía mensajes de prueba.
+4. Para validar un canal SMTP, selecciona **Enviar correo de prueba** en su tarjeta. La ventana modal muestra todos los destinatarios configurados y solicita confirmación antes de enviar; utiliza las credenciales guardadas y no modifica el canal ni inicia un backup. Los webhooks no tienen envío de prueba en la interfaz.
 
 ## Webhook
 
@@ -25,6 +25,8 @@ Configura uno o más webhooks o destinos de correo en **Settings → Notificacio
 | Remitente, destinatarios | Direcciones de correo; separa varios destinatarios con comas. |
 | Seguridad | `STARTTLS` (por defecto y recomendado), `SSL/TLS` o `Sin TLS`. Usa Sin TLS solo en una red confiable. |
 | Usuario y contraseña | Opcionales, pero deben configurarse juntos. Se cifran al guardarse; nunca se devuelven a la interfaz. En edición, déjalos vacíos para conservar las credenciales guardadas; para rotarlas, indica ambos valores. |
+
+La prueba SMTP se envía de forma inmediata al confirmar y puede llegar a todas las direcciones configuradas. Comprueba los destinatarios en la ventana modal antes de enviarla.
 
 ## Qué se envía y cómo se comporta
 

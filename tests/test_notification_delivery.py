@@ -259,8 +259,53 @@ class NotificationDeliveryTests(unittest.TestCase):
         client.login.assert_called_once_with("smtp-user", "smtp-password")
         message = client.send_message.call_args.args[0]
         self.assertEqual(message["To"], "oncall@example.test")
+        self.assertEqual(message["Subject"], "Backup failed: job-1")
         self.assertEqual(json.loads(message.get_content()), payload)
         self.assertNotIn("log_lines", message.get_content())
+
+
+    def test_test_email_sends_to_configured_recipients_without_mutating_channel(self):
+        channel = self.service.create_notification_channel(
+            name="On-call email",
+            channel_type="smtp",
+            config={
+                "host": "mail.internal",
+                "port": 587,
+                "from": "backup@example.test",
+                "to": ["oncall@example.test", "admin@example.test"],
+                "security": "starttls",
+                "username": "smtp-user",
+                "password": "smtp-password",
+            },
+        )
+        before = self.service.notification_channel_public_view(channel)
+        client = Mock()
+        manager = Mock()
+        manager.__enter__ = Mock(return_value=client)
+        manager.__exit__ = Mock(return_value=False)
+
+        with patch("smtplib.SMTP", return_value=manager) as smtp:
+            result = self.service.send_test_notification_email(channel.id)
+
+        self.assertEqual(result, {"recipients": ["oncall@example.test", "admin@example.test"]})
+        smtp.assert_called_once_with("mail.internal", 587, timeout=5)
+        client.starttls.assert_called_once()
+        client.login.assert_called_once_with("smtp-user", "smtp-password")
+        message = client.send_message.call_args.args[0]
+        self.assertEqual(message["Subject"], "Vaultline SMTP test email")
+        self.assertEqual(message["To"], "oncall@example.test, admin@example.test")
+        payload = json.loads(message.get_content())
+        self.assertEqual(payload["event"], "notification.test")
+        self.assertEqual(payload["channel_name"], "On-call email")
+        self.assertNotIn("smtp-password", message.get_content())
+        after = next(
+            self.service.notification_channel_public_view(item)
+            for item in self.service.list_notification_channels()
+            if item.id == channel.id
+        )
+        self.assertEqual(after, before)
+        with self.assertRaisesRegex(ValueError, "SMTP"):
+            self.service.send_test_notification_email(self.channel.id)
 
 
 if __name__ == "__main__":

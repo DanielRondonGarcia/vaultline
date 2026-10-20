@@ -1,4 +1,4 @@
-ARG PYTHON_BASE_IMAGE=python:3.11-slim-bookworm
+ARG PYTHON_BASE_IMAGE=python:3.11.17-slim-bookworm
 FROM ${PYTHON_BASE_IMAGE} AS app-base
 
 # Install system dependencies. Docker CLI installation is optional so the
@@ -43,6 +43,13 @@ COPY src /app/src
 
 # Set PYTHONPATH to /app so python can find 'src'
 ENV PYTHONPATH=/app
+
+# Assert the exact pinned CPython runtime can compile every source file and
+# really start the Control Plane before any image target is built or pushed
+# from this base. Fails the build on version drift or a startup SyntaxError.
+COPY .python-version /app/.python-version
+COPY scripts/check_python_runtime.py /app/scripts/check_python_runtime.py
+RUN python scripts/check_python_runtime.py
 
 ARG APP_VERSION=dev
 ENV APP_VERSION=${APP_VERSION}

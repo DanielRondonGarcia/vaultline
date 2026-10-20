@@ -240,7 +240,8 @@ class SchedulerDeploymentTests(unittest.TestCase):
         self.assertIn("CONTROL_PLANE_TIMEZONE: ${CONTROL_PLANE_TIMEZONE:-America/Bogota}", control_plane_ghcr_compose)
         self.assertIn("tzdata", (ROOT / "Dockerfile").read_text())
         self.assertIn("pull_request:", workflow)
-        self.assertIn("python-version: \"3.11\"", workflow)
+        self.assertIn("python-version-file: .python-version", workflow)
+        self.assertIn("python scripts/check_python_runtime.py", workflow)
         self.assertIn("python -m pip install -r requirements.txt", workflow)
         self.assertIn("python -m unittest discover tests", workflow)
 

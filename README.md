@@ -316,7 +316,52 @@ docker compose -f deploy/worker/docker-compose.yml down
 
 ## Testing
 
-Los casos de prueba viven en [`test/`](test/):
+### Versión de Python exacta
+
+Todo el proyecto usa **una sola versión exacta de Python fijada en `.python-version`**
+(actualmente `3.11.17`, con patch incluido). Docker, CI, los builds nativos y los
+fixtures de integración leen la misma referencia; el script
+`scripts/check_python_runtime.py` verifica el interprete, compila todo `src` en
+memoria y arranca realmente el Control Plane en modo memoria antes de ejecutar
+tests o publicar imágenes.
+
+Para preparar el interprete local (`python 3.11.17`) y el `.venv` del proyecto,
+usa una instalación gestionada por usuario, por ejemplo:
+
+```bash
+uv venv          # lee .python-version y crea .venv con esa versión exacta
+```
+
+En CI, `actions/setup-python` lee `python-version-file: .python-version`;
+Docker y los builds nativos usan interpretes checksum-verified del mismo release.
+La fijación no añade ni modifica ningún Python global del host: el proyecto solo
+consume el interprete que exista en `.venv`.
+
+Nota Windows: la base de zonas IANA (tzdata) se instala automáticamente con el
+projecto (`tzdata; sys_platform == "win32"` en `requirements.txt`), ya que Windows
+no incluye la base de zonas que necesita `zoneinfo`; en Linux/Docker la aporta el
+sistema operativo.
+
+### Ejecutar los tests
+
+Los tests unitarios viven en [`tests/`](tests/):
+
+```powershell
+.venv\Scripts\python.exe scripts\check_python_runtime.py
+.venv\Scripts\python.exe -m unittest discover tests
+```
+
+<details>
+<summary>Linux / macOS</summary>
+
+```bash
+.venv/bin/python scripts/check_python_runtime.py
+.venv/bin/python -m unittest discover tests
+```
+</details>
+
+Los fixtures de integración siguen en [`test/`](test/) y se ejercitan con
+`docker compose`, por ejemplo:
 
 ```bash
 cd test/backing-up-locally/

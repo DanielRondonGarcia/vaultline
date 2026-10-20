@@ -3,6 +3,7 @@ import tempfile
 import threading
 import unittest
 from datetime import timedelta
+from unittest.mock import patch
 
 from src.control_plane.application.services.control_plane_service import ControlPlaneService
 from src.control_plane.domain.models import JobRecord, JobStatus, WorkerRecord, utcnow
@@ -99,9 +100,14 @@ class JobOwnershipTests(unittest.TestCase):
         claimed = service.fetch_jobs_for_worker("worker-a")[0]
         original_expiry = claimed.lease_expires_at
 
-        renewed = service.renew_job_lease("worker-a", job.id, claimed.lease_token)
+        # Advance the renewal clock explicitly: Windows can return the same
+        # timestamp for a claim and an immediate renewal on CPython 3.11.
+        renewal_time = original_expiry - timedelta(seconds=service.JOB_LEASE_DURATION_SECONDS - 1)
+        with patch("src.control_plane.infrastructure.repositories.in_memory.utcnow", return_value=renewal_time), \
+                patch("src.control_plane.application.services.control_plane_service.utcnow", return_value=renewal_time):
+            renewed = service.renew_job_lease("worker-a", job.id, claimed.lease_token)
 
-        self.assertGreater(renewed.lease_expires_at, original_expiry)
+        self.assertEqual(renewed.lease_expires_at, original_expiry + timedelta(seconds=1))
         self.assertIsNotNone(service.worker_repository.get("worker-a").last_seen_at)
         with self.assertRaisesRegex(ValueError, "invalid or stale"):
             service.renew_job_lease("worker-a", job.id, "wrong-token")
@@ -115,8 +121,14 @@ class JobOwnershipTests(unittest.TestCase):
             sqlite_service = self.make_service(SQLiteJobRepository(f"{directory}/control-plane.db"))
             sqlite_job = sqlite_service.dispatch_job("worker-a", "worker.self_check")
             sqlite_claimed = sqlite_service.fetch_jobs_for_worker("worker-a")[0]
-            sqlite_renewed = sqlite_service.renew_job_lease("worker-a", sqlite_job.id, sqlite_claimed.lease_token)
-            self.assertGreater(sqlite_renewed.lease_expires_at, sqlite_claimed.lease_expires_at)
+            sqlite_original_expiry = sqlite_claimed.lease_expires_at
+            sqlite_renewal_time = sqlite_original_expiry - timedelta(
+                seconds=sqlite_service.JOB_LEASE_DURATION_SECONDS - 1
+            )
+            with patch("src.control_plane.infrastructure.repositories.sqlite.utcnow", return_value=sqlite_renewal_time), \
+                    patch("src.control_plane.application.services.control_plane_service.utcnow", return_value=sqlite_renewal_time):
+                sqlite_renewed = sqlite_service.renew_job_lease("worker-a", sqlite_job.id, sqlite_claimed.lease_token)
+            self.assertEqual(sqlite_renewed.lease_expires_at, sqlite_original_expiry + timedelta(seconds=1))
 
     def test_reported_renewal_failure_is_preserved_until_expiry(self):
         service = self.make_service()

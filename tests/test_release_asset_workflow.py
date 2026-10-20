@@ -101,7 +101,9 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
 
     def test_windows_build_names_smokes_and_uploads_exact_exe(self):
         self.assertIn("runs-on: windows-2022", self.workflow)
-        self.assertIn("python-version: '3.11'", self.workflow)
+        # setup-python@v5 was replaced by a checksum-verified pinned PBS
+        # interpreter; no floating python-version input may return.
+        self.assertNotIn("python-version:", self.windows_job())
         self.assertIn("vaultline-worker_${{ needs.prepare.outputs.new_version }}_windows-amd64.exe", self.workflow)
         self.assertRegex(self.workflow, r"vaultline-worker(?:\.exe)? --help")
         self.assertIn("actions/upload-artifact@v4", self.workflow)
@@ -258,7 +260,7 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
     def test_release_image_builds_use_mirror_pinned_python_base_image(self):
         self.assertRegex(
             self.dockerfile,
-            r"(?m)^ARG PYTHON_BASE_IMAGE=python:3\.11-slim-bookworm$",
+            r"(?m)^ARG PYTHON_BASE_IMAGE=python:3\.11\.17-slim-bookworm$",
         )
         self.assertRegex(self.dockerfile, r"(?m)^FROM \$\{PYTHON_BASE_IMAGE\} AS app-base$")
 

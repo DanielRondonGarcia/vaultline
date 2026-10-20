@@ -152,6 +152,7 @@ jobs:
               export LD_LIBRARY_PATH="/tmp/pbs/python/lib:${LD_LIBRARY_PATH:-}"
               python -c "import pathlib, sysconfig; shared = sysconfig.get_config_var(\"Py_ENABLE_SHARED\"); assert shared == 1, f\"Py_ENABLE_SHARED={shared}\"; assert pathlib.Path(\"/tmp/pbs/python/lib/libpython3.11.so\").is_file(), \"missing libpython3.11.so\"; print(\"Py_ENABLE_SHARED=1\")"
               python -m pip install -r requirements-build.txt
+              python scripts/check_python_runtime.py
               python scripts/set_worker_build_version.py "${{ needs.prepare.outputs.new_version }}"
               python /workspace/scripts/download_pinned_restic.py --platform linux --arch "${{ matrix.arch }}" --output-dir /tmp/vaultline-restic
               python /workspace/scripts/download_pinned_rclone.py --platform linux --arch "${{ matrix.arch }}" --output-dir /tmp/vaultline-rclone
@@ -188,16 +189,48 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      # setup-python@v5 offers no exact 3.11.17 interpreter on Windows, so use
+      # the checksum-verified python-build-standalone install-only archive for
+      # the same 20261003 release already pinned for the Linux native builds.
+      - name: Download pinned Python 3.11.17 runtime
+        shell: pwsh
+        env:
+          PBS_PYTHON_SHA256: 0f7defa7a0ed99b61e0df0bba5027474711521f1307cc3830c2f456401beeed5
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Archive = Join-Path $env:RUNNER_TEMP "cpython-3.11.17-pbs-windows-install_only.tar.gz"
+          $Url = 'https://github.com/astral-sh/python-build-standalone/releases/download/20261003/cpython-3.11.17%2B20261003-x86_64-pc-windows-msvc-install_only.tar.gz'
+          Invoke-WebRequest -Uri $Url -OutFile $Archive
+          $Digest = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($Digest -ne $env:PBS_PYTHON_SHA256) { throw "python archive checksum mismatch: expected $env:PBS_PYTHON_SHA256, got $Digest" }
+          $InstallDir = Join-Path $env:RUNNER_TEMP "python-3.11.17"
+          New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+          tar -xzf $Archive -C $InstallDir
+          if ($LASTEXITCODE -ne 0) { throw "pinned PBS python extract exited with $LASTEXITCODE" }
+          # install_only archives root at ./python; put the interpreter and its
+          # Scripts directory on PATH so every later step runs the same build.
+          Add-Content $env:GITHUB_PATH (Join-Path $InstallDir "python")
+          Add-Content $env:GITHUB_PATH (Join-Path $InstallDir "python\Scripts")
+
+      - name: Verify pinned Python runtime against .python-version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $Pinned = (Get-Content -LiteralPath .python-version).Trim()
+          $Actual = python -c "import sys; print('%d.%d.%d' % sys.version_info[:3])"
+          if ($LASTEXITCODE -ne 0) { throw "python -c version probe exited with $LASTEXITCODE" }
+          if ($Actual -ne $Pinned) { throw "python runtime mismatch: .python-version pins $Pinned, running on $Actual" }
+          $ResolvedPython = (Get-Command python).Source
+          if (-not ($ResolvedPython -like (Join-Path $env:RUNNER_TEMP "*"))) { throw "python resolved to $ResolvedPython outside the pinned RUNNER_TEMP install" }
+          Write-Host "Pinned CPython $Pinned is on PATH at $ResolvedPython"
 
       - name: Build onefile worker
         shell: pwsh
         run: |
           python scripts/set_worker_build_version.py "${{ needs.prepare.outputs.new_version }}"
           python -m pip install -r requirements-build.txt
+          python scripts/check_python_runtime.py
+          if ($LASTEXITCODE -ne 0) { throw "pinned runtime/startup check exited with $LASTEXITCODE" }
           $ResticOutput = Join-Path $env:RUNNER_TEMP "vaultline-restic-v0.19.1"
           $RcloneOutput = Join-Path $env:RUNNER_TEMP "vaultline-rclone-v1.75.2"
           python scripts/download_pinned_restic.py --platform windows --arch amd64 --output-dir "$ResticOutput"

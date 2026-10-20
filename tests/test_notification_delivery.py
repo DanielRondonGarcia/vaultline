@@ -153,20 +153,29 @@ class NotificationDeliveryTests(unittest.TestCase):
             "password": "must-not-be-included",
             "arbitrary_payload": {"private": "must-not-be-included"},
         }
-        self.job.log_lines = ["raw log private-token"]
+        # Log line matches the regex pattern: token=secret
+        self.job.log_lines = ["raw log with token=private-token and password=secret123 here"]
 
         payload = self.service._build_failure_notification_payload(self.job)
         serialized = json.dumps(payload, ensure_ascii=False)
 
         self.assertEqual(payload["event"], "backup.failed")
         self.assertEqual(payload["job_id"], self.job.id)
-        self.assertNotIn("log", serialized.lower())
-        self.assertNotIn("raw worker", serialized)
+        # log_lines are now included but redacted - no secrets
         self.assertNotIn("private-token", serialized)
+        self.assertNotIn("raw worker", serialized)
         self.assertNotIn("must-not-be-included", serialized)
+        self.assertNotIn("secret123", serialized)
         self.assertIn("<redacted>", serialized)
         self.assertLessEqual(len(serialized.encode("utf-8")), 8192)
         self.assertLessEqual(len(payload["summary"]["error"]), 2048)
+        # log_lines are present and redacted
+        self.assertIn("log_lines", payload)
+        log_lines = payload.get("log_lines", [])
+        self.assertIsInstance(log_lines, list)
+        self.assertNotIn("private-token", " ".join(log_lines))
+        self.assertNotIn("secret123", " ".join(log_lines))
+        self.assertIn("<redacted>", " ".join(log_lines))
 
     def test_attempt_claim_is_atomic_and_survives_repository_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -259,9 +268,26 @@ class NotificationDeliveryTests(unittest.TestCase):
         client.login.assert_called_once_with("smtp-user", "smtp-password")
         message = client.send_message.call_args.args[0]
         self.assertEqual(message["To"], "oncall@example.test")
-        self.assertEqual(message["Subject"], "Backup failed: job-1")
-        self.assertEqual(json.loads(message.get_content()), payload)
-        self.assertNotIn("log_lines", message.get_content())
+        self.assertEqual(message["Subject"], "Backup fallido: job-1")
+        # Multipart: extract plain text and HTML parts
+        self.assertEqual(message.get_content_type(), "multipart/alternative")
+        parts = message.get_payload()
+        plain_parts = [p for p in parts if p.get_content_type() == "text/plain"]
+        html_parts = [p for p in parts if p.get_content_type() == "text/html"]
+        self.assertEqual(len(plain_parts), 1)
+        self.assertEqual(len(html_parts), 1)
+        # Plain text part: readable summary, no JSON
+        plain_text = plain_parts[0].get_content()
+        self.assertIn("Backup fallido: job-1", plain_text)
+        self.assertIn("safe failure", plain_text)
+        self.assertNotIn("log_lines", plain_text)
+        self.assertNotIn("private", plain_text.lower())
+        self.assertNotIn("event", plain_text)
+        # HTML part
+        html_body = html_parts[0].get_content()
+        self.assertIn("Backup fallido", html_body)
+        self.assertIn("safe failure", html_body)
+        self.assertIn("job-1", html_body)
 
 
     def test_test_email_sends_to_configured_recipients_without_mutating_channel(self):
@@ -306,6 +332,60 @@ class NotificationDeliveryTests(unittest.TestCase):
         self.assertEqual(after, before)
         with self.assertRaisesRegex(ValueError, "SMTP"):
             self.service.send_test_notification_email(self.channel.id)
+
+    def test_html_email_includes_control_plane_link_when_configured(self):
+        """Verify that a configured control_plane_public_url appears in the HTML body link."""
+        channel = self.service.create_notification_channel(
+            name="On-call email",
+            channel_type="smtp",
+            config={
+                "host": "mail.internal",
+                "port": 587,
+                "from": "backup@example.test",
+                "to": ["oncall@example.test"],
+                "security": "starttls",
+                "username": "smtp-user",
+                "password": "smtp-password",
+            },
+        )
+        # Save a settings record with a public URL
+        settings_repo = InMemorySettingsRepository()
+        from src.control_plane.domain.models import SettingsRecord
+        settings_repo.save(SettingsRecord(control_plane_public_url="https://backups.miempresa.com"))
+        service_with_settings = ControlPlaneService(
+            worker_repository=self.workers,
+            inventory_repository=InMemoryInventoryRepository(),
+            target_repository=InMemoryTargetRepository(),
+            job_repository=self.jobs,
+            storage_profile_repository=InMemoryStorageProfileRepository(),
+            secret_repository=InMemorySecretRepository(),
+            snapshot_repository=InMemorySnapshotRepository(),
+            retention_policy_repository=InMemoryRetentionPolicyRepository(),
+            target_stats_repository=InMemoryTargetStatsRepository(),
+            secret_codec=self.codec,
+            settings_repository=settings_repo,
+            cache_repository=InMemoryCacheRepository(),
+            index_repository=InMemoryIndexRepository(),
+            notification_channel_repository=self.channels,
+        )
+        client = Mock()
+        manager = Mock()
+        manager.__enter__ = Mock(return_value=client)
+        manager.__exit__ = Mock(return_value=False)
+        payload = {"event": "backup.failed", "job_id": "job-abc123", "target_id": "target-a", "started_at": "2026-10-20T08:14:14", "finished_at": "2026-10-20T08:39:39", "summary": {"error": "docker socket timeout"}}
+
+        with patch("smtplib.SMTP", return_value=manager) as smtp:
+            service_with_settings._send_notification_channel(channel, payload)
+
+        message = client.send_message.call_args.args[0]
+        parts = message.get_payload()
+        html_parts = [part for part in parts if part.get_content_type() == "text/html"]
+        self.assertEqual(len(html_parts), 1)
+        html_body = html_parts[0].get_content()
+        self.assertIn("https://backups.miempresa.com/#/jobs", html_body)
+        self.assertIn("docker socket timeout", html_body)
+        self.assertIn("job-abc123", html_body)
+        self.assertIn("Ver trabajos en el sistema de backups", html_body)
 
 
 if __name__ == "__main__":

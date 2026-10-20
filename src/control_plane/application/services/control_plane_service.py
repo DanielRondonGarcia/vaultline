@@ -3084,6 +3084,13 @@ class ControlPlaneService:
                 if value is not None:
                     summary[key] = value
 
+        # Add limited redacted log lines for context
+        log_lines = []
+        try:
+            log_lines = self._bounded_job_log_lines(job)[:50]  # Cap at 50 lines for notifications
+        except Exception:
+            pass
+
         payload = {
             "event": "backup.failed",
             "job_id": str(job.id)[:128],
@@ -3093,11 +3100,13 @@ class ControlPlaneService:
             "started_at": job.started_at.isoformat() if job.started_at else None,
             "finished_at": job.finished_at.isoformat() if job.finished_at else None,
             "summary": summary,
+            "log_lines": log_lines,
         }
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
             error = summary.get("error")
             payload["summary"] = {"error": error[:512]} if isinstance(error, str) else {}
+            payload["log_lines"] = log_lines[:20]  # Further reduce if needed
             serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
             payload["summary"] = {}
@@ -3128,6 +3137,132 @@ class ControlPlaneService:
                     type(exc).__name__,
                 )
 
+    @staticmethod
+    def _escape_html(text: str) -> str:
+        """Minimal HTML escaping."""
+        return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
+
+    def _build_html_email_body(self, payload: Dict[str, Any], control_plane_url: str) -> str:
+        """Build a professional HTML email body for backup failure notifications."""
+        job_id = payload.get("job_id", "unknown")
+        target_id = payload.get("target_id", "unknown")
+        started_at = payload.get("started_at", "")
+        finished_at = payload.get("finished_at", "")
+        summary = payload.get("summary") or {}
+        error = summary.get("error", "")
+        status_code = summary.get("status_code")
+        state = summary.get("state", "")
+        source = summary.get("source", "")
+        recovery = summary.get("recovery", "")
+        diag_code = summary.get("diagnostic_code", "")
+        diag_category = summary.get("diagnostic_category", "")
+        diag_message = summary.get("diagnostic_message", "")
+        log_lines = payload.get("log_lines") or []
+
+        # Build log section
+        log_html = ""
+        if log_lines:
+            log_rows = ""
+            for line in log_lines:
+                safe_line = self._escape_html(str(line))
+                log_rows += f'<div style="padding:2px 0;font-family:monospace;font-size:12px;line-height:1.5;color:#495057;white-space:pre-wrap;word-break:break-all;">{safe_line}</div>'
+            log_html = f'''<div style="margin-top:16px;border:1px solid #dee2e6;border-radius:4px;overflow:hidden;">
+              <div style="background:#f8f9fa;padding:8px 12px;font-size:12px;font-weight:600;color:#495057;border-bottom:1px solid #dee2e6;">Registro de error</div>
+              <div style="padding:12px;max-height:320px;overflow-y:auto;background:#fff;font-family:monospace;font-size:12px;line-height:1.5;">{log_rows}</div>
+            </div>'''
+
+        # Build job detail link
+        if control_plane_url:
+            base = control_plane_url.rstrip("/")
+            detail_url = f"{base}/#/jobs"
+        else:
+            detail_url = ""
+
+        # Build diagnostic badge if present
+        diag_badge = ""
+        if diag_category or diag_code:
+            badge_text = f"{diag_code}" if diag_code else diag_category
+            diag_badge = f'<span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;color:#fff;background:#dc3545;vertical-align:middle;margin-left:8px;">{self._escape_html(badge_text)}</span>'
+
+        # Build recovery info
+        recovery_html = ""
+        if recovery:
+            recovery_html = f'<div style="margin-top:16px;padding:12px 16px;background:#f8f9fa;border-left:4px solid #17a2b8;border-radius:4px;"><strong>Recuperación sugerida:</strong> {self._escape_html(str(recovery))}</div>'
+
+        # Build diagnostic info
+        diag_html = ""
+        if diag_message:
+            diag_html = f'<div style="margin-top:8px;padding:12px 16px;background:#fff3cd;border-left:4px solid #ffc107;border-radius:4px;"><strong>Diagnóstico:</strong> {self._escape_html(str(diag_message))}</div>'
+
+        # Build target info
+        target_display = self._escape_html(str(target_id)) if target_id and str(target_id) != "None" else "\u2014"
+
+        # Build state/status row
+        state_row = ""
+        if state:
+            state_row = f'<tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Estado</td><td style="padding:8px 0;border-bottom:1px solid #eee;font-weight:600;">{self._escape_html(str(state))}</td></tr>'
+
+        # Build source row
+        source_row = ""
+        if source:
+            source_row = f'<tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Origen</td><td style="padding:8px 0;border-bottom:1px solid #eee;">{self._escape_html(str(source))}</td></tr>'
+
+        # Build status code row
+        code_row = ""
+        if status_code is not None:
+            code_row = f'<tr><td style="padding:8px 0;color:#6c757d;">Código</td><td style="padding:8px 0;font-weight:600;">{status_code}</td></tr>'
+
+        html = f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body style="margin:0;padding:0;background:#f4f6f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Oxygen,Ubuntu,sans-serif;">
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6f9;padding:24px 0;">
+    <tr>
+      <td align="center">
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.08);max-width:600px;width:100%;">
+          <tr>
+            <td style="background:#dc3545;padding:20px 24px;color:#fff;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                <tr>
+                  <td style="font-size:18px;font-weight:700;">Backup fallido</td>
+                  <td align="right" style="font-size:13px;opacity:.9;">{self._escape_html(finished_at) if finished_at else ""}</td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px;">
+              <p style="margin:0 0 20px;color:#495057;font-size:15px;line-height:1.5;">Se ha detectado un fallo en un trabajo de backup. A continuación se muestra el resumen:</p>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+                <tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Identificador del trabajo</td><td style="padding:8px 0;border-bottom:1px solid #eee;"><code style="background:#f1f3f5;padding:3px 8px;border-radius:4px;font-size:13px;">{self._escape_html(job_id)}</code></td></tr>
+                <tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Target</td><td style="padding:8px 0;border-bottom:1px solid #eee;font-weight:600;">{target_display}</td></tr>
+                {state_row}
+                {code_row}
+                {source_row}
+                <tr><td style="padding:8px 0;color:#6c757d;">Inicio</td><td style="padding:8px 0;">{self._escape_html(started_at) if started_at else "\u2014"}</td></tr>
+                <tr><td style="padding:8px 0;color:#6c757d;">Finalización</td><td style="padding:8px 0;">{self._escape_html(finished_at) if finished_at else "\u2014"}</td></tr>
+              </table>
+              {f'<div style="margin-bottom:16px;padding:12px 16px;background:#f8d7da;border-left:4px solid #dc3545;border-radius:4px;"><strong>Error:</strong> <span style="color:#721c24;">{self._escape_html(error)}{diag_badge}</span></div>' if error else ''}
+              {recovery_html}
+              {diag_html}
+              {log_html}
+              {f'<div style="margin-top:24px;text-align:center;"><a href="{detail_url}" style="display:inline-block;padding:10px 24px;background:#007bff;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;font-size:14px;">Ver trabajos en el sistema de backups</a></div>' if detail_url else ''}
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:16px 24px;background:#f8f9fa;border-top:1px solid #e9ecef;text-align:center;font-size:12px;color:#868e96;">Notificación automática del sistema Vaultline \u00b7 No responda a este correo</td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>"""
+        return html
+
     def _send_notification_channel(
         self,
         channel: NotificationChannelRecord,
@@ -3153,11 +3288,63 @@ class ControlPlaneService:
                 raise ValueError("notification webhook returned a non-success response")
             return
 
+        # --- SMTP: build a professional multipart/alternative email ---
         message = EmailMessage()
-        message["Subject"] = subject if subject is not None else f"Backup failed: {payload['job_id']}"
+        if subject is not None:
+            message["Subject"] = subject
+        elif payload.get("event") == "backup.failed":
+            job_id = payload.get("job_id", "unknown")
+            target = payload.get("target_id", "")
+            target_display = f" ({target})" if target and target != "None" else ""
+            message["Subject"] = f"Backup fallido: {job_id}{target_display}"
+        else:
+            message["Subject"] = f"Backup failed: {payload.get('job_id', 'unknown')}"
+
         message["From"] = config["from"]
         message["To"] = ", ".join(config["to"])
-        message.set_content(serialized.decode("utf-8"))
+
+        # Get the control plane public URL for the deep link
+        control_plane_url = ""
+        try:
+            settings = self.get_settings()
+            if settings:
+                control_plane_url = settings.control_plane_public_url
+        except Exception:
+            pass
+
+        # Build HTML body for backup failures
+        if payload.get("event") == "backup.failed":
+            html_body = self._build_html_email_body(payload, control_plane_url)
+            # Plain text fallback
+            job_id = payload.get("job_id", "unknown")
+            target = payload.get("target_id", "")
+            target_display = f" ({target})" if target and target != "None" else ""
+            plain_text = f"Backup fallido: {job_id}{target_display}\n"
+            if control_plane_url:
+                plain_text += f"Ver detalles: {control_plane_url}/#/jobs\n"
+            plain_text += "\nResumen del error:\n"
+            summary = payload.get("summary") or {}
+            error = summary.get("error", "")
+            if error:
+                plain_text += f"Error: {error}\n"
+            diag_msg = summary.get("diagnostic_message", "")
+            if diag_msg:
+                plain_text += f"Diagnóstico: {diag_msg}\n"
+            recovery = summary.get("recovery", "")
+            if recovery:
+                plain_text += f"Recuperación: {recovery}\n"
+            # Include log lines
+            log_lines = payload.get("log_lines") or []
+            if log_lines:
+                plain_text += f"\nRegistros ({len(log_lines)} líneas):\n"
+                for line in log_lines:
+                    plain_text += f"  {line}\n"
+
+            message.set_content(plain_text)
+            message.add_alternative(html_body, subtype="html")
+        else:
+            # For other events (test, etc.), keep JSON as plain text
+            message.set_content(serialized.decode("utf-8"))
         security = config["security"]
         context = ssl.create_default_context()
         if security == "ssl":

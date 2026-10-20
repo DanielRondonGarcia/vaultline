@@ -145,6 +145,112 @@ class NotificationDeliveryTests(unittest.TestCase):
 
         thread_factory.assert_not_called()
 
+    def test_failure_email_previews_head_and_tail_and_attaches_the_redacted_log(self):
+        smtp_channel = self.service.create_notification_channel(
+            name="Mail", channel_type="smtp",
+            config={"host": "mail.internal", "from": "backup@example.test", "to": ["oncall@example.test"]},
+        )
+        self.job.payload = {"env": {"RESTIC_PASSWORD": "known-secret"}}
+        logs = [f"INFO: step {index}" for index in range(60)]
+        logs += ["ERROR: <disk full> known-secret token=private-token lease-token"]
+        self.jobs.save(self.job)
+        channel_before = self.service.notification_channel_public_view(smtp_channel)
+        message, webhook, result = self._complete_with_mocked_delivery(logs)
+
+        self.assertEqual(result.status, JobStatus.FAILED)
+        self.assertEqual(self.jobs.get(self.job.id).status, JobStatus.FAILED)
+        self.assertEqual(self.service.notification_channel_public_view(smtp_channel), channel_before)
+        for subtype in ("plain", "html"):
+            body = message.get_body(preferencelist=(subtype,)).get_content()
+            self.assertIn("INFO: step 0", body)
+            self.assertIn("INFO: step 59", body)
+            self.assertNotIn("INFO: step 30", body)
+            self.assertIn("Contenido omitido", body)
+            self.assertIn("archivo adjunto", body)
+            self.assertIn("Registro de error", body)
+        html = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("ERROR: &lt;disk full&gt;", html)
+        self.assertNotIn("<disk full>", html)
+        self.assertGreater(html.index("Registro de error"), html.index("Ver trabajos"))
+        attachments = list(message.iter_attachments())
+        self.assertEqual(len(attachments), 1)
+        attachment = attachments[0]
+        self.assertEqual(attachment.get_filename(), "backup-job-1.log.txt")
+        self.assertEqual(attachment.get_content_type(), "text/plain")
+        self.assertEqual(attachment.get_content_charset(), "utf-8")
+        expected = "\n".join(logs[:-1] + ["ERROR: <disk full> <redacted> token=<redacted> <redacted>"]) + "\n"
+        self.assertEqual(attachment.get_content(), expected)
+        for secret in ("known-secret", "private-token", "lease-token", "smtp-password"):
+            for part in message.walk():
+                if not part.is_multipart():
+                    self.assertNotIn(secret, part.get_content())
+        self.assertNotIn("log_lines", webhook)
+        self.assertNotIn("INFO: step", json.dumps(webhook))
+        self.assertLessEqual(len(json.dumps(webhook, ensure_ascii=False).encode("utf-8")), 8192)
+        self.assertEqual(webhook["summary"]["status_code"], 1)
+
+    def test_long_unicode_logs_still_send_with_bounded_head_tail_preview(self):
+        self.service.create_notification_channel(
+            name="Mail", channel_type="smtp",
+            config={"host": "mail.internal", "from": "backup@example.test", "to": ["oncall@example.test"]},
+        )
+        logs = ["START: " + "é" * 15000, "界" * 15000, "ERROR: final backup failure"]
+        message, webhook, result = self._complete_with_mocked_delivery(logs)
+        self.assertEqual(result.status, JobStatus.FAILED)
+        body = message.get_body(preferencelist=("plain",)).get_content()
+        preview = body.split("Registro de error", 1)[1]
+        self.assertIn("START:", preview)
+        self.assertIn("ERROR: final backup failure", preview)
+        self.assertIn("Contenido omitido", preview)
+        self.assertLessEqual(len(preview.encode("utf-8")), 4200)
+        self.assertNotIn("\ufffd", preview)
+        attachment, = message.iter_attachments()
+        self.assertEqual(attachment.get_content(), "\n".join(logs) + "\n")
+        self.assertLessEqual(len(json.dumps(webhook).encode("utf-8")), 8192)
+
+    def test_empty_failure_log_sends_without_an_attachment(self):
+        self.service.create_notification_channel(
+            name="Mail", channel_type="smtp",
+            config={"host": "mail.internal", "from": "backup@example.test", "to": ["oncall@example.test"]},
+        )
+        message, webhook, result = self._complete_with_mocked_delivery([])
+        self.assertEqual(result.status, JobStatus.FAILED)
+        self.assertEqual(list(message.iter_attachments()), [])
+        self.assertEqual(message.get_content_type(), "multipart/alternative")
+        self.assertNotIn("Registro de error", message.get_body(preferencelist=("plain",)).get_content())
+        self.assertNotIn("log_lines", webhook)
+
+    def _complete_with_mocked_delivery(self, logs):
+        self.service.update_settings(control_plane_public_url="https://backups.example.test/")
+        client = Mock()
+        manager = Mock()
+        manager.__enter__ = Mock(return_value=client)
+        manager.__exit__ = Mock(return_value=False)
+        response = Mock(status=202)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        opener = Mock()
+        opener.open.return_value = response
+
+        def execute(**kwargs):
+            thread = Mock()
+            thread.start.side_effect = lambda: kwargs["target"](*kwargs["args"])
+            return thread
+
+        with patch("threading.Thread", side_effect=execute), patch("smtplib.SMTP", return_value=manager), \
+                patch("urllib.request.build_opener", return_value=opener):
+            result = self.service.update_job_status(
+                "worker-a", self.job.id, JobStatus.FAILED, lease_token="lease-token",
+                result_summary={"status_code": 1}, log_lines=logs,
+            )
+            with self.assertRaises(ValueError) as repeated:
+                self.service.update_job_status("worker-a", self.job.id, JobStatus.FAILED, lease_token="lease-token")
+            self.assertEqual(str(repeated.exception), "job 'job-1' is not in progress (current status: failed)")
+        client.send_message.assert_called_once()
+        opener.open.assert_called_once()
+        request, = opener.open.call_args.args
+        return client.send_message.call_args.args[0], json.loads(request.data), result
+
     def test_notification_payload_is_safe_bounded_and_excludes_logs(self):
         self.job.status = JobStatus.FAILED
         self.job.result_summary = {
@@ -161,7 +267,7 @@ class NotificationDeliveryTests(unittest.TestCase):
 
         self.assertEqual(payload["event"], "backup.failed")
         self.assertEqual(payload["job_id"], self.job.id)
-        # log_lines are now included but redacted - no secrets
+        # The shared webhook payload stays a safe bounded summary.
         self.assertNotIn("private-token", serialized)
         self.assertNotIn("raw worker", serialized)
         self.assertNotIn("must-not-be-included", serialized)
@@ -169,13 +275,8 @@ class NotificationDeliveryTests(unittest.TestCase):
         self.assertIn("<redacted>", serialized)
         self.assertLessEqual(len(serialized.encode("utf-8")), 8192)
         self.assertLessEqual(len(payload["summary"]["error"]), 2048)
-        # log_lines are present and redacted
-        self.assertIn("log_lines", payload)
-        log_lines = payload.get("log_lines", [])
-        self.assertIsInstance(log_lines, list)
-        self.assertNotIn("private-token", " ".join(log_lines))
-        self.assertNotIn("secret123", " ".join(log_lines))
-        self.assertIn("<redacted>", " ".join(log_lines))
+        self.assertNotIn("log_lines", payload)
+        self.assertNotIn("raw log", serialized)
 
     def test_attempt_claim_is_atomic_and_survives_repository_reopen(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -2826,6 +2826,11 @@ class ControlPlaneService:
     NOTIFICATION_CHANNEL_NAME_MAX_LENGTH = 100
     MAX_NOTIFICATION_PAYLOAD_BYTES = 8192
     NOTIFICATION_DELIVERY_TIMEOUT_SECONDS = 5
+    SMTP_LOG_PREVIEW_MAX_LINES = 50
+    SMTP_LOG_PREVIEW_MAX_BYTES = 4096
+    SMTP_LOG_PREVIEW_SIDE_LINES = 24
+    SMTP_LOG_PREVIEW_ERROR_RESERVE_BYTES = 2048
+    SMTP_LOG_PREVIEW_OMISSION_MARKER = "Contenido omitido"
     SMTP_SECURITY_MODES = frozenset({"starttls", "ssl", "none"})
     SMTP_EMAIL_PATTERN = re.compile(
         r"^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@"
@@ -3084,13 +3089,9 @@ class ControlPlaneService:
                 if value is not None:
                     summary[key] = value
 
-        # Add limited redacted log lines for context
-        log_lines = []
-        try:
-            log_lines = self._bounded_job_log_lines(job)[:50]  # Cap at 50 lines for notifications
-        except Exception:
-            pass
-
+        # The shared payload stays a bounded safe summary without log lines; the
+        # already-redacted retained job log only travels to SMTP channels as an
+        # email preview and TXT attachment.
         payload = {
             "event": "backup.failed",
             "job_id": str(job.id)[:128],
@@ -3100,13 +3101,11 @@ class ControlPlaneService:
             "started_at": job.started_at.isoformat() if job.started_at else None,
             "finished_at": job.finished_at.isoformat() if job.finished_at else None,
             "summary": summary,
-            "log_lines": log_lines,
         }
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
             error = summary.get("error")
             payload["summary"] = {"error": error[:512]} if isinstance(error, str) else {}
-            payload["log_lines"] = log_lines[:20]  # Further reduce if needed
             serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(serialized) > self.MAX_NOTIFICATION_PAYLOAD_BYTES:
             payload["summary"] = {}
@@ -3119,6 +3118,8 @@ class ControlPlaneService:
         try:
             channels = repository.list()
             payload = self._build_failure_notification_payload(job)
+            # Already-redacted retained log for the email preview and TXT attachment.
+            email_log_lines = self._bounded_job_log_lines(job)
         except Exception as exc:
             logger.warning("Failed backup notification preparation failed (%s)", type(exc).__name__)
             return
@@ -3129,7 +3130,10 @@ class ControlPlaneService:
             try:
                 if not repository.claim_delivery_attempt(job.id, channel.id):
                     continue
-                self._send_notification_channel(channel, payload)
+                if channel.channel_type == "smtp" and email_log_lines:
+                    self._send_notification_channel(channel, payload, email_log_lines=email_log_lines)
+                else:
+                    self._send_notification_channel(channel, payload)
             except Exception as exc:
                 logger.warning(
                     "Notification delivery failed for channel %s (%s)",
@@ -3138,11 +3142,102 @@ class ControlPlaneService:
                 )
 
     @staticmethod
+    def _utf8_slice(text: str, max_bytes: int) -> str:
+        """Truncate text to at most max_bytes of UTF-8, never mid-character."""
+        if max_bytes <= 0:
+            return ""
+        encoded = text.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return text
+        return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+    def _smtp_log_attachment_name(self, job_id: Any) -> str:
+        safe_job_id = re.sub(r"[^A-Za-z0-9._-]+", "-", str(job_id or "job"))[:64].strip("-.") or "job"
+        return f"backup-{safe_job_id}.log.txt"
+
+    def _smtp_log_preview_lines(self, email_log_lines: Any) -> List[str]:
+        """Bounded first/last preview of an already-redacted job log for email bodies.
+
+        Keeps at most SMTP_LOG_PREVIEW_SIDE_LINES lines on each side within the byte
+        budget, always preserving the last ERROR line even with huge Unicode lines.
+        """
+        raw_lines = email_log_lines if isinstance(email_log_lines, list) else []
+        lines = [line for line in raw_lines if isinstance(line, str)]
+        if not lines:
+            return []
+        marker = self.SMTP_LOG_PREVIEW_OMISSION_MARKER
+        error_index = max(
+            (index for index, line in enumerate(lines) if "ERROR" in line.upper()), default=-1
+        )
+        error_line = ""
+        if error_index >= 0:
+            error_line = self._utf8_slice(lines[error_index], self.SMTP_LOG_PREVIEW_ERROR_RESERVE_BYTES)
+        marker_cost = len(marker.encode("utf-8")) + 1
+        reserved_cost = (len(error_line.encode("utf-8")) + 1) if error_index >= 0 else 0
+        side_budget = max(0, (self.SMTP_LOG_PREVIEW_MAX_BYTES - marker_cost - reserved_cost - 2) // 2)
+        side_max = self.SMTP_LOG_PREVIEW_SIDE_LINES
+
+        head: List[str] = []
+        head_bytes = 0
+        head_end = -1
+        head_partial = False
+        for index in range(min(side_max, len(lines))):
+            remaining = side_budget - head_bytes
+            piece = self._utf8_slice(lines[index], remaining - 1)
+            if not piece:
+                break
+            head.append(piece)
+            head_bytes += len(piece.encode("utf-8"))
+            head_end = index
+            if piece != lines[index]:
+                head_partial = True
+                break
+
+        tail: List[str] = []
+        tail_bytes = 0
+        tail_start = len(lines)
+        tail_partial = False
+        cursor = len(lines) - 1
+        # The newest line is always represented, truncated only when huge.
+        if cursor > head_end:
+            piece = self._utf8_slice(lines[cursor], side_budget)
+            if piece:
+                tail.append(piece)
+                tail_partial = piece != lines[cursor]
+                tail_bytes += len(piece.encode("utf-8")) + 1
+                tail_start = cursor
+                cursor -= 1
+        while cursor > head_end and len(tail) < side_max and not tail_partial:
+            cost = len(lines[cursor].encode("utf-8")) + 1
+            if tail_bytes + cost > side_budget:
+                break
+            tail.append(lines[cursor])
+            tail_bytes += cost
+            tail_start = cursor
+            cursor -= 1
+
+        tail.reverse()
+        preview: List[str] = []
+        preview.extend(head)
+        if head_end + 1 < tail_start or head_partial or tail_partial:
+            preview.append(marker)
+        preview.extend(tail)
+        if error_index >= 0 and head_end < error_index < tail_start:
+            preview.append(error_line)
+        return preview
+
+    @staticmethod
     def _escape_html(text: str) -> str:
         """Minimal HTML escaping."""
         return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#39;"))
 
-    def _build_html_email_body(self, payload: Dict[str, Any], control_plane_url: str) -> str:
+    def _build_html_email_body(
+        self,
+        payload: Dict[str, Any],
+        control_plane_url: str,
+        log_preview: Optional[List[str]] = None,
+        attachment_name: Optional[str] = None,
+    ) -> str:
         """Build a professional HTML email body for backup failure notifications."""
         job_id = payload.get("job_id", "unknown")
         target_id = payload.get("target_id", "unknown")
@@ -3157,24 +3252,35 @@ class ControlPlaneService:
         diag_code = summary.get("diagnostic_code", "")
         diag_category = summary.get("diagnostic_category", "")
         diag_message = summary.get("diagnostic_message", "")
-        log_lines = payload.get("log_lines") or []
+
+        # Bounded first/last preview of the already-redacted job log. The shared
+        # payload never carries log_lines, so the preview arrives separately.
+        preview_lines = [str(line) for line in (log_preview or []) if isinstance(line, str)]
 
         # Build log section
         log_html = ""
-        if log_lines:
+        if preview_lines:
             log_rows = ""
-            for line in log_lines:
+            for line in preview_lines:
+                row_color = "#adb5bd" if line == self.SMTP_LOG_PREVIEW_OMISSION_MARKER else "#495057"
                 safe_line = self._escape_html(str(line))
-                log_rows += f'<div style="padding:2px 0;font-family:monospace;font-size:12px;line-height:1.5;color:#495057;white-space:pre-wrap;word-break:break-all;">{safe_line}</div>'
+                log_rows += f'<div style="padding:2px 0;font-family:monospace;font-size:12px;line-height:1.5;color:{row_color};white-space:pre-wrap;word-break:break-all;">{safe_line}</div>'
+            attachment_note = ""
+            if attachment_name:
+                note_text = f"El registro completo va en el archivo adjunto {attachment_name}"
+                attachment_note = f'<div style="padding:10px 12px;border-top:1px solid #dee2e6;background:#f8f9fa;font-size:12px;color:#495057;">{self._escape_html(note_text)}</div>'
             log_html = f'''<div style="margin-top:16px;border:1px solid #dee2e6;border-radius:4px;overflow:hidden;">
               <div style="background:#f8f9fa;padding:8px 12px;font-size:12px;font-weight:600;color:#495057;border-bottom:1px solid #dee2e6;">Registro de error</div>
               <div style="padding:12px;max-height:320px;overflow-y:auto;background:#fff;font-family:monospace;font-size:12px;line-height:1.5;">{log_rows}</div>
+              {attachment_note}
             </div>'''
 
-        # Build job detail link
+        # Build job detail link; only absolute http(s) URLs are trusted here
+        detail_url = ""
         if control_plane_url:
-            base = control_plane_url.rstrip("/")
-            detail_url = f"{base}/#/jobs"
+            base = (control_plane_url or "").strip().rstrip("/")
+            if urlsplit(base).scheme.lower() in ("http", "https"):
+                detail_url = f"{self._escape_html(base)}/#/jobs"
         else:
             detail_url = ""
 
@@ -3248,8 +3354,8 @@ class ControlPlaneService:
               {f'<div style="margin-bottom:16px;padding:12px 16px;background:#f8d7da;border-left:4px solid #dc3545;border-radius:4px;"><strong>Error:</strong> <span style="color:#721c24;">{self._escape_html(error)}{diag_badge}</span></div>' if error else ''}
               {recovery_html}
               {diag_html}
-              {log_html}
               {f'<div style="margin-top:24px;text-align:center;"><a href="{detail_url}" style="display:inline-block;padding:10px 24px;background:#007bff;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;font-size:14px;">Ver trabajos en el sistema de backups</a></div>' if detail_url else ''}
+              {log_html}
             </td>
           </tr>
           <tr>
@@ -3268,6 +3374,7 @@ class ControlPlaneService:
         channel: NotificationChannelRecord,
         payload: Dict[str, Any],
         subject: Optional[str] = None,
+        email_log_lines: Optional[List[str]] = None,
     ) -> None:
         config = self._notification_channel_config(channel)
         serialized = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -3314,7 +3421,12 @@ class ControlPlaneService:
 
         # Build HTML body for backup failures
         if payload.get("event") == "backup.failed":
-            html_body = self._build_html_email_body(payload, control_plane_url)
+            # The already-sanitized job log only travels to SMTP channels.
+            preview = self._smtp_log_preview_lines(email_log_lines) if email_log_lines else []
+            attachment_name = self._smtp_log_attachment_name(payload.get("job_id")) if preview else ""
+            html_body = self._build_html_email_body(
+                payload, control_plane_url, log_preview=preview, attachment_name=attachment_name
+            )
             # Plain text fallback
             job_id = payload.get("job_id", "unknown")
             target = payload.get("target_id", "")
@@ -3333,15 +3445,22 @@ class ControlPlaneService:
             recovery = summary.get("recovery", "")
             if recovery:
                 plain_text += f"Recuperación: {recovery}\n"
-            # Include log lines
-            log_lines = payload.get("log_lines") or []
-            if log_lines:
-                plain_text += f"\nRegistros ({len(log_lines)} líneas):\n"
-                for line in log_lines:
-                    plain_text += f"  {line}\n"
+            # Bounded first/last preview; the full retained log goes as attachment.
+            if preview:
+                plain_text += "\nRegistro de error:\n"
+                for line in preview:
+                    plain_text += f"{line}\n"
+                plain_text += f"El registro completo va en el archivo adjunto {attachment_name}\n"
 
             message.set_content(plain_text)
             message.add_alternative(html_body, subtype="html")
+            if attachment_name and email_log_lines:
+                message.add_attachment(
+                    "\n".join(line for line in email_log_lines if isinstance(line, str)) + "\n",
+                    subtype="plain",
+                    charset="utf-8",
+                    filename=attachment_name,
+                )
         else:
             # For other events (test, etc.), keep JSON as plain text
             message.set_content(serialized.decode("utf-8"))

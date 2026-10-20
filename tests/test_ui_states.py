@@ -2734,7 +2734,11 @@ const apiPost = async (path, body) => {
             "STARTTLS",
             "correo de prueba",
             "backup.failed",
-            "logs completos",
+            "primeras y últimas líneas",
+            "Contenido omitido",
+            "archivo adjunto",
+            "log completo retenido",
+            "control_plane_public_url",
             "un intento",
             "redes internas",
         ):

@@ -181,6 +181,14 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertIn("_windows-amd64.exe", paths)
         self.assertIn("_windows-amd64.msi", paths)
         self.assertEqual(job.count("name: vaultline-worker-windows-amd64"), 1)
+        # Mitigation only (not a proven root-cause fix): skip the redundant
+        # archive compression for the incompressible exe/MSI upload payload.
+        step = re.search(r"(?ms)- name: Upload Windows [^\n]*\n.*?(?=\n      - name: |\Z)", job)
+        self.assertIsNotNone(step)
+        with self.subTest(scope="windows upload step"):
+            self.assertIn("compression-level: 0", step.group(0))
+        # Other upload steps keep their default compression settings.
+        self.assertEqual(self.workflow.count("compression-level:"), 1)
 
     def test_publish_validates_assets_generates_checksums_and_uses_release_notes(self):
         required = re.search(r"(?ms)required=\(\n(.*?)\n\s*\)", self.workflow)

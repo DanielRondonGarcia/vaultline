@@ -326,6 +326,10 @@ jobs:
             dist/release/vaultline-worker_${{ needs.prepare.outputs.new_version }}_windows-amd64.msi
           if-no-files-found: error
           retention-days: 1
+          # Mitigation only: the exe/MSI binaries are incompressible, so skip
+          # the redundant archive compression for this upload. Not a claim
+          # about the root cause of any hosted-runner communication loss.
+          compression-level: 0
 
   image-build:
     needs: prepare

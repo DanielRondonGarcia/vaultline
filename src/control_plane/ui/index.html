@@ -8626,15 +8626,21 @@ docker compose up -d
         <div class="field"><label for="notificationSmtpPassword">Nueva contraseña SMTP</label><input id="notificationSmtpPassword" name="password" type="password" autocomplete="new-password" placeholder="${channelSummary.authentication_configured ? "Dejar vacío para conservar" : "Contraseña"}" /></div>
         <div class="helper full">Si defines usuario, también debes indicar contraseña. Las credenciales guardadas nunca se devuelven a la interfaz.</div>
       `;
-      const editorMarkup = !editor ? "" : `
-        <div class="settings-card notification-channel-editor">
-          <div class="settings-card-header"><div><h3>${isEditing ? "Editar canal" : "Agregar canal"}</h3><div class="settings-card-sub">${isEditing ? "Los campos secretos no se rellenan ni se vuelven a mostrar." : "Las credenciales se cifran antes de guardarse."}</div></div><div class="header-actions"><button type="submit" class="btn primary sm" form="notificationChannelForm">${isEditing ? "Guardar cambios" : "Crear canal"}</button><button type="button" class="btn secondary sm" id="cancelNotificationChannelEdit">Cancelar</button></div></div>
-          <form id="notificationChannelForm" class="form-grid">
-            <div class="field"><label for="notificationChannelName">Nombre</label><input id="notificationChannelName" name="name" value="${escapeHtml(editor.name || editingChannel?.name || "")}" required maxlength="100" placeholder="Operaciones" /></div>
-            <div class="field"><label for="notificationChannelType">Tipo</label><select id="notificationChannelType" name="channel_type" ${isEditing ? "disabled" : ""}><option value="webhook" ${channelType === "webhook" ? "selected" : ""}>Webhook</option><option value="smtp" ${channelType === "smtp" ? "selected" : ""}>Correo SMTP</option></select></div>
-            ${editorFields}
+      const editorDialogMarkup = !editor ? "" : `
+        <dialog id="notificationChannelDialog" class="modal notification-channel-modal" aria-labelledby="notificationChannelTitle">
+          <form id="notificationChannelForm">
+            <div class="modal-header"><div><h3 id="notificationChannelTitle">${isEditing ? "Editar canal" : "Agregar canal"}</h3><div class="settings-card-sub">${isEditing ? "Los campos secretos no se rellenan ni se vuelven a mostrar." : "Las credenciales se cifran antes de guardarse."}</div></div><button type="button" class="close" id="closeNotificationChannelEdit" aria-label="Cerrar">&times;</button></div>
+            <div class="modal-body">
+              <div class="form-error" data-notification-channel-error role="alert" hidden></div>
+              <div class="form-grid">
+                <div class="field full"><label for="notificationChannelName">Nombre</label><input id="notificationChannelName" name="name" value="${escapeHtml(editor.name || editingChannel?.name || "")}" required maxlength="100" placeholder="Operaciones" /></div>
+                <div class="field full"><label for="notificationChannelType">Tipo</label><select id="notificationChannelType" name="channel_type" ${isEditing ? "disabled" : ""}><option value="webhook" ${channelType === "webhook" ? "selected" : ""}>Webhook</option><option value="smtp" ${channelType === "smtp" ? "selected" : ""}>Correo SMTP</option></select></div>
+                ${editorFields}
+              </div>
+            </div>
+            <div class="modal-footer"><button type="button" class="btn secondary" id="cancelNotificationChannelEdit">Cancelar</button><button type="submit" class="btn primary">${isEditing ? "Guardar cambios" : "Crear canal"}</button></div>
           </form>
-        </div>`;
+        </dialog>`;
       const feedback = state.notificationChannelFeedback;
       container.innerHTML = `
         <section class="settings-grid notification-settings" aria-label="Notificaciones de backups fallidos">
@@ -8644,12 +8650,11 @@ docker compose up -d
             <div class="settings-actions"><button type="button" class="btn primary" id="addNotificationChannel">Agregar canal</button></div>
           </div>
           <div class="settings-card"><h3>Canales configurados</h3><div class="notification-channel-list">${channelCards}</div></div>
-          ${editorMarkup}
           <span id="notificationChannelFeedback" class="notification-feedback ${feedback?.type === "error" ? "is-error" : "is-success"}" role="status" aria-live="polite" ${feedback?.message ? "" : "hidden"}>
             <span class="notification-feedback-icon" data-notification-feedback-icon aria-hidden="true">${feedback?.type === "error" ? "!" : "✓"}</span>
             <span data-notification-feedback-message>${escapeHtml(feedback?.message || "")}</span>
           </span>
-        </section>`;
+        </section>${editorDialogMarkup}`;
 
       const showFeedback = (message, type = "success") => {
         state.notificationChannelFeedback = { message, type };
@@ -8669,20 +8674,48 @@ docker compose up -d
         state.notificationChannels = response.items || [];
         state.pageDataLoaded.notificationChannels = true;
       };
+      const editorDialog = container.querySelector("#notificationChannelDialog");
+      const editorErrorElement = container.querySelector("[data-notification-channel-error]");
+      let editorPending = false;
+      const showChannelError = message => {
+        if (editorErrorElement) {
+          editorErrorElement.textContent = message;
+          editorErrorElement.hidden = false;
+        } else {
+          showFeedback(message, "error");
+        }
+      };
+      const clearChannelError = () => {
+        if (editorErrorElement) {
+          editorErrorElement.hidden = true;
+          editorErrorElement.textContent = "";
+        }
+      };
+      const restoreEditorTriggerFocus = selector => {
+        const trigger = container.querySelector(selector || "#addNotificationChannel");
+        if (trigger?.focus) trigger.focus();
+      };
+      const discardEditorState = selector => {
+        state.notificationChannelEditor = null;
+        renderNotificationChannelManager();
+        restoreEditorTriggerFocus(selector);
+      };
       container.querySelector("#addNotificationChannel")?.addEventListener("click", () => {
         state.notificationChannelFeedback = null;
-        state.notificationChannelEditor = { channelType: "webhook", name: "" };
+        state.notificationChannelEditor = { channelType: "webhook", name: "", returnFocusSelector: "#addNotificationChannel" };
         renderNotificationChannelManager();
       });
       container.querySelector("#cancelNotificationChannelEdit")?.addEventListener("click", () => {
-        state.notificationChannelEditor = null;
-        renderNotificationChannelManager();
+        if (!editorPending) editorDialog?.close();
+      });
+      container.querySelector("#closeNotificationChannelEdit")?.addEventListener("click", () => {
+        if (!editorPending) editorDialog?.close();
       });
       container.querySelectorAll("[data-notification-edit]").forEach(button => button.addEventListener("click", () => {
         const channel = channels.find(item => item.id === button.dataset.notificationEdit);
         if (!channel) return;
         state.notificationChannelFeedback = null;
-        state.notificationChannelEditor = { channel, channelType: channel.channel_type, name: channel.name };
+        state.notificationChannelEditor = { channel, channelType: channel.channel_type, name: channel.name, returnFocusSelector: `[data-notification-edit="${channel.id}"]` };
         renderNotificationChannelManager();
       }));
       container.querySelectorAll("[data-notification-test-close]").forEach(button => button.addEventListener("click", () => {
@@ -8835,6 +8868,8 @@ docker compose up -d
       const form = container.querySelector("#notificationChannelForm");
       form?.addEventListener("submit", async event => {
         event.preventDefault();
+        if (editorPending) return;
+        clearChannelError();
         const formData = new FormData(form);
         const name = String(formData.get("name") || "").trim();
         const config = {};
@@ -8842,7 +8877,8 @@ docker compose up -d
           const url = String(formData.get("url") || "").trim();
           if (url) config.url = url;
           if (!isEditing && !url) {
-            showFeedback("La URL del webhook es obligatoria.", "error");
+            showChannelError("La URL del webhook es obligatoria.");
+            form.querySelector("#notificationWebhookUrl")?.focus();
             return;
           }
         } else {
@@ -8854,7 +8890,8 @@ docker compose up -d
           const username = String(formData.get("username") || "").trim();
           const password = String(formData.get("password") || "");
           if (Boolean(username) !== Boolean(password)) {
-            showFeedback("Para cambiar la autenticación SMTP, indica usuario y contraseña.", "error");
+            showChannelError("Para cambiar la autenticación SMTP, indica usuario y contraseña.");
+            form.querySelector("#notificationSmtpUsername")?.focus();
             return;
           }
           if (username) {
@@ -8864,6 +8901,9 @@ docker compose up -d
         }
         const submitButton = form.querySelector('button[type="submit"]');
         if (submitButton) submitButton.disabled = true;
+        editorPending = true;
+        clearChannelError();
+        const editorToken = state.notificationChannelEditor;
         try {
           if (isEditing) {
             await apiPatch(`/api/v1/notification-channels/${encodeURIComponent(editingChannel.id)}`, { name, config });
@@ -8871,14 +8911,25 @@ docker compose up -d
             await apiPost("/api/v1/notification-channels", { name, channel_type: channelType, config });
           }
           await reloadChannels();
-          state.notificationChannelEditor = null;
-          state.notificationChannelFeedback = { message: isEditing ? "Canal actualizado." : "Canal creado.", type: "success" };
-          renderNotificationChannelManager();
+          editorPending = false;
+          if (state.notificationChannelEditor === editorToken) {
+            state.notificationChannelFeedback = { message: isEditing ? "Canal actualizado." : "Canal creado.", type: "success" };
+            discardEditorState(editorToken?.returnFocusSelector);
+          }
         } catch (error) {
-          showFeedback(`No se pudo guardar el canal: ${error.message}`, "error");
+          editorPending = false;
+          showChannelError(`No se pudo guardar el canal: ${error.message}`);
           if (submitButton) submitButton.disabled = false;
         }
       });
+      editorDialog?.addEventListener("cancel", event => {
+        if (editorPending) event.preventDefault();
+      });
+      editorDialog?.addEventListener("close", () => {
+        if (editorPending) return;
+        if (state.notificationChannelEditor) discardEditorState(state.notificationChannelEditor.returnFocusSelector || "#addNotificationChannel");
+      });
+      if (editor && editorDialog && !editorDialog.open) editorDialog.showModal();
     }
 
     async function refreshAll() {

@@ -681,6 +681,33 @@ details.form-section[open] > .form-body { border-top: 1px solid var(--border); p
 .notification-test-custom-field[data-notification-test-custom-group] { margin: 0; }
 .notification-test-recipient { display: block; max-width: 100%; padding: 8px 10px; border-radius: 8px; background: var(--muted); color: var(--foreground); font-family: var(--mono-font, monospace); font-size: 12px; overflow-wrap: anywhere; }
 .notification-test-modal .modal-footer .btn.primary { margin-left: auto; }
+.notification-channel-modal {
+  box-sizing: border-box;
+  width: min(640px, calc(100vw - 32px));
+  max-width: 640px;
+  max-height: min(720px, calc(100vh - 32px));
+  padding: 0;
+  overflow: hidden;
+  color: var(--foreground);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: calc(var(--radius) + 4px);
+  box-shadow: var(--shadow-md);
+}
+.notification-channel-modal:not([open]) { display: none; }
+.notification-channel-modal::backdrop { background: rgb(0 0 0 / 0.6); }
+.notification-channel-modal form { display: flex; flex-direction: column; margin: 0; max-height: inherit; }
+.notification-channel-modal .modal-header { flex-shrink: 0; }
+.notification-channel-modal .modal-header .close:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.notification-channel-modal .modal-body { overflow-y: auto; min-height: 0; gap: 16px; }
+.notification-channel-modal .modal-body .form-error { margin: 0; }
+.notification-channel-modal .modal-body .form-grid { gap: 12px; }
+.notification-channel-modal .modal-footer { flex-shrink: 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--border); }
+.notification-channel-modal .modal-footer .btn { flex: 0 0 auto; }
+@media (max-width: 640px) {
+  .notification-channel-modal .form-grid { grid-template-columns: 1fr; }
+  .notification-channel-modal .modal-footer .btn { flex: 1 1 120px; }
+}
 #settingsFormSave[hidden], #settingsFormActions[hidden] { display: none !important; }
 @media (max-width: 768px) { .settings-grid { grid-template-columns: 1fr; } }
 

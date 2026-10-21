@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+import tempfile
 import unittest
 import re
 from pathlib import Path
@@ -2717,13 +2718,17 @@ if (!tabSelected || !fieldFocused) throw new Error("validation target was not re
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
         script = SMTP_TEST_DIALOG_MOCK_PRELUDE + renderer.group(0) + assertions
-        result = subprocess.run(
-            ["node", "--input-type=commonjs", "--eval", script],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            check=False,
-        )
+        # The combined script exceeds the Windows command-line limit; run from a temp file.
+        with tempfile.TemporaryDirectory(prefix="smtp-test-dialog-check-") as tmp:
+            script_path = Path(tmp) / "smtp_test_dialog_check.js"
+            script_path.write_text(script, encoding="utf-8")
+            result = subprocess.run(
+                ["node", str(script_path)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, expected_stdout)
 

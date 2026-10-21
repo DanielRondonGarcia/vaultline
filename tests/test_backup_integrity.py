@@ -245,6 +245,48 @@ class BackupIntegrityTests(unittest.TestCase):
                 clear.assert_not_called()
                 run.assert_not_called()
 
+    def test_read_only_target_precedes_restic_binary_discovery_and_rejection_is_pre_mutate(self):
+        def assertions(result, marker, clear, run, mkdtemp, which, category, which_call_count):
+            self.assertFalse(result.success)
+            self.assertEqual(result.category, category)
+            self.assertEqual(result.destructive_state, "none")
+            self.assertFalse(result.partial)
+            self.assertEqual(marker.read_text(), "preserve")
+            self.assertNotIn("secret-password", result.error)
+            if which_call_count:
+                self.assertIn("restic", result.error)
+            clear.assert_not_called()
+            run.assert_not_called()
+            mkdtemp.assert_not_called()
+            if which_call_count:
+                which.assert_called_once_with("restic")
+            else:
+                which.assert_not_called()
+
+        for readonly, category, which_call_count in (
+            (False, "restore_failed", 1),
+            (True, "readonly_target", 0),
+        ):
+            with self.subTest(readonly=readonly), patch.object(
+                backup_module.shutil, "which", return_value=None
+            ) as which, tempfile.TemporaryDirectory() as target:
+                marker = Path(target) / "must-remain.txt"
+                marker.write_text("preserve")
+                config = RestoreConfig(
+                    target,
+                    source="snapshot",
+                    dry_run=False,
+                    force_overwrite=True,
+                    layout="direct",
+                    restic_password="secret-password",
+                    read_only_paths=(target,) if readonly else (),
+                )
+                with patch.object(backup_module, "_clear_target_contents") as clear, patch.object(
+                    backup_module.subprocess, "run"
+                ) as run, patch.object(backup_module.tempfile, "mkdtemp") as mkdtemp:
+                    result = ResticBackupStrategy().restore("snapshot", config)
+                assertions(result, marker, clear, run, mkdtemp, which, category, which_call_count)
+
     def test_restore_gate_blocks_before_stop_clear_and_dry_run_probes_nothing(self):
         with tempfile.TemporaryDirectory() as target:
             container, strategy, storage = Mock(), Mock(), Mock()
@@ -274,7 +316,9 @@ class BackupIntegrityTests(unittest.TestCase):
                 def run(command, **_):
                     destination = command[command.index(target_flag) + 1]; Path(destination, "restored").write_text("new")
                 config = RestoreConfig(target, source="snapshot", dry_run=False, force_overwrite=True, chown="1000:1000", layout="direct")
-                with patch.object(backup_module.os, "lchown", create=True), patch.object(backup_module.subprocess, "run", side_effect=run):
+                with patch.object(backup_module.os, "lchown", create=True), patch.object(
+                    backup_module.shutil, "which", return_value="/usr/local/bin/fake-restic"
+                ), patch.object(backup_module.subprocess, "run", side_effect=run):
                     result = strategy_type().restore("archive", config)
                 self.assertTrue(result.success); self.assertTrue(result.normalization["changed"]); self.assertEqual(result.destructive_state, "complete")
 

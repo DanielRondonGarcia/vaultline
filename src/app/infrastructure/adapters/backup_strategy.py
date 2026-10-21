@@ -682,9 +682,9 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             env["RESTIC_PASSWORD"] = password
 
         try:
+            _ensure_direct_restore_target_is_writable(config)
             restic = _require_executable("restic") or "restic"
             env = restic_subprocess_environment(env)
-            _ensure_direct_restore_target_is_writable(config)
             policy = _ownership_policy(config)
             snapshot = source_path or config.source or "latest"
             if _should_use_backup_dir_layout(config):

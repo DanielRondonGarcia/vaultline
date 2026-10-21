@@ -78,6 +78,17 @@ def confined_path(root, path):
     return candidate
 
 
+def _anchored_component_is_link(directory_fd, name):
+    # Authoritative no-follow check anchored to the open parent directory: the
+    # name is resolved relative to the walked directory fd, never via a
+    # re-traversed path, so it is race-safe against swaps outside the root.
+    try:
+        return stat_module.S_ISLNK(os.stat(name, dir_fd=directory_fd, follow_symlinks=False).st_mode)
+    except OSError:
+        # Fail closed: a vanished entry leaves the original open error standing.
+        return False
+
+
 def _windows_final_path(fd):
     import ctypes
     import msvcrt
@@ -132,11 +143,20 @@ def open_confined(root, path, flags=os.O_RDONLY):
             fd = os.open(os.fspath(root), os.O_RDONLY | directory | nofollow)
             try:
                 for index, part in enumerate(parts):
-                    child = os.open(
-                        part,
-                        (os.O_RDONLY | directory if index < len(parts) - 1 else flags) | nofollow,
-                        dir_fd=fd,
-                    )
+                    try:
+                        child = os.open(
+                            part,
+                            (os.O_RDONLY | directory if index < len(parts) - 1 else flags) | nofollow,
+                            dir_fd=fd,
+                        )
+                    except OSError as exc:
+                        # O_NOFOLLOW on a symlink raises ENOTDIR when O_DIRECTORY
+                        # is also set and ELOOP otherwise; only a verified symlink
+                        # (anchored lstat) turns that into the link rejection, not
+                        # ordinary not-a-directory or missing path errors.
+                        if getattr(exc, "errno", None) in (errno.ELOOP, errno.ENOTDIR) and _anchored_component_is_link(fd, part):
+                            raise ValueError("live links are not allowed") from exc
+                        raise
                     os.close(fd)
                     fd = child
                 return fd

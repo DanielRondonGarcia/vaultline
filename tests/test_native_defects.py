@@ -237,6 +237,38 @@ class NativeLiveFilesTests(unittest.TestCase):
             self.assertEqual(self.request(worker, client, str(root))["entries"], [])
             self.assertEqual(self.request(worker, client, str(root), operation="file", path="/escape/private.bin")["status"], 400)
 
+    def test_native_symlink_final_component_escape_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root, outside = Path(directory, "root"), Path(directory, "outside")
+            root.mkdir(); outside.mkdir()
+            (outside / "private.bin").write_bytes(b"outside")
+            try:
+                (root / "leak").symlink_to(outside / "private.bin", target_is_directory=False)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlink creation is unavailable to this user")
+            worker, client, _docker = self.make_worker()
+            result = self.request(worker, client, str(root), operation="file", path="/leak")
+            self.assertEqual(result, {"status": 400, "code": "live_request_rejected", "reason": "invalid_request"})
+            # No chunk is streamed and no outside byte moves on rejection.
+            self.assertEqual(client.send_live_chunk.call_args_list, [])
+            self.assertEqual((outside / "private.bin").read_bytes(), b"outside")
+
+    def test_native_not_directory_or_missing_components_keep_prior_error_semantics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory, "root")
+            root.mkdir()
+            (root / "plain.bin").write_bytes(b"plain")
+            worker, client, _docker = self.make_worker()
+            # Only a verified symlink is the link rejection; an ordinary
+            # not-a-directory descent through a regular file and a missing name
+            # keep their prior operational failure classification.
+            for path in ("/plain.bin/nested", "/missing"):
+                with self.subTest(path=path):
+                    result = self.request(worker, client, str(root), operation="file", path=path)
+                    self.assertEqual(result, {"status": 503, "code": "live_worker_unavailable", "reason": "live_session_unavailable"}, result)
+            self.assertEqual(client.send_live_chunk.call_args_list, [])
+            self.assertEqual((root / "plain.bin").read_bytes(), b"plain")
+
     def test_native_control_plane_descriptors_and_revision_use_configured_paths_only(self):
         service = browser_tests.LiveTargetFoundationTests.make_service()
         target = service.register_target("native", "worker-a")

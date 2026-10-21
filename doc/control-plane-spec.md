@@ -444,6 +444,8 @@ Un parámetro inválido responde `400 {"error": "invalid <param>: ..."}`.
 
 `GET /api/v1/jobs/stats` devuelve los agregados que usa el dashboard sin listar jobs: `{"total", "by_status": {status: count}, "by_day": [{"date", "total", "success", "failed"}]}` para los últimos 7 días calendario según `started_at`. El parámetro opcional `tz_offset` (minutos respecto a UTC, `-840..840`) desplaza el corte de día al huso del cliente.
 
+Los agregados se leen de una proyección compacta interna `job_stats_facts` (`job_id`, `status` normalizado, `started_at`), mantenida atómicamente con cada escritura de la tabla `jobs` mediante triggers (`INSERT`/`UPDATE OF status, started_at`/`DELETE`; `cancelled` se normaliza a `canceled`). Los jobs y logs originales no se podan, mueven ni reescriben. Las bases de datos existentes se rellenan aditivamente una sola vez (marcador `job_stats_facts_backfill_done` en `schema_meta`, verificado dentro de `BEGIN IMMEDIATE` para que reinicializaciones no dupliquen totales) y llevan índices cubrientes sobre `(status)` y `(started_at, status)`. La forma de la respuesta, la ventana de 7 días, la semántica de `tz_offset` y la normalización de estados quedan intactas. En un corpus sintético local aislado (11.009 jobs mediante los métodos públicos del repositorio, filas anchas de ~4 KB) la lectura bajó de ~31 ms/query contra la tabla original a ~1,5 ms contra la proyección; la latencia de ~21 s reportada en producción no fue reproducible localmente; la proyección compacta es la primera parte de la optimización del dashboard (los snapshots persistidos y la cola de refresco se agregan en tareas posteriores).
+
 #### Policies
 
 - `GET /api/v1/policies/retention`

@@ -47,6 +47,13 @@ from src.control_plane.infrastructure.sqlite_runtime import SQLiteConnection as 
 
 
 LEASE_DIAGNOSTIC_CODE = "worker_lease_expired"
+
+# Compact dashboard-stats projection: one row per job with only (job_id,
+# normalized status, started_at). Maintained atomically by triggers on the
+# jobs table so every INSERT/UPDATE/DELETE path is covered; jobs and logs
+# themselves are never pruned, moved or rewritten.
+JOB_STATS_FACTS_TABLE = "job_stats_facts"
+JOB_STATS_FACTS_BACKFILL_META_KEY = "job_stats_facts_backfill_done"
 LEASE_DIAGNOSTIC_CATEGORY = "worker_interrupted"
 LEASE_DIAGNOSTIC_MESSAGE = (
     "Control Plane observed that the worker lease expired before a terminal result arrived; "
@@ -400,6 +407,35 @@ class SQLiteRepositoryBase:
                 "ON jobs (status, submitted_at DESC)"
             )
             connection.execute(
+                f"CREATE TABLE IF NOT EXISTS {JOB_STATS_FACTS_TABLE} ("
+                "job_id TEXT PRIMARY KEY, status TEXT NOT NULL, started_at TEXT)"
+            )
+            connection.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{JOB_STATS_FACTS_TABLE}_status "
+                f"ON {JOB_STATS_FACTS_TABLE} (status)"
+            )
+            connection.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{JOB_STATS_FACTS_TABLE}_started_at_status "
+                f"ON {JOB_STATS_FACTS_TABLE} (started_at, status)"
+            )
+            for trigger_sql in (
+                "CREATE TRIGGER IF NOT EXISTS trg_job_stats_facts_insert "
+                f"AFTER INSERT ON jobs BEGIN INSERT OR REPLACE INTO {JOB_STATS_FACTS_TABLE} "
+                "(job_id, status, started_at) VALUES "
+                "(NEW.id, CASE NEW.status WHEN 'cancelled' THEN 'canceled' ELSE NEW.status END, "
+                "NEW.started_at); END",
+                "CREATE TRIGGER IF NOT EXISTS trg_job_stats_facts_update "
+                f"AFTER UPDATE OF status, started_at ON jobs BEGIN INSERT OR REPLACE INTO {JOB_STATS_FACTS_TABLE} "
+                "(job_id, status, started_at) VALUES "
+                "(NEW.id, CASE NEW.status WHEN 'cancelled' THEN 'canceled' ELSE NEW.status END, "
+                "NEW.started_at); END",
+                "CREATE TRIGGER IF NOT EXISTS trg_job_stats_facts_delete "
+                f"AFTER DELETE ON jobs BEGIN DELETE FROM {JOB_STATS_FACTS_TABLE} "
+                "WHERE job_id = OLD.id; END",
+            ):
+                connection.execute(trigger_sql)
+            self._backfill_job_stats_facts_once(connection)
+            connection.execute(
                 "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
                 (str(self.SCHEMA_VERSION),),
             )
@@ -415,6 +451,48 @@ class SQLiteRepositoryBase:
         existing = {row["name"] for row in rows}
         if column_name not in existing:
             connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+
+    def _backfill_job_stats_facts_once(self, connection: sqlite3.Connection) -> None:
+        """Additively backfill the stats projection from existing history.
+
+        Idempotent: the marker lives in schema_meta and is re-checked inside a
+        BEGIN IMMEDIATE transaction, so repeated initializations of the same
+        database (other processes included) can never duplicate the backfill
+        or double-count totals.
+        """
+        marker = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = ?",
+            (JOB_STATS_FACTS_BACKFILL_META_KEY,),
+        ).fetchone()
+        if marker:
+            return
+        try:
+            connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            marker = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = ?",
+                (JOB_STATS_FACTS_BACKFILL_META_KEY,),
+            ).fetchone()
+            if not marker:
+                connection.execute(
+                    f"""
+                    INSERT OR REPLACE INTO {JOB_STATS_FACTS_TABLE} (job_id, status, started_at)
+                    SELECT id, CASE status WHEN 'cancelled' THEN 'canceled' ELSE status END, started_at
+                    FROM jobs
+                    WHERE id NOT IN (SELECT job_id FROM {JOB_STATS_FACTS_TABLE})
+                    """
+                )
+                connection.execute(
+                    "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                    (
+                        JOB_STATS_FACTS_BACKFILL_META_KEY,
+                        f"v{self.SCHEMA_VERSION}:{datetime.utcnow().isoformat()}",
+                    ),
+                )
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
 
 class SQLiteWorkerRepository(SQLiteRepositoryBase, WorkerRepository):
@@ -848,14 +926,23 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
         return jobs
 
     def job_stats(self, tz_offset_minutes: int = 0, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """Aggregate dashboard stats from the compact projection table.
+
+        Same day keys, tz-offset grouping, window semantics, status
+        normalization and result shape as the historical full-table scan, but
+        it only reads the compact facts (job_id, normalized status,
+        started_at) instead of probing the wide jobs rows.
+        """
         day_keys = job_stats_day_keys(now or datetime.utcnow(), tz_offset_minutes)
         window_start = datetime.fromisoformat(day_keys[0]) - timedelta(minutes=tz_offset_minutes)
         with self._connect() as connection:
-            status_rows = connection.execute("SELECT status, COUNT(*) AS total FROM jobs GROUP BY status").fetchall()
+            status_rows = connection.execute(
+                f"SELECT status, COUNT(*) AS total FROM {JOB_STATS_FACTS_TABLE} GROUP BY status"
+            ).fetchall()
             day_rows = connection.execute(
-                """
+                f"""
                 SELECT date(started_at, ?) AS day, status, COUNT(*) AS total
-                FROM jobs
+                FROM {JOB_STATS_FACTS_TABLE}
                 WHERE started_at IS NOT NULL AND started_at >= ?
                 GROUP BY day, status
                 """,

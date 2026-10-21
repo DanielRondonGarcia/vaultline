@@ -3057,6 +3057,9 @@ class ControlPlaneService:
             "message": "Correo de prueba con datos ficticios: no se ha ejecutado un backup real.",
             "job_id": self.SMTP_TEST_SAMPLE_JOB_ID,
             "target_id": self.SMTP_TEST_SAMPLE_TARGET_ID,
+            "target_name": "target de ejemplo",
+            "worker_name": "worker de ejemplo",
+            "host_name": "servidor-demo.example.test",
             "command": "backup.run",
             "status": "failed",
             "started_at": self.SMTP_TEST_SAMPLE_STARTED_AT,
@@ -3188,6 +3191,31 @@ class ControlPlaneService:
             payload["summary"] = {}
         return payload
 
+    def _build_failure_email_context(self, job: JobRecord) -> Dict[str, str]:
+        """Resolve display names for SMTP without expanding the webhook payload."""
+        context: Dict[str, str] = {}
+        secrets = self._job_sensitive_values(job)
+        worker_repository = self.worker_repository
+        target_repository = self.target_repository
+        try:
+            worker = worker_repository.get(job.worker_id) if worker_repository else None
+        except Exception:
+            worker = None
+        try:
+            target = target_repository.get(job.target_id) if target_repository and job.target_id else None
+        except Exception:
+            target = None
+
+        for key, value in (
+            ("worker_name", getattr(worker, "name", None)),
+            ("host_name", getattr(worker, "host_name", None)),
+            ("target_name", getattr(target, "name", None)),
+        ):
+            if isinstance(value, str) and value.strip():
+                normalized = re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip()
+                context[key] = self._redact_job_text(normalized, secrets)[:256]
+        return context
+
     def _deliver_failed_backup_notifications(self, job: JobRecord) -> None:
         repository = self.notification_channel_repository
         if repository is None or job.command != "backup.run" or JobStatus.normalize(job.status) != JobStatus.FAILED:
@@ -3195,6 +3223,7 @@ class ControlPlaneService:
         try:
             channels = repository.list()
             payload = self._build_failure_notification_payload(job)
+            email_context = self._build_failure_email_context(job)
             # Already-redacted retained log for the email preview and TXT attachment.
             email_log_lines = self._bounded_job_log_lines(job)
         except Exception as exc:
@@ -3207,8 +3236,13 @@ class ControlPlaneService:
             try:
                 if not repository.claim_delivery_attempt(job.id, channel.id):
                     continue
-                if channel.channel_type == "smtp" and email_log_lines:
-                    self._send_notification_channel(channel, payload, email_log_lines=email_log_lines)
+                if channel.channel_type == "smtp":
+                    self._send_notification_channel(
+                        channel,
+                        payload,
+                        email_log_lines=email_log_lines or None,
+                        email_context=email_context,
+                    )
                 else:
                     self._send_notification_channel(channel, payload)
             except Exception as exc:
@@ -3303,6 +3337,34 @@ class ControlPlaneService:
             preview.append(error_line)
         return preview
 
+    @staticmethod
+    def _failure_email_reason(summary: Any, preview_lines: List[str]) -> str:
+        summary = summary if isinstance(summary, dict) else {}
+        for key in ("error", "diagnostic_message"):
+            value = summary.get(key)
+            if isinstance(value, str) and value.strip():
+                value = value.strip()
+                return value[:512] + ("..." if len(value) > 512 else "")
+
+        for line in reversed(preview_lines):
+            if not isinstance(line, str) or line == ControlPlaneService.SMTP_LOG_PREVIEW_OMISSION_MARKER:
+                continue
+            try:
+                parsed = json.loads(line)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict) and parsed.get("message_type") == "exit_error":
+                message = parsed.get("message")
+                if isinstance(message, str) and message.strip():
+                    message = message.strip()
+                    return message[:512] + ("..." if len(message) > 512 else "")
+            if re.search(r"\b(?:fatal|error|failed|failure)\b", line, re.IGNORECASE):
+                line = line.strip()
+                return line[:512] + ("..." if len(line) > 512 else "")
+        if preview_lines:
+            return "No se recibió un detalle del error; revisa el registro adjunto."
+        return "No se recibió un detalle del error."
+
     def _smtp_plain_email_text(
         self,
         payload: Dict[str, Any],
@@ -3313,8 +3375,14 @@ class ControlPlaneService:
     ) -> str:
         """Readable plain-text alternative shared by real failures and the SMTP test preview."""
         job_id = payload.get("job_id", "unknown")
-        target = payload.get("target_id", "")
-        target_display = f" ({target})" if target and target != "None" else ""
+        target_id = payload.get("target_id", "")
+        target_name = payload.get("target_name", "")
+        host_name = payload.get("host_name", "")
+        worker_name = payload.get("worker_name", "")
+        target_display = target_name or target_id
+        target_display = f" ({target_display})" if target_display and target_display != "None" else ""
+        summary = payload.get("summary") or {}
+        failure_reason = self._failure_email_reason(summary, preview)
         if testing:
             plain_text = (
                 "PRUEBA / TESTING - Datos ficticios: no se ha ejecutado un backup real.\n"
@@ -3323,15 +3391,19 @@ class ControlPlaneService:
             )
         else:
             plain_text = f"Backup fallido: {job_id}{target_display}\n"
+        plain_text += f"\nQué falló: {failure_reason}\n"
+        if host_name:
+            plain_text += f"Servidor / host: {host_name}\n"
+        if worker_name:
+            plain_text += f"Agente: {worker_name}\n"
+        if target_display:
+            plain_text += f"Target: {target_name or target_id}\n"
+            if target_name and target_id and str(target_name) != str(target_id):
+                plain_text += f"ID del target: {target_id}\n"
         if control_plane_url:
             plain_text += f"Ver detalles: {control_plane_url}/#/jobs\n"
-        plain_text += "\nResumen del error:\n"
-        summary = payload.get("summary") or {}
-        error = summary.get("error", "")
-        if error:
-            plain_text += f"Error: {error}\n"
         diag_msg = summary.get("diagnostic_message", "")
-        if diag_msg:
+        if diag_msg and diag_msg != failure_reason:
             plain_text += f"Diagnóstico: {diag_msg}\n"
         recovery = summary.get("recovery", "")
         if recovery:
@@ -3341,7 +3413,8 @@ class ControlPlaneService:
             plain_text += "\nRegistro de error:\n"
             for line in preview:
                 plain_text += f"{line}\n"
-            plain_text += f"El registro completo va en el archivo adjunto {attachment_name}\n"
+            if attachment_name:
+                plain_text += f"El registro completo va en el archivo adjunto {attachment_name}\n"
         return plain_text
 
     @staticmethod
@@ -3368,7 +3441,6 @@ class ControlPlaneService:
         started_at = payload.get("started_at", "")
         finished_at = payload.get("finished_at", "")
         summary = payload.get("summary") or {}
-        error = summary.get("error", "")
         status_code = summary.get("status_code")
         state = summary.get("state", "")
         source = summary.get("source", "")
@@ -3376,10 +3448,14 @@ class ControlPlaneService:
         diag_code = summary.get("diagnostic_code", "")
         diag_category = summary.get("diagnostic_category", "")
         diag_message = summary.get("diagnostic_message", "")
+        target_name = payload.get("target_name", "")
+        host_name = payload.get("host_name", "")
+        worker_name = payload.get("worker_name", "")
 
         # Bounded first/last preview of the already-redacted job log. The shared
         # payload never carries log_lines, so the preview arrives separately.
         preview_lines = [str(line) for line in (log_preview or []) if isinstance(line, str)]
+        failure_reason = self._failure_email_reason(summary, preview_lines)
 
         # Build log section
         log_html = ""
@@ -3414,6 +3490,8 @@ class ControlPlaneService:
             badge_text = f"{diag_code}" if diag_code else diag_category
             diag_badge = f'<span style="display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600;color:#fff;background:#dc3545;vertical-align:middle;margin-left:8px;">{self._escape_html(badge_text)}</span>'
 
+        failure_html = f'<div style="margin:0 0 18px;padding:14px 16px;background:#f8d7da;border-left:4px solid #dc3545;border-radius:4px;color:#721c24;line-height:1.5;"><strong>Qué falló:</strong> {self._escape_html(failure_reason)}{diag_badge}</div>'
+
         # Build recovery info
         recovery_html = ""
         if recovery:
@@ -3424,8 +3502,19 @@ class ControlPlaneService:
         if diag_message:
             diag_html = f'<div style="margin-top:8px;padding:12px 16px;background:#fff3cd;border-left:4px solid #ffc107;border-radius:4px;"><strong>Diagnóstico:</strong> {self._escape_html(str(diag_message))}</div>'
 
-        # Build target info
-        target_display = self._escape_html(str(target_id)) if target_id and str(target_id) != "None" else "\u2014"
+        # Build target and host details with human-readable names before opaque IDs.
+        target_label = target_name or target_id
+        target_display = self._escape_html(str(target_label)) if target_label and str(target_label) != "None" else "\u2014"
+        if target_name and target_id and str(target_id) != "None" and str(target_name) != str(target_id):
+            target_display += f'<div style="margin-top:3px;font-size:12px;color:#6c757d;">ID: {self._escape_html(str(target_id))}</div>'
+        host_row = ""
+        if host_name:
+            host_value = self._escape_html(str(host_name))
+            if worker_name:
+                host_value += f'<div style="margin-top:3px;font-size:12px;color:#6c757d;">Agente: {self._escape_html(str(worker_name))}</div>'
+            host_row = f'<tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Servidor / host</td><td style="padding:8px 0;border-bottom:1px solid #eee;font-weight:600;">{host_value}</td></tr>'
+        elif worker_name:
+            host_row = f'<tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Agente</td><td style="padding:8px 0;border-bottom:1px solid #eee;font-weight:600;">{self._escape_html(str(worker_name))}</td></tr>'
 
         # Build state/status row
         state_row = ""
@@ -3481,16 +3570,17 @@ class ControlPlaneService:
           <tr>
             <td style="padding:24px;">
               {intro_html}
+              {failure_html}
               <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
-                <tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Identificador del trabajo</td><td style="padding:8px 0;border-bottom:1px solid #eee;"><code style="background:#f1f3f5;padding:3px 8px;border-radius:4px;font-size:13px;">{self._escape_html(job_id)}</code></td></tr>
+                {host_row}
                 <tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Target</td><td style="padding:8px 0;border-bottom:1px solid #eee;font-weight:600;">{target_display}</td></tr>
+                <tr><td style="padding:8px 0;border-bottom:1px solid #eee;color:#6c757d;">Identificador del trabajo</td><td style="padding:8px 0;border-bottom:1px solid #eee;"><code style="background:#f1f3f5;padding:3px 8px;border-radius:4px;font-size:13px;">{self._escape_html(job_id)}</code></td></tr>
                 {state_row}
                 {code_row}
                 {source_row}
                 <tr><td style="padding:8px 0;color:#6c757d;">Inicio</td><td style="padding:8px 0;">{self._escape_html(started_at) if started_at else missing_date}</td></tr>
                 <tr><td style="padding:8px 0;color:#6c757d;">Finalización</td><td style="padding:8px 0;">{self._escape_html(finished_at) if finished_at else missing_date}</td></tr>
               </table>
-              {f'<div style="margin-bottom:16px;padding:12px 16px;background:#f8d7da;border-left:4px solid #dc3545;border-radius:4px;"><strong>Error:</strong> <span style="color:#721c24;">{self._escape_html(error)}{diag_badge}</span></div>' if error else ''}
               {recovery_html}
               {diag_html}
               {f'<div style="margin-top:24px;text-align:center;"><a href="{detail_url}" style="display:inline-block;padding:10px 24px;background:#007bff;color:#fff;text-decoration:none;border-radius:6px;font-weight:600;font-size:14px;">Ver trabajos en el sistema de backups</a></div>' if detail_url else ''}
@@ -3516,6 +3606,7 @@ class ControlPlaneService:
         email_log_lines: Optional[List[str]] = None,
         recipient_override: Optional[List[str]] = None,
         report_template_testing: bool = False,
+        email_context: Optional[Dict[str, str]] = None,
     ) -> None:
         # `recipient_override` is accepted only from the SMTP test path
         # (`notification.test`); scheduled backup/webhook deliveries always pass
@@ -3541,15 +3632,28 @@ class ControlPlaneService:
                 raise ValueError("notification webhook returned a non-success response")
             return
 
+        # SMTP-only display context is added after the bounded shared-payload check.
+        email_payload = {**payload, **(email_context or {})}
+
         # --- SMTP: build a professional multipart/alternative email ---
         message = EmailMessage()
         if subject is not None:
             message["Subject"] = subject
-        elif payload.get("event") == "backup.failed":
-            job_id = payload.get("job_id", "unknown")
-            target = payload.get("target_id", "")
-            target_display = f" ({target})" if target and target != "None" else ""
-            message["Subject"] = f"Backup fallido: {job_id}{target_display}"
+        elif email_payload.get("event") == "backup.failed":
+            job_id = email_payload.get("job_id", "unknown")
+            target_name = email_payload.get("target_name", "")
+            if not target_name and email_payload.get("target_id"):
+                target_name = str(email_payload["target_id"])
+            host_name = email_payload.get("host_name", "")
+            location_parts = [str(value).strip() for value in (target_name, host_name) if isinstance(value, str) and value.strip()]
+            if location_parts:
+                location = " en ".join(location_parts)
+                location = re.sub(r"[\r\n\t]+", " ", location)[:180]
+                message["Subject"] = f"Backup fallido - {location}"
+            else:
+                target = email_payload.get("target_id", "")
+                target_display = f" ({target})" if target and target != "None" else ""
+                message["Subject"] = f"Backup fallido: {job_id}{target_display}"
         else:
             message["Subject"] = f"Backup failed: {payload.get('job_id', 'unknown')}"
 
@@ -3573,11 +3677,11 @@ class ControlPlaneService:
             preview = self._smtp_log_preview_lines(email_log_lines) if email_log_lines else []
             attachment_name = self._smtp_log_attachment_name(payload.get("job_id")) if preview else ""
             html_body = self._build_html_email_body(
-                payload, control_plane_url, log_preview=preview, attachment_name=attachment_name,
+                email_payload, control_plane_url, log_preview=preview, attachment_name=attachment_name,
                 testing=report_template_testing,
             )
             plain_text = self._smtp_plain_email_text(
-                payload, control_plane_url, preview, attachment_name or "", testing=report_template_testing
+                email_payload, control_plane_url, preview, attachment_name or "", testing=report_template_testing
             )
 
             message.set_content(plain_text)

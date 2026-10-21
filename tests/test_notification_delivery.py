@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 from cryptography.fernet import Fernet
 
 from src.control_plane.application.services.control_plane_service import ControlPlaneService
-from src.control_plane.domain.models import JobRecord, JobStatus, WorkerRecord, WorkerStatus, utcnow
+from src.control_plane.domain.models import BackupTargetRecord, JobRecord, JobStatus, WorkerRecord, WorkerStatus, utcnow
 from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryCacheRepository,
     InMemoryIndexRepository,
@@ -188,6 +188,40 @@ class NotificationDeliveryTests(unittest.TestCase):
         self.assertNotIn("INFO: step", json.dumps(webhook))
         self.assertLessEqual(len(json.dumps(webhook, ensure_ascii=False).encode("utf-8")), 8192)
         self.assertEqual(webhook["summary"]["status_code"], 1)
+
+    def test_failure_email_highlights_reason_target_and_worker_host(self):
+        target_repository = self.service.target_repository
+        target_repository.save(BackupTargetRecord(name="production-db", worker_id="worker-a", id="target-a"))
+        worker = self.workers.get("worker-a")
+        worker.host_name = "backup-node-07"
+        self.workers.save(worker)
+        self.service.create_notification_channel(
+            name="Mail", channel_type="smtp",
+            config={"host": "mail.internal", "from": "backup@example.test", "to": ["oncall@example.test"]},
+        )
+        logs = [
+            '{"message_type":"exit_error","code":1,"message":"Fatal: unable to open repository: context deadline exceeded"}'
+        ]
+
+        message, webhook, result = self._complete_with_mocked_delivery(logs)
+
+        self.assertEqual(result.status, JobStatus.FAILED)
+        self.assertIn("production-db", message["Subject"])
+        self.assertIn("backup-node-07", message["Subject"])
+        plain = message.get_body(preferencelist=("plain",)).get_content()
+        html = message.get_body(preferencelist=("html",)).get_content()
+        self.assertIn("Qué falló", plain)
+        self.assertIn("Fatal: unable to open repository: context deadline exceeded", plain)
+        self.assertIn("Servidor / host: backup-node-07", plain)
+        self.assertIn("Target: production-db", plain)
+        self.assertIn("Servidor / host", html)
+        self.assertIn("backup-node-07", html)
+        self.assertIn("production-db", html)
+        self.assertIn("target-a", html)
+        self.assertLess(html.index("Qué falló"), html.index("Servidor / host"))
+        self.assertLess(html.index("Servidor / host"), html.index("Registro de error"))
+        self.assertNotIn("host_name", json.dumps(webhook))
+        self.assertNotIn("production-db", json.dumps(webhook))
 
     def test_long_unicode_logs_still_send_with_bounded_head_tail_preview(self):
         self.service.create_notification_channel(

@@ -131,7 +131,7 @@ class EnrollmentFilesTrustedTests(unittest.TestCase):
 
     def test_system_and_administrators_owners_are_trusted_on_windows(self):
         for sid in ("S-1-5-18", "S-1-5-32-544"):
-            with self.subTest(sid=sid):
+            with self.subTest(sid=sid), patch.object(state_paths, "_platform_is_windows", return_value=True):
                 self.assertTrue(state_paths.enrollment_files_trusted([self.credential, self.config], owner_resolver=lambda _path: sid))
 
     def test_standard_user_owner_is_rejected(self):
@@ -295,11 +295,14 @@ class EnrollPersistsConfigTests(unittest.TestCase):
             self.secured.assert_not_called()
 
     def test_enroll_without_permission_to_lock_down_state_dir_fails_cleanly(self):
+        from src.worker_agent import cli
+
         with tempfile.TemporaryDirectory() as directory:
             def deny(path):
                 raise PermissionError(f"could not restrict permissions on {path}")
 
-            code, out, err = self._run(["enroll", "--control-plane-url", "http://cp"], {"WORKER_STATE_DIR": directory}, secure_state_dir=deny)
+            with patch("src.worker_agent.cli._is_windows", return_value=True):
+                code, out, err = self._run(["enroll", "--control-plane-url", "http://cp"], {"WORKER_STATE_DIR": directory}, secure_state_dir=deny)
             self.assertEqual(code, 1)
             self.assertEqual(self.FakeClient.instances, [])
             self.assertEqual(out, "")

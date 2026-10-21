@@ -62,7 +62,8 @@ class WorkerEnrollmentCLITests(unittest.TestCase):
                     "private path and https://secret.invalid", icacls_error_code=error_code,
                     pending_state_may_exist=True,
                 )
-                with patch.dict(os.environ, {"WORKER_CREDENTIAL_FILE": path}, clear=True), \
+                with patch("src.worker_agent.cli._is_windows", return_value=True), \
+                        patch.dict(os.environ, {"WORKER_CREDENTIAL_FILE": path}, clear=True), \
                         patch("src.worker_agent.cli.state_dir_is_managed", return_value=False), \
                         patch("getpass.getpass", return_value=token), \
                         patch("src.worker_agent.cli.WorkerCredentialStore.save_pending_enrollment", side_effect=failure), \
@@ -98,6 +99,7 @@ class WorkerEnrollmentCLITests(unittest.TestCase):
         errors = io.StringIO()
         token = "bootstrap-secret-should-not-appear-123"
         with tempfile.TemporaryDirectory() as directory, \
+                patch("src.worker_agent.cli._is_windows", return_value=True), \
                 patch.dict(os.environ, {"WORKER_CREDENTIAL_FILE": os.path.join(directory, "credentials.json")}, clear=True), \
                 patch("src.worker_agent.cli.state_dir_is_managed", return_value=False), \
                 patch("getpass.getpass", return_value=token), \

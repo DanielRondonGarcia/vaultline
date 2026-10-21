@@ -634,11 +634,19 @@
     }
 
     function isVersionOutdated(current, latest) {
-      const normalize = v => (v || "").replace(/^v/, "").trim();
-      const cur = normalize(current);
-      const lat = normalize(latest);
-      if (!cur || !lat || cur === "dev") return false;
-      return cur !== lat;
+      const parse = (raw) => {
+        const value = (raw || "").replace(/^v/, "").trim();
+        const parts = value.split(".");
+        if (parts.length !== 3 || parts.some(part => !/^\d+$/.test(part))) return null;
+        return parts.map(Number);
+      };
+      const cur = parse(current);
+      const lat = parse(latest);
+      if (!cur || !lat) return false;
+      for (let i = 0; i < cur.length; i++) {
+        if (lat[i] !== cur[i]) return lat[i] > cur[i];
+      }
+      return false;
     }
 
     function renderVersionBanner() {
@@ -961,11 +969,7 @@
     function renderWorkers(content) {
       const canEnroll = state.currentRole === "admin";
       const latest = state.latestVersion ? state.latestVersion.replace(/^v/, "").trim() : null;
-      const isOutdated = (wv) => {
-        const cur = (wv || "").replace(/^v/, "").trim();
-        if (!cur || !latest || cur === "dev") return false;
-        return cur !== latest;
-      };
+      const isOutdated = (wv) => isVersionOutdated(wv, latest);
       const versionCell = (wv) => {
         const cur = (wv || "").replace(/^v/, "").trim();
         if (!cur || cur === "dev") return `<span class="mono">—</span>`;

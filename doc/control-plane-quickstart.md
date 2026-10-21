@@ -623,6 +623,13 @@ Notas prácticas de los formularios:
 - si un formulario falla por un `JSON` inválido, la UI lo notifica antes de
   enviar una carga inconsistente al backend.
 
+Avisos de versión: el banner de actualización de la UI y la marca
+«Desactualizado» de cada worker aparecen solo cuando la versión publicada
+conocida es numéricamente superior a la instalada (se comparan mayor, menor y
+patch). Con una versión igual o más nueva instalada no hay aviso, aunque los
+datos del release conocido fueran más antiguos; sin datos de versión válidos
+tampoco se muestra un aviso de actualización. La versión del worker sigue visible.
+
 ## 5. Configuración de backup
 
 ### Crear un target de backup

@@ -22,4 +22,8 @@ Si el worker nunca regresa, el resultado permanece sin confirmar. Investiga el h
 
 Los logs se redactan antes de guardarlos. Los archivos usan permisos privados y escritura atómica. La cola admite 64 lotes por ejecución, hasta 64 KiB por lote, con una antigüedad máxima de 7 días. Bajo presión de retención, se conservan los datos más recientes; una advertencia señala la omisión de líneas antiguas. El journal de resultados conserva hasta 32 resultados de hasta 2 MiB cada uno.
 
+## Retención vacía y versión del runtime
+
+Un `RESTIC_KEEP_YEARLY=""` procedente de una política explícita del target significa que esa regla no se aplica; no debe convertirse con `int("")` ni reinterpretarse como `0`. El parser actual usa `RESTIC_RETENTION_POLICY_CONFIGURED=true` para distinguir la política explícita de los valores heredados. Sin ese indicador, una cadena vacía es configuración inválida y se informa con el nombre de la variable. Un runtime antiguo que todavía use `int(os.environ.get(...))` necesita actualizarse: los reintentos de conexión no corrigen ese error de ejecución.
+
 La persistencia requiere que el directorio de estado del worker sea escribible y sobreviva al reinicio del proceso/contenedor. Un error de disco se registra; no equivale a una garantía de persistencia. No borres estos archivos para resolver una desconexión: contienen información todavía no confirmada.

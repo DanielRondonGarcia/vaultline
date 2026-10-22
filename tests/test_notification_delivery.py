@@ -223,6 +223,22 @@ class NotificationDeliveryTests(unittest.TestCase):
         self.assertNotIn("host_name", json.dumps(webhook))
         self.assertNotIn("production-db", json.dumps(webhook))
 
+    def test_python_exception_is_used_as_email_reason_instead_of_generic_fallback(self):
+        self.service.create_notification_channel(
+            name="Mail", channel_type="smtp",
+            config={"host": "mail.internal", "from": "backup@example.test", "to": ["oncall@example.test"]},
+        )
+        error = "ValueError: invalid literal for int() with base 10: ''"
+        message, webhook, result = self._complete_with_mocked_delivery([
+            "Traceback (most recent call last):", "  restic_keep_yearly = int(value)", error,
+        ])
+        plain = message.get_body(preferencelist=("plain",)).get_content()
+        reason = plain.split("Servidor / host", 1)[0]
+        self.assertIn(error, reason)
+        self.assertNotIn("No se recibió un detalle del error", reason)
+        self.assertEqual(result.status, JobStatus.FAILED)
+        self.assertNotIn("log_lines", webhook)
+
     def test_long_unicode_logs_still_send_with_bounded_head_tail_preview(self):
         self.service.create_notification_channel(
             name="Mail", channel_type="smtp",

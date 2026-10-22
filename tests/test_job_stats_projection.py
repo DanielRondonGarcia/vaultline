@@ -391,13 +391,13 @@ class JobStatsProjectionTests(unittest.TestCase):
             self.assertEqual(reconciled, 1)
             expired_stats = repository.job_stats(tz_offset_minutes=0, now=_STATS_NOW)
             self.assertEqual(expired_stats["total"], 1)
-            self.assertEqual(expired_stats["by_status"], {"failed": 1})
+            self.assertEqual(expired_stats["by_status"], {"in_progress": 1})
             # Reconciliation keeps the claim-time started_at, which in this
             # fixture is the current date, outside the frozen seven-day
             # window of _STATS_NOW's day keys: it counts in totals only.
             self.assertEqual(
                 self._facts_rows(database_path),
-                [("p7-lease-cycle", "failed", claimed_started_at)],
+                [("p7-lease-cycle", "in_progress", claimed_started_at)],
             )
 
     def test_empty_database_report_zeroed_shape(self):

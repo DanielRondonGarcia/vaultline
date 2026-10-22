@@ -46,7 +46,7 @@ Un vencimiento de lease sin resultado final no genera `backup.failed`: el trabaj
 
 Los avisos SMTP llegan como correo HTML con alternativa de texto plano (no JSON):
 
-- El asunto identifica el target y el host; al inicio del cuerpo se destaca **Qué falló**, seguido por **Servidor / host** y el nombre del target (con su ID como referencia). Si el resumen no trae un error, se extrae una causa reconocible del log saneado, incluyendo mensajes de error estructurados; el log completo sigue adjunto.
+- El asunto identifica el target y el host; al inicio del cuerpo se destaca **Qué falló**, seguido por **Servidor / host** y el nombre del target (con su ID como referencia). Si el resumen no trae un error, se extrae una causa reconocible del log saneado, incluyendo mensajes de error estructurados y excepciones Python como `ValueError: invalid literal for int() with base 10: ''`; el log completo sigue adjunto.
 - Estos nombres de host y target se agregan solo al correo SMTP. El resumen JSON del webhook conserva su contrato y no recibe esos campos.
 - Con la URL pública del Control Plane configurada (`control_plane_public_url` en Settings, por ejemplo `https://backups.miempresa.com`), el correo incluye el enlace **Ver trabajos en el sistema de backups** hacia la lista de jobs; los links solo se generan con URLs absolutas `http://` o `https://`.
 - Al final del correo, después del enlace, va la sección **Registro de error**: una vista previa acotada con las primeras y últimas líneas del log (máx. 50 líneas o 4 KiB en total). Si se cortaron líneas del medio, aparece un marcador `Contenido omitido`; la última línea `ERROR` se conserva siempre, incluso con líneas Unicode muy largas, y el texto indica que el registro completo va en el archivo adjunto.

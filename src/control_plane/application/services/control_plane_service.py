@@ -3358,7 +3358,7 @@ class ControlPlaneService:
                 if isinstance(message, str) and message.strip():
                     message = message.strip()
                     return message[:512] + ("..." if len(message) > 512 else "")
-            if re.search(r"\b(?:fatal|error|failed|failure)\b", line, re.IGNORECASE):
+            if re.search(r"\b(?:fatal|error|failed|failure)\b|\b[A-Za-z_]\w*(?:Error|Exception):", line, re.IGNORECASE):
                 line = line.strip()
                 return line[:512] + ("..." if len(line) > 512 else "")
         if preview_lines:

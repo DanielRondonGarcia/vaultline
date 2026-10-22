@@ -248,6 +248,11 @@
       notificationChannelFeedback: null,
       pageDataLoaded: {},
       pageDataPending: {},
+      // T3: frescura/estado de warming de los read models (stats/targets)
+      readModels: {
+        stats: { updatedAt: null, ageSeconds: null, observedAtMs: null, warmingUp: false, retryTimer: null, retryAfterMs: null, retryDelayMs: null, outstanding: null },
+        targets: { updatedAt: null, ageSeconds: null, observedAtMs: null, warmingUp: false, retryTimer: null, retryAfterMs: null, retryDelayMs: null, outstanding: null },
+      },
     };
     let workersNotice = null;
 
@@ -496,10 +501,31 @@
       return `<span class="cmd-badge ${m.cls}"><span class="cmd-badge-icon">${m.icon}</span>${escapeHtml(m.label)}</span>`;
     }
 
+    // Solo los lectores del read model (jobs/stats y targets) pasan este hook
+    // opcional: capturan frescura del snapshot por cabecera sin tocar el body.
+    function readModelHeaderValue(resp, name) {
+      const headers = resp && resp.headers;
+      if (!headers || typeof headers.get !== "function") return null;
+      const value = headers.get(name);
+      return value === null || value === undefined || value === "" ? null : String(value);
+    }
+
+    function readModelRetryAfterMs(resp) {
+      const raw = readModelHeaderValue(resp, "Retry-After");
+      if (raw === null) return null;   // sin cabecera: sin reintento solicitado (cae al default en la UI)
+      const seconds = Number(raw);
+      return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : null;
+    }
+
     async function apiGet(path, options = {}) {
-      const resp = await fetch(path, { ...options, method: "GET" });
+      const { onResponseMeta: explicitHook, ...fetchOptions } = options || {};
+      const resp = await fetch(path, { ...fetchOptions, method: "GET" });
+      // Los lectores del read model (/api/v1/targets y /api/v1/jobs/stats)
+      // capturan su frescura por cabecera; el resto de llamadas se queda igual.
+      const onMetadata = typeof explicitHook === "function" ? explicitHook : captureReadModelMetaForPath(path);
       if (resp.status === 401) { window.location.href = "/login"; throw new Error("auth"); }
       if (!resp.ok) {
+        if (onMetadata) onMetadata({ status: resp.status, retryAfterMs: readModelRetryAfterMs(resp) });
         const err = await resp.json().catch(() => ({}));
         const error = new Error(typeof err.error === "string" ? err.error : `${resp.status} ${resp.statusText}`);
         error.status = resp.status;
@@ -507,6 +533,14 @@
         error.reason = typeof err.reason === "string" ? err.reason : "";
         error.path = typeof err.path === "string" ? err.path : "";
         throw error;
+      }
+      if (onMetadata) {
+        const ageSeconds = Number(readModelHeaderValue(resp, "X-Read-Model-Age-Seconds"));
+        onMetadata({
+          status: resp.status,
+          updatedAt: readModelHeaderValue(resp, "X-Read-Model-Updated-At"),
+          ageSeconds: Number.isFinite(ageSeconds) ? ageSeconds : null,
+        });
       }
       return resp.json();
     }
@@ -751,6 +785,7 @@
       }
       if (view !== "workers") stopWorkersPolling();
       if (view !== "targets") stopTargetsPolling();
+      stopReadModelTimersForView(view);
       renderSidebar();
       renderTopbar();
       const content = document.getElementById("content");
@@ -797,6 +832,13 @@
       if (view === "dashboard" && previousView !== view) void refreshDashboardJobs();
     }
     window.addEventListener("hashchange", route);
+    window.addEventListener("pagehide", () => {
+      // Menú de descarga: todos los timers del read model (reintentos y edad
+      // visible) se detienen al descartar la página.
+      stopReadModelRetryTimer("stats");
+      stopReadModelRetryTimer("targets");
+      stopReadModelFreshnessTicker();
+    });
 
     function statCard(eyebrow, title, value, meta) {
       return `<article class="card compact"><span class="eyebrow">${escapeHtml(eyebrow)}</span><div class="title">${escapeHtml(title)}</div><div class="value">${escapeHtml(String(value))}</div><div class="meta">${escapeHtml(meta || "")}</div></article>`;
@@ -820,23 +862,244 @@
 
     const EMPTY_JOB_STATS = { total: 0, by_status: {}, by_day: [] };
 
+    // ================================================= T3 read models del dashboard ============
+    // GET /api/v1/jobs/stats y GET /api/v1/targets se sirven desde snapshots "last-good"
+    // del backend. La UI captura X-Read-Model-Updated-At / X-Read-Model-Age-Seconds por
+    // cabecera (nunca en el body), aplica workers/targets/stats/jobs y demás widgets de
+    // forma independiente según responde cada petición (sin await-all que bloquee el
+    // dashboard o el arranque), muestra "Preparando ..." durante el warm-up (un 503 de
+    // warm-up nunca es éxito con datos falsos) y reintenta según la cabecera Retry-After
+    // con un timer acotado por tipo: sin peticiones/sondeos duplicados, pausado fuera de
+    // dashboard/targets y detenido al navegar o descargar la página.
+    const READ_MODEL_WARMUP_CODE = "read_model_warming_up";
+    const READ_MODEL_RETRY_DEFAULT_MS = 5000;   // igual al Retry-After que envía el backend en warm-up
+    const READ_MODEL_RETRY_MAX_MS = 30000;      // cadencia tope del reintento
+    const READ_MODEL_FRESHNESS_TICK_MS = 1000;  // la edad visible avanza cada segundo
+    const READ_MODEL_PREPARING_TEXT = {
+      stats: "Preparando estadísticas...",
+      targets: "Preparando targets...",
+    };
+    let targetsSnapshotRequest = null;
+    let readModelFreshnessTimer = null;
+    let lastDashboardSnapshotRefreshAtMs = 0;
+
+    function readModelEntry(kind) {
+      state.readModels = state.readModels || {
+        stats: { updatedAt: null, ageSeconds: null, observedAtMs: null, warmingUp: false, retryTimer: null, retryAfterMs: null, retryDelayMs: null, outstanding: null },
+        targets: { updatedAt: null, ageSeconds: null, observedAtMs: null, warmingUp: false, retryTimer: null, retryAfterMs: null, retryDelayMs: null, outstanding: null },
+      };
+      return state.readModels[kind];
+    }
+
+    function readModelRetryDelayMs(retryAfterMs) {
+      const requested = Number.isFinite(retryAfterMs) && retryAfterMs >= 0 ? retryAfterMs : READ_MODEL_RETRY_DEFAULT_MS;
+      return Math.min(Math.max(requested, 100), READ_MODEL_RETRY_MAX_MS);
+    }
+
+    function captureReadModelMeta(kind, meta) {
+      const entry = readModelEntry(kind);
+      if (!entry || !meta) return;
+      if (meta.updatedAt !== null && meta.updatedAt !== undefined) {
+        entry.updatedAt = meta.updatedAt;
+        entry.ageSeconds = Number.isFinite(meta.ageSeconds) ? meta.ageSeconds : null;
+        entry.observedAtMs = Date.now();
+        entry.warmingUp = false;
+        return;
+      }
+      if (meta.status === 503) {
+        // Warm-up explícito: aún no hay snapshot, no se escriben ceros falsos.
+        entry.warmingUp = true;
+        entry.retryAfterMs = meta.retryAfterMs;
+      }
+      // Otros estados sin cabeceras de snapshot (401/403/gate de roles, body legado)
+      // dejan intacta la frescura ya capturada.
+    }
+
+    function captureReadModelMetaForPath(path) {
+      // Hook de metadata solo para las dos lecturas del read model.
+      if (path === "/api/v1/targets") return meta => captureReadModelMeta("targets", meta);
+      if (typeof path === "string" && path.startsWith("/api/v1/jobs/stats")) return meta => captureReadModelMeta("stats", meta);
+      return null;
+    }
+
+    function scheduleReadModelRetry(kind, reload) {
+      const entry = readModelEntry(kind);
+      if (!entry || entry.retryTimer || typeof reload !== "function") return; // un solo timer acotado por tipo, sin sondeos duplicados
+      entry.retryTimer = setTimeout(() => {
+        entry.retryTimer = null;
+        if (!readModelTimerActive(kind)) return; // pausado fuera de dashboard/targets
+        reload();
+      }, readModelRetryDelayMs(entry.retryAfterMs));
+      entry.retryAfterMs = null;
+    }
+
+    function readModelTimerActive(kind) {
+      if (kind === "stats") return state.currentView === "dashboard";
+      return state.currentView === "dashboard" || state.currentView === "targets";
+    }
+
+    function stopReadModelRetryTimer(kind) {
+      const entry = readModelEntry(kind);
+      if (entry && entry.retryTimer) {
+        clearTimeout(entry.retryTimer);
+        entry.retryTimer = null;
+      }
+    }
+
+    function readModelFreshness(kind, hasData) {
+      const entry = readModelEntry(kind);
+      if (!entry) return null;
+      if (entry.updatedAt !== null && entry.updatedAt !== undefined) {
+        const elapsedSeconds = Number.isFinite(entry.observedAtMs) ? Math.max(0, Math.floor((Date.now() - entry.observedAtMs) / 1000)) : 0;
+        const ageSeconds = (Number.isFinite(entry.ageSeconds) ? entry.ageSeconds : 0) + elapsedSeconds;
+        return `Actualizado hace ${ageSeconds} s (datos de ${fmtDate(entry.updatedAt)})`;
+      }
+      if (entry.warmingUp && !hasData) return READ_MODEL_PREPARING_TEXT[kind];
+      return null;
+    }
+
+    function updateReadModelFreshness() {
+      // La edad visible avanza cada segundo sin re-render: los tables/editores no se tocan.
+      const statsElement = document.getElementById("readModelStatsFreshness");
+      if (statsElement) statsElement.textContent = readModelFreshness("stats", Boolean(state.jobStats)) || "";
+      const targetsElement = document.getElementById("readModelTargetsFreshness");
+      if (targetsElement) targetsElement.textContent = readModelFreshness("targets", state.targets.length > 0) || "";
+    }
+
+    function startReadModelFreshnessTicker() {
+      if (readModelFreshnessTimer) return;
+      lastDashboardSnapshotRefreshAtMs = Date.now();
+      readModelFreshnessTimer = setInterval(() => {
+        updateReadModelFreshness();
+        if (state.currentView !== "dashboard" || Date.now() - lastDashboardSnapshotRefreshAtMs < READ_MODEL_RETRY_DEFAULT_MS) return;
+        lastDashboardSnapshotRefreshAtMs = Date.now();
+        const stats = readModelEntry("stats");
+        const targets = readModelEntry("targets");
+        if (!stats.outstanding && !stats.retryTimer) void refreshDashboardJobs();
+        if (!targetsSnapshotRequest && !targets.retryTimer) refreshTargetsSnapshotWithRetry();
+      }, READ_MODEL_FRESHNESS_TICK_MS);
+      updateReadModelFreshness();
+    }
+
+    function stopReadModelTimersForView(nextView) {
+      // Los timers de stats son solo del dashboard; los de targets aplican en
+      // dashboard y targets; al quedar fuera se detienen (navegación/descarga).
+      if (nextView !== "dashboard") stopReadModelRetryTimer("stats");
+      if (nextView !== "dashboard" && nextView !== "targets") stopReadModelRetryTimer("targets");
+      if (nextView === "dashboard" || nextView === "targets") startReadModelFreshnessTicker();
+      else stopReadModelFreshnessTicker();
+    }
+
+    function renderDashboardContentIfVisible() {
+      const content = document.getElementById("content");
+      if (content && state.currentView === "dashboard") {
+        if (typeof renderDashboard === "function") renderDashboard(content);
+        updateReadModelFreshness();
+      }
+    }
+
+    function applyDashboardTargets(items) {
+      const newTargets = Array.isArray(items) ? items : [];
+      const targetsChanged = JSON.stringify(newTargets.map(targetFingerprint)) !== JSON.stringify((state.targets || []).map(targetFingerprint));
+      state.targets = newTargets;
+      if (!targetsChanged) return { items: newTargets, changed: false };
+      const content = document.getElementById("content");
+      if (state.currentView === "targets" && content) renderTargetsTable();
+      else if (state.currentView === "dashboard" && content) renderDashboard(content);
+      updateReadModelFreshness();
+      return { items: newTargets, changed: true };
+    }
+
+    function loadTargetsSnapshot() {
+      if (targetsSnapshotRequest) return targetsSnapshotRequest;   // coalescente: máximo una petición en curso
+      targetsSnapshotRequest = apiGet("/api/v1/targets")
+        .then(response => applyDashboardTargets(response && response.items))
+        .catch(error => {
+          if (error.code === READ_MODEL_WARMUP_CODE) return null;  // warm-up: se conserva el último targets bueno
+          throw error;                                             // error transitorio: último bueno + poll
+        })
+        .finally(() => { targetsSnapshotRequest = null; });
+      return targetsSnapshotRequest;
+    }
+
+    function refreshTargetsSnapshotWithRetry() {
+      void loadTargetsSnapshot()
+        .then(targetsResponse => {
+          if (targetsResponse || targetsPolling) return;  // el poll propio ya reintenta a su cadencia
+          // Sin poll en curso (p. ej. arranque en dashboard): reintento acotado según Retry-After.
+          scheduleReadModelRetry("targets", refreshTargetsSnapshotWithRetry);
+        })
+        .catch(() => null); // error transitorio: se conserva el último targets bueno
+    }
+
+    function stopReadModelFreshnessTicker() {
+      if (readModelFreshnessTimer) {
+        clearInterval(readModelFreshnessTimer);
+        readModelFreshnessTimer = null;
+      }
+    }
+
     async function fetchDashboardJobs() {
-      const [jobs, stats] = await Promise.all([
-        apiGet("/api/v1/jobs?limit=5"),
-        apiGet(`/api/v1/jobs/stats?tz_offset=${browserTimezoneOffsetMinutes()}`).catch(() => null),
-      ]);
-      return { jobs, stats };
+      // Los widgets del dashboard se aplican de forma independiente a medida que
+      // responde cada petición: el listado de jobs recientes nunca espera al
+      // snapshot de stats (ni a sus reintentos de warm-up), y viceversa.
+      const dashboard = { jobs: null, stats: null };
+      const statsMeta = (state.readModels = state.readModels || {
+        stats: { updatedAt: null, ageSeconds: null, observedAtMs: null, warmingUp: false, retryTimer: null, retryAfterMs: null, retryDelayMs: null, outstanding: null },
+        targets: { updatedAt: null, ageSeconds: null, observedAtMs: null, warmingUp: false, retryTimer: null, retryAfterMs: null, retryDelayMs: null, outstanding: null },
+      }).stats;
+
+      const captureStatsMeta = meta => captureReadModelMeta("stats", meta);
+      const scheduleStatsRetry = () => scheduleReadModelRetry("stats", () => { void loadStats().catch(() => null); });
+      const renderIfVisible = () => {
+        if (typeof renderDashboardContentIfVisible === "function") renderDashboardContentIfVisible();
+      };
+      const loadStats = async () => {
+        if (statsMeta.outstanding) return statsMeta.outstanding;  // coalescente: máximo una petición de stats en curso
+        const request = apiGet(`/api/v1/jobs/stats?tz_offset=${browserTimezoneOffsetMinutes()}`)
+          .then(snapshot => {
+            if (!snapshot) return null;
+            dashboard.stats = snapshot;
+            applyDashboardJobs({ stats: dashboard.stats });
+            renderIfVisible();
+            return snapshot;
+          })
+          .catch(error => {
+            if (error.code === READ_MODEL_WARMUP_CODE) {
+              // Warm-up 503: no es éxito con datos falsos. Se conserva el último
+              // buen dato, se muestra el aviso y se reintenta según Retry-After.
+              scheduleStatsRetry();
+              return null;
+            }
+            throw error; // error transitorio: el dashboard mantiene su último dato bueno
+          });
+        const coalesced = request.finally(() => { if (statsMeta.outstanding === coalesced) statsMeta.outstanding = null; });
+        statsMeta.outstanding = coalesced;
+        return statsMeta.outstanding;
+      };
+
+      void loadStats().catch(() => null);
+      void apiGet("/api/v1/jobs?limit=5")
+        .then(response => {
+          dashboard.jobs = { items: response.items || [] };
+          applyDashboardJobs({ jobs: dashboard.jobs });
+          renderIfVisible();
+        })
+        .catch(() => null);
+      return dashboard;
     }
 
     function applyDashboardJobs(dashboard) {
       if (!dashboard) return;
-      state.jobs = mergeJobList((dashboard.jobs && dashboard.jobs.items) || []);
+      if (dashboard.jobs) state.jobs = mergeJobList((dashboard.jobs && dashboard.jobs.items) || []);
       if (dashboard.stats) state.jobStats = dashboard.stats;
     }
 
     function renderDashboard(content) {
       const onlineWorkers = state.workers.filter(w => w.status === "online").length;
       const stats = state.jobStats || EMPTY_JOB_STATS;
+      const statsPending = !state.jobStats && Boolean(state.readModels.stats.warmingUp);
+      const targetsPending = !state.targets.length && Boolean(state.readModels.targets.warmingUp);
       const byStatus = stats.by_status || {};
       const jobsTotal = Number(stats.total) || 0;
       const jobsSuccess = Number(byStatus.succeeded) || 0;
@@ -899,31 +1162,31 @@
 
       content.innerHTML = `
         <div class="dashboard-content">
-        <div class="page-header"><div><h2>Resumen</h2><div class="subtitle">Estado general del Control Plane</div></div></div>
+        <div class="page-header"><div><h2>Resumen</h2><div class="subtitle">Estado general del Control Plane</div><div class="helper" id="readModelStatsFreshness" role="status" aria-live="polite"></div></div></div>
         <div class="stat-grid">
           ${statCard("Workers", "Online", onlineWorkers, `${state.workers.length} total`)}
-          ${statCard("Targets", "Configurados", state.targets.length, "targets de backup")}
-          ${statCard("Jobs", "Total", jobsTotal, "historico de jobs")}
+          ${statCard("Targets", "Configurados", targetsPending ? "…" : state.targets.length, targetsPending ? "Preparando targets..." : "targets de backup")}
+          ${statCard("Jobs", "Total", statsPending ? "…" : jobsTotal, statsPending ? "Preparando estadísticas..." : "historico de jobs")}
           ${statCard("Storage", "Profiles", state.storageProfiles.length, "profiles configurados")}
         </div>
 
         <div class="dashboard-charts">
           <div class="card compact chart-card">
-            <div class="chart-header"><span class="eyebrow">Estado de Jobs</span><span class="chart-value">${successRate}% exito</span></div>
+            <div class="chart-header"><span class="eyebrow">Estado de Jobs</span>${statsPending ? `<span class="chart-value" role="status">Preparando estadísticas...</span>` : `<span class="chart-value">${successRate}% exito</span>`}</div>
             <div class="donut-container">
               <svg viewBox="0 0 120 120" class="donut-svg">
                 ${donutPaths || `<circle cx="60" cy="60" r="36.5" fill="none" stroke="var(--border)" stroke-width="17" />`}
-                <text x="60" y="58" text-anchor="middle" font-size="20" font-weight="700" fill="var(--foreground)">${jobsTotal}</text>
+                <text x="60" y="58" text-anchor="middle" font-size="20" font-weight="700" fill="var(--foreground)">${statsPending ? "…" : jobsTotal}</text>
                 <text x="60" y="72" text-anchor="middle" font-size="9" fill="var(--muted-foreground)">jobs</text>
               </svg>
               <div class="donut-legend">
-                ${donutSegments.map(s => `<div class="legend-item"><span class="legend-dot" style="background:${s.color}"></span><span class="legend-label">${escapeHtml(s.label)}</span><span class="legend-value">${s.value}</span></div>`).join("") || '<div class="legend-empty">Sin datos</div>'}
+                ${donutSegments.map(s => `<div class="legend-item"><span class="legend-dot" style="background:${s.color}"></span><span class="legend-label">${escapeHtml(s.label)}</span><span class="legend-value">${s.value}</span></div>`).join("") || (statsPending ? '<div class="legend-empty" role="status">Preparando estadísticas...</div>' : '<div class="legend-empty">Sin datos</div>')}
               </div>
             </div>
           </div>
 
           <div class="card compact chart-card">
-            <div class="chart-header"><span class="eyebrow">Actividad (7 dias)</span><span class="chart-value">${days.reduce((s, d) => s + d.total, 0)} jobs</span></div>
+            <div class="chart-header"><span class="eyebrow">Actividad (7 dias)</span>${statsPending ? `<span class="chart-value" role="status">Preparando estadísticas...</span>` : `<span class="chart-value">${days.reduce((s, d) => s + d.total, 0)} jobs</span>`}</div>
             <svg viewBox="0 0 200 110" class="bar-svg">
               <line x1="0" y1="90" x2="200" y2="90" stroke="var(--border)" stroke-width="0.5" />
               ${barChart}
@@ -937,11 +1200,11 @@
 
         <div class="dashboard-bars">
           <div class="card compact">
-            <div class="chart-header"><span class="eyebrow">Cobertura de Targets</span><span class="chart-value">${targetsWithBackup}/${state.targets.length}</span></div>
+            <div class="chart-header"><span class="eyebrow">Cobertura de Targets</span>${targetsPending ? `<span class="chart-value" role="status">Preparando targets...</span>` : `<span class="chart-value">${targetsWithBackup}/${state.targets.length}</span>`}</div>
             <div class="progress-bar-container">
               <div class="progress-bar" style="width: ${state.targets.length > 0 ? (targetsWithBackup / state.targets.length) * 100 : 0}%"></div>
             </div>
-            <div class="bar-meta">${state.targets.length > 0 ? Math.round((targetsWithBackup / state.targets.length) * 100) : 0}% con estrategia configurada</div>
+            <div class="bar-meta">${targetsPending ? "Preparando targets..." : `${state.targets.length > 0 ? Math.round((targetsWithBackup / state.targets.length) * 100) : 0}% con estrategia configurada`}</div>
           </div>
           <div class="card compact">
             <div class="chart-header"><span class="eyebrow">Storage con Volumes</span><span class="chart-value">${storageWithRclone}/${state.storageProfiles.length}</span></div>
@@ -1278,14 +1541,12 @@
         if (!targetsPolling) return;
         try {
           const [targetsResponse, workersResponse] = await Promise.all([
-            apiGet("/api/v1/targets"),
+            loadTargetsSnapshot(),   // lectura coalescente del snapshot con cabeceras de frescura (warm-up aware)
             apiGet("/api/v1/workers"),
           ]);
-          const newTargets = targetsResponse.items || [];
           const newWorkers = workersResponse.items || [];
-          const targetsChanged = JSON.stringify(newTargets.map(targetFingerprint)) !== JSON.stringify((state.targets || []).map(targetFingerprint));
+          const targetsChanged = Boolean(targetsResponse && targetsResponse.changed);
           const workersChanged = JSON.stringify(newWorkers.map(workerFingerprint)) !== JSON.stringify((state.workers || []).map(workerFingerprint));
-          state.targets = newTargets;
           state.workers = newWorkers;
           if ((targetsChanged || workersChanged) && state.currentView === "targets") renderTargetsTable();
         } catch (e) {
@@ -1802,11 +2063,12 @@ docker compose up -d
       content.innerHTML = `
         <div class="page-header"><div><h2>Targets</h2><div class="subtitle">Configura que se va a backupear por worker y compose project</div></div></div>
         ${createTargetSection}
-         <div class="page-header"><div><h2>Targets configurados</h2></div></div>
+         <div class="page-header"><div><h2>Targets configurados</h2><div class="helper" id="readModelTargetsFreshness" role="status" aria-live="polite"></div></div></div>
          <div id="targetsTableContainer"></div>
        `;
       bindTargetForm();
       renderTargetsTable();
+      if (typeof updateReadModelFreshness === "function") updateReadModelFreshness();
       startTargetsPolling();
       if (currentLogJobId) {
         const target = state.targets.find(t => {
@@ -2009,6 +2271,7 @@ docker compose up -d
         : null;
       if (currentLogTargetId && !selectedTarget) closeLogPanel();
       const activeLogTargetId = currentLogTargetId;
+      const targetsWarming = !state.targets.length && Boolean(state.readModels && state.readModels.targets.warmingUp);
       tbody.innerHTML = paged.length ? paged.map(t => {
         const canManageTargets = state.currentRole === "admin";
         const canRunTargets = state.currentRole === "admin" || state.currentRole === "operator";
@@ -2075,7 +2338,9 @@ docker compose up -d
            </td>
          </tr>`;
         return targetRow + (currentLogJobId && String(activeLogTargetId) === String(t.id) ? renderTargetLogDetailRow(t) : "");
-       }).join("") : `<tr class="empty-targets-row"><td colspan="9" class="empty-state">Sin targets que coincidan con los filtros</td></tr>`;
+       }).join("") : targetsWarming
+          ? `<tr class="empty-targets-row"><td colspan="9" class="empty-state" role="status">${escapeHtml("Preparando targets...")}</td></tr>`
+          : `<tr class="empty-targets-row"><td colspan="9" class="empty-state">Sin targets que coincidan con los filtros</td></tr>`;
       const infoEl = document.querySelector("#targetsTableContainer .pagination-info");
       if (infoEl) infoEl.textContent = total === 0 ? "Sin resultados" : `${startIdx + 1}-${Math.min(startIdx + pageSize, total)} de ${total}`;
       const controlsEl = document.querySelector("#targetsTableContainer .pagination-controls");
@@ -8936,24 +9201,40 @@ docker compose up -d
       try {
         const routeView = currentRouteView();
         const dashboardView = routeView === "dashboard";
-        const [workers, targets, dashboardJobs, storageProfiles, schedulerConfig, systemVersion] = await Promise.all([
-          apiGet("/api/v1/workers"),
-          apiGet("/api/v1/targets"),
-          shouldFetchJobsDuringRefresh(routeView) ? fetchDashboardJobs() : Promise.resolve(null),
-          dashboardView ? apiGet("/api/v1/storage-profiles") : Promise.resolve({ items: state.storageProfiles }),
+        // Los componentes del dashboard se aplican de forma independiente a medida
+        // que responde cada petición: workers, targets, stats y jobs recientes
+        // jamás esperan a los demás, y el arranque no se bloquea por un snapshot
+        // en warm-up (los reintentos son timers acotados según Retry-After).
+        const dashboardJobsRequest = shouldFetchJobsDuringRefresh(routeView) ? fetchDashboardJobs() : Promise.resolve(null);
+        if (typeof loadTargetsSnapshot === "function") {
+          void refreshTargetsSnapshotWithRetry();
+        } else {
+          void apiGet("/api/v1/targets").then(response => {
+            state.targets = response.items || [];
+          }).catch(() => null);
+        }
+        void apiGet("/api/v1/workers").then(response => {
+          state.workers = response.items || [];
+          if (typeof renderDashboardContentIfVisible === "function") renderDashboardContentIfVisible();
+        }).catch(() => null);
+        if (dashboardView) {
+          void apiGet("/api/v1/storage-profiles").then(response => {
+            state.storageProfiles = response.items || [];
+            state.pageDataLoaded.storageProfiles = true;
+            if (typeof renderDashboardContentIfVisible === "function") renderDashboardContentIfVisible();
+          }).catch(() => null);
+        }
+        const [schedulerConfig, systemVersion] = await Promise.all([
           apiGet("/api/v1/config/public").catch(() => ({})),
           apiGet("/api/v1/version").catch(() => ({ version: "dev" })),
         ]);
-        state.workers = workers.items || [];
-        state.targets = targets.items || [];
-        applyDashboardJobs(dashboardJobs);
-        if (dashboardView) {
-          state.storageProfiles = storageProfiles.items || [];
-          state.pageDataLoaded.storageProfiles = true;
-        }
         state.schedulerTimezone = schedulerConfig.scheduler_timezone || state.settings.scheduler_timezone || null;
         state.workerInventories = {};
         state.systemVersion = systemVersion.version || "dev";
+        // El bloque de dashboard (jobs recientes + stats) ya se aplicó por su cuenta;
+        // se vuelve a aplicar el objeto consolidado si traía datos.
+        const dashboardJobs = await dashboardJobsRequest.catch(() => null);
+        if (dashboardJobs && (dashboardJobs.jobs || dashboardJobs.stats)) applyDashboardJobs(dashboardJobs);
         const pageData = loadPageData(routeView, true);
         if (pageData) await pageData;
         renderVersionBanner();
@@ -8981,9 +9262,13 @@ docker compose up -d
 
     async function refreshDashboardJobs() {
       try {
-        applyDashboardJobs(await fetchDashboardJobs());
+        const dashboardJobs = await fetchDashboardJobs();
+        if (dashboardJobs && (dashboardJobs.jobs || dashboardJobs.stats)) applyDashboardJobs(dashboardJobs);
         const content = document.getElementById("content");
-        if (content && state.currentView === "dashboard") renderDashboard(content);
+        if (content && state.currentView === "dashboard") {
+          renderDashboard(content);
+          if (typeof updateReadModelFreshness === "function") updateReadModelFreshness();
+        }
       } catch (error) {
         if (error.message !== "auth") console.error(error);
       }

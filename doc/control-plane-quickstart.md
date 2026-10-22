@@ -821,6 +821,13 @@ curl "http://127.0.0.1:8080/api/v1/jobs?limit=50&status=failed&sort=started_at&o
 - Mientras el modelo arranca (o si un refresco falla y aún no hay snapshot) la respuesta es `503` con `code: "read_model_warming_up"` y cabecera `Retry-After`; nunca se devuelven datos falsos vacíos. Si un refresco falla con snapshot previo, se sigue sirviendo el último dato bueno sin bloqueo.
 - Al reiniciar el Control Plane los snapshots persistidos en SQLite (`dashboard_read_snapshots`) se hidratan antes de servir: la convergencia del arranque no requiere recargar el navegador.
 
+#### Nota operativa: dashboard y targets en la interfaz (T3)
+
+- La UI aplica de forma independiente workers, targets, jobs recientes, estadísticas y demás widgets: cada componente se pinta a medida que responde su propia petición, sin esperas cruzadas ni bloqueo del arranque inicial.
+- Mientras el read model está en warm-up la UI muestra `"Preparando estadísticas..."` (dashboard) y `"Preparando targets..."` (tabla de targets); nunca muestra ceros/listas falsas en lugar de datos pendientes. Reintenta automáticamente según la cabecera `Retry-After` (cadencia acotada, sin recargar el navegador) y conserva el último dato bueno ante errores transitorios.
+- Con datos del snapshot la UI muestra la frescura como `"Actualizado hace N s (datos de fecha hora)"` usando las cabeceras `X-Read-Model-Updated-At` / `X-Read-Model-Age-Seconds`; la edad avanza cada segundo mientras el dashboard o la tabla estén visibles. El dashboard consulta stats/jobs recientes y targets cada 5 segundos, sin duplicar peticiones pendientes ni reintentos de arranque; la tabla de targets conserva su sondeo de 3 segundos. Los sondeos se pausan al navegar fuera de su vista (todos los timers del read model se detienen al descargar la página).
+- Solo stats y targets/lista son snapshot: crear/editar/eliminar targets, backups manuales, syncs y la gestión de usuarios/secretos/canales siguen siendo llamadas live al backend.
+
 ## 7. Enrolamiento HMAC y transporte
 
 HMAC usa secreto de un solo uso, digest en CP y archivo `0600`; no hay

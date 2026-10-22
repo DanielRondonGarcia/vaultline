@@ -296,6 +296,36 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
                 if target == "worker":
                     self.assertIn('INSTALL_DOCKER_CLI=true"', step)
 
+    def test_prerelease_disables_automatic_latest_and_gates_all_stable_aliases(self):
+        image_job = self.image_build_job()
+        blocks = re.findall(
+            r"(?ms)^      - name: Extract metadata for [^\n]+\n(.*?)(?=^      - name: |\Z)",
+            image_job,
+        )
+        self.assertEqual(len(blocks), 3)
+        for block in blocks:
+            with self.subTest(image=block.split("images:", 1)[-1].splitlines()[0]):
+                self.assertIn("flavor: latest=false", block)
+                rules = re.findall(r"(?m)^            (type=.*)$", block)
+                self.assertEqual(rules, [
+                    "type=semver,pattern={{version}},value=${{ needs.prepare.outputs.new_version }}",
+                    "type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.new_version }},enable=${{ !inputs.prerelease }}",
+                    "type=semver,pattern={{major}},value=${{ needs.prepare.outputs.new_version }},enable=${{ !inputs.prerelease }}",
+                    "type=raw,value=latest,enable=${{ !inputs.prerelease }}",
+                ])
+                # Evaluate the channel selector for both workflow input values.
+                for prerelease in (True, False):
+                    enabled = [rule.split(",enable=", 1)[0] for rule in rules
+                               if ",enable=" not in rule or not prerelease]
+                    self.assertEqual(len(enabled), 1 if prerelease else 4)
+                    self.assertIn("pattern={{version}}", enabled[0])
+                    self.assertEqual(any("value=latest" in rule for rule in enabled), not prerelease)
+
+    def test_prerelease_explicitly_avoids_github_latest_release(self):
+        publish = self.workflow.split("  publish-release:", 1)[1]
+        self.assertIn("${{ inputs.prerelease && '--latest=false' || '' }}", publish)
+        self.assertIn("${{ inputs.prerelease && '--prerelease' || '' }}", publish)
+
     def image_build_job(self) -> str:
         match = re.search(r"(?ms)^  image-build:\n(.*?)(?=^  [\w-]+:\n|\Z)", self.workflow)
         self.assertIsNotNone(match)

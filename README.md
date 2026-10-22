@@ -373,13 +373,16 @@ docker-compose stop && docker-compose rm -f && docker-compose build && docker-co
 El workflow **Create Release** en GitHub Actions maneja el tagging y publicación.
 
 1. Ve a **Actions → Create Release → Run workflow**
-2. Elige el bump type (`patch`, `minor`, `major`)
+2. Elige el bump type (`patch`, `minor`, `major`) y activa `prerelease` si la publicación es solo para pruebas.
 3. El workflow:
    - Crea y push el Git tag
    - Genera el changelog desde el tag anterior
    - Crea el GitHub Release
-   - Construye imágenes multi-arch (`linux/amd64`, `linux/arm64`)
-   - Publica a GHCR con tags `latest`, `{version}`, `{major}.{minor}`, `{major}`
+   - Construye imágenes Docker `linux/amd64`, paquetes Debian `amd64`/`arm64` e instaladores Windows `amd64`.
+   - En un release estable, publica a GHCR con tags `latest`, `{version}`, `{major}.{minor}`, `{major}`.
+   - En un prerelease, publica solo el tag exacto `{version}` para las tres imágenes; no mueve `latest`, los canales mayor/menor ni el release estable más reciente de GitHub. Para probarlo, fija la misma versión en CP, worker y runtime.
+
+El prerelease conserva una versión numérica (por ejemplo `3.15.12`) compatible con el instalador MSI; GitHub lo marca como pre-release. Publica desde la rama que contiene los cambios: esto no fusiona esa rama con `master`. El tag anterior sigue siendo la referencia de rollback.
 
 ## Licencia
 

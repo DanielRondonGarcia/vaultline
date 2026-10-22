@@ -390,33 +390,36 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ needs.prepare.outputs.new_version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.new_version }}
-            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.new_version }}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.new_version }},enable=${{ !inputs.prerelease }}
+            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.new_version }},enable=${{ !inputs.prerelease }}
+            type=raw,value=latest,enable=${{ !inputs.prerelease }}
 
       - name: Extract metadata for Control Plane image
         id: meta_control_plane
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-control-plane
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ needs.prepare.outputs.new_version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.new_version }}
-            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.new_version }}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.new_version }},enable=${{ !inputs.prerelease }}
+            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.new_version }},enable=${{ !inputs.prerelease }}
+            type=raw,value=latest,enable=${{ !inputs.prerelease }}
 
       - name: Extract metadata for Worker image
         id: meta_worker
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-worker
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ needs.prepare.outputs.new_version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.new_version }}
-            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.new_version }}
-            type=raw,value=latest
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.new_version }},enable=${{ !inputs.prerelease }}
+            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.new_version }},enable=${{ !inputs.prerelease }}
+            type=raw,value=latest,enable=${{ !inputs.prerelease }}
 
       - name: Build and push backup runtime image
         # The standard Docker CLI path is native amd64; it cannot use the
@@ -577,6 +580,7 @@ jobs:
             --title "v${VERSION}" \
             --notes-file release_body.md \
             ${{ inputs.prerelease && '--prerelease' || '' }} \
+            ${{ inputs.prerelease && '--latest=false' || '' }} \
             "dist/release-assets/vaultline-worker_${VERSION}_amd64.deb" \
             "dist/release-assets/vaultline-worker_${VERSION}_arm64.deb" \
             "dist/release-assets/vaultline-worker_${VERSION}_windows-amd64.exe" \

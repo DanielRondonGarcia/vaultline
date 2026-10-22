@@ -9,9 +9,9 @@ S3. "el propio worker debería de ir guardando en una caché temporal esos estad
 S4. Authorization: "vale super, implementalos"; direct execution exception confirmed: "si dale".
 
 ## Tasks
-T1 | S2-S4 | inline (explicit user exception after explorer failure) | done | Persisted sequenced progress/log spool, retries and restart replay; final result prewrite; RED 4 failed then GREEN 4, observability 58, runtime safety 67 pass; commit: pending below.
-T2 | S1-S2,S4 | inline (dependent CP reconciliation seam) | in_progress | Keep disconnected jobs awaiting confirmation, accept authenticated replay, idempotent final ACK, retain real-failure alerts; commit: pending.
-T3 | S1-S4 | inline (user exception includes unavailable independent verification) | pending | Verify retention example, notification reason, documentation, differential checks and relevant suite; commit: pending.
+T1 | S2-S4 | inline (explicit user exception after explorer failure) | done | Persisted sequenced progress/log spool, retries and restart replay; final result prewrite; RED 4 failed then GREEN 4, observability 58, runtime safety 67 pass; commit: 5429551 (325 authored lines); independent verifier: 4+67+58 tests and 11 isolated probes pass, no blockers.
+T2 | S1-S2,S4 | inline (dependent CP reconciliation seam) | done | Unconfirmed lease without failure notification, authenticated progress/renew and idempotent final ACK; GREEN new 2, ownership 16, scheduler 15, events 14, notifications 22, UI checks pass; commit: pending below.
+T3 | S1-S4 | inline (user exception includes unavailable independent verification) | in_progress | Verify retention example, notification reason, documentation, differential checks and relevant suite; commit: pending.
 
 ## Log
 L1. Original request verbatim: Mira, necesito que analises estos logs, me preocupa tantos falsos positivos o esa perdida de conexión que marque error, debería de haber un try connection o algo asi, y pueda obtener los logs y el estado correcto, para ello el propio worker debería de ir guardando en una caché temporal esos estados y logs para que cuando el CP lo vuelva a contactar, este le pueda seguir entregando los datos, uno modo async C:\Users\DANIEL~1.RON\AppData\Local\Temp\orca-paste-1792697048932-61a1a227-7fe2-49ad-97f0-e49e771f19b0.png

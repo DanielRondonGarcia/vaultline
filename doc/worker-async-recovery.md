@@ -10,6 +10,14 @@ Una desconexión del Control Plane no demuestra que el backup haya fallado. El w
 - El resultado final se escribe en el journal `*.terminal.json` antes del primer intento de entrega. Los logs pendientes se entregan antes del resultado final.
 - Tras reiniciar, el siguiente ciclo de consulta carga los archivos pendientes. La ejecución no se repite por un fallo de entrega.
 
+## Estado en el Control Plane
+
+Al vencer el lease sin resultado final, el trabajo permanece `in_progress`, sin fecha de finalización, con el diagnóstico `worker_lease_expired`. La interfaz explica que espera confirmación; no se envía `backup.failed` por la desconexión. El propietario puede renovar el lease o entregar progreso con la misma prueba de ejecución, incluso después del vencimiento. Una renovación correcta limpia el diagnóstico de desconexión.
+
+El resultado real posterior sustituye el diagnóstico. Si confirma un fallo, se envía la alerta habitual; un resultado exitoso cierra el trabajo sin alerta de fallo. Reenviar exactamente el mismo resultado final solo confirma recepción: no cambia fechas, no duplica logs ni notificaciones. Otro resultado, otro worker o un token incorrecto se rechazan. La cancelación explícita del operador sigue siendo definitiva.
+
+Si el worker nunca regresa, el resultado permanece sin confirmar. Investiga el host y el runtime; si corresponde, cancela el trabajo desde el CP. No se declara éxito ni fallo basándose únicamente en la ausencia de comunicación. Los antiguos fallos sintéticos guardados antes de esta versión siguen admitiendo el resultado tardío del propietario.
+
 ## Límites y protección
 
 Los logs se redactan antes de guardarlos. Los archivos usan permisos privados y escritura atómica. La cola admite 64 lotes por ejecución, hasta 64 KiB por lote, con una antigüedad máxima de 7 días. Bajo presión de retención, se conservan los datos más recientes; una advertencia señala la omisión de líneas antiguas. El journal de resultados conserva hasta 32 resultados de hasta 2 MiB cada uno.

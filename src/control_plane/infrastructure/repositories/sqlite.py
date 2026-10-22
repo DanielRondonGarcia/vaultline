@@ -1010,8 +1010,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 continue
             result_summary = _json_load(row["result_summary_json"], None)
             result_summary = dict(result_summary) if isinstance(result_summary, dict) else {}
-            result_summary.setdefault("error", "worker lease expired before the job reported a terminal result")
-            result_summary["recovery"] = "worker_interrupted"
+            result_summary["recovery"] = "awaiting_worker_confirmation"
             result_summary["diagnostic_code"] = LEASE_DIAGNOSTIC_CODE
             result_summary["diagnostic_category"] = LEASE_DIAGNOSTIC_CATEGORY
             result_summary["diagnostic_message"] = LEASE_DIAGNOSTIC_MESSAGE
@@ -1039,14 +1038,13 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 UPDATE jobs
                 SET status = ?, lease_issued_at = NULL, lease_expires_at = NULL,
                     result_summary_json = ?, log_lines_json = ?,
-                    finished_at = ?, updated_at = ?
+                    finished_at = NULL, updated_at = ?
                 WHERE id = ? AND status = ?
                 """,
                 (
-                    JobStatus.FAILED,
+                    JobStatus.IN_PROGRESS,
                     json.dumps(result_summary),
                     json.dumps(log_lines),
-                    now.isoformat(),
                     now.isoformat(),
                     row["id"],
                     JobStatus.IN_PROGRESS,
@@ -1092,14 +1090,15 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     or JobStatus.normalize(row["status"]) != JobStatus.IN_PROGRESS
                     or row["owner_worker_id"] != worker_id
                     or row["lease_token"] != lease_token
-                    or not lease_expires_at
-                    or lease_expires_at <= now
                 ):
                     connection.commit()
                     return None
                 expires_at = now + timedelta(seconds=lease_duration_seconds)
                 current_summary = _json_load(row["result_summary_json"], None)
                 current_summary = dict(current_summary) if isinstance(current_summary, dict) else {}
+                if current_summary.get("diagnostic_code") == LEASE_DIAGNOSTIC_CODE:
+                    for key in ("diagnostic_code", "diagnostic_category", "diagnostic_message", "lease_diagnostics", "recovery"):
+                        current_summary.pop(key, None)
                 context = _lease_context_for_values(
                     job_id=row["id"],
                     worker_id=row["owner_worker_id"] or row["worker_id"],
@@ -1119,7 +1118,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     UPDATE jobs
                     SET lease_expires_at = ?, result_summary_json = ?, updated_at = ?
                     WHERE id = ? AND status = ? AND owner_worker_id = ?
-                      AND lease_token = ? AND lease_expires_at > ?
+                      AND lease_token = ?
                     """,
                     (
                         expires_at.isoformat(),
@@ -1129,7 +1128,6 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                         JobStatus.IN_PROGRESS,
                         worker_id,
                         lease_token,
-                        now.isoformat(),
                     ),
                 )
                 if updated.rowcount != 1:
@@ -1168,8 +1166,6 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     or JobStatus.normalize(row["status"]) != JobStatus.IN_PROGRESS
                     or row["owner_worker_id"] != worker_id
                     or not hmac.compare_digest(row["lease_token"] or "", lease_token or "")
-                    or not lease_expires_at
-                    or lease_expires_at <= now
                 ):
                     connection.commit()
                     return None
@@ -1213,7 +1209,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     UPDATE jobs
                     SET result_summary_json = ?, log_lines_json = ?, updated_at = ?
                     WHERE id = ? AND status = ? AND owner_worker_id = ?
-                      AND lease_token = ? AND lease_expires_at > ?
+                      AND lease_token = ?
                     """,
                     (
                         json.dumps(current_summary),
@@ -1223,7 +1219,6 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                         JobStatus.IN_PROGRESS,
                         worker_id,
                         lease_token,
-                        now.isoformat(),
                     ),
                 )
                 if updated.rowcount != 1:

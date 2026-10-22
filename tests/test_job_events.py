@@ -143,7 +143,8 @@ class JobEventServiceTests(unittest.TestCase):
 
         view = service.get_job_view(job.id)
 
-        self.assertEqual(view["status"], JobStatus.FAILED)
+        self.assertEqual(view["status"], JobStatus.IN_PROGRESS)
+        self.assertIsNone(view["finished_at"])
         self.assertEqual(view["diagnostics"]["code"], "worker_lease_expired")
         self.assertEqual(view["diagnostics"]["category"], "worker_interrupted")
         self.assertIn("terminal result", view["diagnostics"]["message"])

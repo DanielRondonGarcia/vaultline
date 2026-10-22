@@ -34,6 +34,8 @@ El endpoint de administrador `POST /api/v1/notification-channels/{id}/test-email
 
 ## Qué se envía y cómo se comporta
 
+Un vencimiento de lease sin resultado final no genera `backup.failed`: el trabajo queda pendiente de confirmación. El worker conserva y reenvía estados y logs al recuperar conexión; solo un fallo real confirmado produce el aviso. Consulta [Recuperación de estados y logs](worker-async-recovery.md).
+
 - El evento se llama `backup.failed` e incluye identificadores del job/target, estado, fechas y un resumen de error saneado. Los webhooks reciben siempre ese JSON de resumen; nunca incluyen logs.
 - **No se incluyen credenciales de los canales.** Los valores sensibles reconocidos en el contexto del job (contraseñas, tokens y credenciales configurados en el target o en Settings, con su patrón `clave=valor`) se redactan; otros secrets que solo aparecieron en los logs sin ese contexto pueden no detectarse, revisa siempre el correo antes de reenviarlo.
 - Se intenta una entrega por job y canal activo. La reclamación se guarda para evitar duplicados si el Control Plane vuelve a publicar el mismo fallo, incluso después de reiniciarse.

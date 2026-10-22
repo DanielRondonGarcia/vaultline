@@ -97,7 +97,7 @@ class NotificationDeliveryTests(unittest.TestCase):
         self.assertTrue(thread_factory.call_args.kwargs["daemon"])
         thread_factory.return_value.start.assert_called_once_with()
 
-    def test_expired_lease_failure_also_schedules_notification(self):
+    def test_expired_lease_waits_for_confirmation_without_failure_notification(self):
         expired = self._new_job(job_id="job-expired")
         expired.lease_expires_at = utcnow() - timedelta(seconds=1)
         self.jobs.save(expired)
@@ -106,9 +106,9 @@ class NotificationDeliveryTests(unittest.TestCase):
             reconciled = self.service._reconcile_expired_jobs()
 
         self.assertEqual(reconciled, 1)
-        self.assertEqual(self.jobs.get(expired.id).status, JobStatus.FAILED)
-        thread_factory.assert_called_once()
-        thread_factory.return_value.start.assert_called_once_with()
+        self.assertEqual(self.jobs.get(expired.id).status, JobStatus.IN_PROGRESS)
+        self.assertIsNone(self.jobs.get(expired.id).finished_at)
+        thread_factory.assert_not_called()
 
     def test_delivery_error_does_not_change_failure_or_log_destination_secret(self):
         with self.assertLogs("src.control_plane.application.services.control_plane_service", level="WARNING") as captured:

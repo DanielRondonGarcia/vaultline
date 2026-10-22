@@ -1712,7 +1712,7 @@ const html = renderJobLeaseDiagnostics({
 const expected = [
   "El worker no confirmó el fin del job",
   "El plazo de reserva (lease) venció antes de que el Control Plane recibiera el resultado final",
-  "Este diagnóstico no revela por sí solo qué ocurrió dentro del worker o del runtime",
+  "El job sigue pendiente de confirmación: una pérdida de comunicación no demuestra que el backup haya fallado",
   "No se pudo determinar si el worker se detuvo, quedó esperando o perdió comunicación con el Control Plane",
   "<summary>Detalles técnicos</summary>",
   "worker_lease_expired",

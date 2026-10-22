@@ -471,8 +471,8 @@ class BackupObservabilityServiceTests(unittest.TestCase):
 
                     claimed.lease_expires_at = utcnow() - timedelta(seconds=1)
                     repository.save(claimed)
-                    with self.assertRaisesRegex(ValueError, "expired"):
-                        service.update_job_progress("worker-a", job.id, 2, {"percent_done": 20}, [], claimed.lease_token)
+                    resumed = service.update_job_progress("worker-a", job.id, 2, {"percent_done": 20}, [], claimed.lease_token)
+                    self.assertEqual(resumed.result_summary["progress"]["percent_done"], 20)
 
                     claimed.lease_expires_at = utcnow() + timedelta(minutes=5)
                     repository.save(claimed)

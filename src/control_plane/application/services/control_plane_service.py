@@ -3783,8 +3783,8 @@ class ControlPlaneService:
         now = utcnow()
         if job.status != JobStatus.IN_PROGRESS:
             raise ValueError(f"job '{job_id}' is not in progress (current status: {job.status})")
-        if not job.lease_expires_at or job.lease_expires_at <= now:
-            raise ValueError(f"job '{job_id}' lease has expired")
+        # Expiry measures connectivity, not ownership. The authenticated owner
+        # may resume the same execution; cancellation still fences it out.
         renewed = self.job_repository.renew_lease(
             job_id=job_id,
             worker_id=worker_id,
@@ -4410,8 +4410,6 @@ class ControlPlaneService:
             raise ValueError(f"worker '{worker_id}' does not own job '{job_id}'")
         if not isinstance(lease_token, str) or not hmac.compare_digest(job.lease_token or "", lease_token):
             raise ValueError(f"job '{job_id}' lease token is invalid or stale")
-        if not job.lease_expires_at or job.lease_expires_at <= utcnow():
-            raise ValueError(f"job '{job_id}' lease has expired")
         normalized_sequence, normalized_progress, normalized_lines = self._validate_progress_payload(
             sequence, progress, [] if log_lines is None else log_lines
         )
@@ -4492,12 +4490,19 @@ class ControlPlaneService:
         # the job to the synthetic worker_lease_expired failure.
         current_summary = job.result_summary if isinstance(job.result_summary, dict) else {}
         late_after_lease_expiry = (
-            job.status == JobStatus.FAILED and current_summary.get("diagnostic_code") == self.LEASE_DIAGNOSTIC_CODE
+            job.status in (JobStatus.FAILED, JobStatus.IN_PROGRESS)
+            and current_summary.get("diagnostic_code") == self.LEASE_DIAGNOSTIC_CODE
         )
-        if job.status != JobStatus.IN_PROGRESS and not late_after_lease_expiry:
-            raise ValueError(f"job '{job_id}' is not in progress (current status: {job.status})")
         if not isinstance(lease_token, str) or not hmac.compare_digest(job.lease_token or "", lease_token):
             raise ValueError(f"job '{job_id}' lease token is invalid or stale")
+        report_digest = hashlib.sha256(json.dumps(
+            [JobStatus.normalize(status), result_summary, log_lines],
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode()).hexdigest()
+        if job.status != JobStatus.IN_PROGRESS and not late_after_lease_expiry:
+            if current_summary.get("_terminal_report_digest") == report_digest:
+                return job  # The result was saved, but its network ACK was lost.
+            raise ValueError(f"job '{job_id}' is not in progress (current status: {job.status})")
         status = JobStatus.normalize(status)
         if status not in (JobStatus.SUCCEEDED, JobStatus.FAILED):
             raise ValueError(f"job '{job_id}' cannot be completed with status: {status}")
@@ -4534,6 +4539,9 @@ class ControlPlaneService:
             current_summary = dict(job.result_summary) if isinstance(job.result_summary, dict) else {}
             current_summary["lease_context"] = normalized_lease_context
             job.result_summary = current_summary
+        completed = dict(job.result_summary) if isinstance(job.result_summary, dict) else {}
+        completed["_terminal_report_digest"] = report_digest
+        job.result_summary = completed
         if log_lines:
             job.log_lines = self._bounded_job_log_lines(job, list(job.log_lines or []) + list(log_lines))
         else:
@@ -5101,9 +5109,9 @@ class ControlPlaneService:
         if reconciled:
             for job_id in expired_ids:
                 job = self.job_repository.get(job_id)
-                if job is not None and JobStatus.normalize(job.status) == JobStatus.FAILED:
+                if job is not None:
                     self._publish_job_event(job)
-                    self._schedule_failed_backup_notifications(job)
+                    # No terminal result was received: do not send a failure alert.
         return reconciled
 
     def _require_target(self, target_id: str) -> BackupTargetRecord:

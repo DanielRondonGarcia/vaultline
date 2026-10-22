@@ -287,15 +287,14 @@ class InMemoryJobRepository(JobRepository):
                 and lease_expires_at <= now
             ):
                 result_summary = dict(job.result_summary or {})
-                result_summary.setdefault("error", "worker lease expired before the job reported a terminal result")
-                result_summary["recovery"] = "worker_interrupted"
+                result_summary["recovery"] = "awaiting_worker_confirmation"
                 job.result_summary = result_summary
                 result_summary["diagnostic_code"] = LEASE_DIAGNOSTIC_CODE
                 result_summary["diagnostic_category"] = LEASE_DIAGNOSTIC_CATEGORY
                 result_summary["diagnostic_message"] = LEASE_DIAGNOSTIC_MESSAGE
                 result_summary["lease_diagnostics"] = _lease_diagnostics(job, now)
                 result_summary.pop("lease_context", None)
-                job.status = JobStatus.FAILED
+                job.status = JobStatus.IN_PROGRESS
                 # Keep owner_worker_id and lease_token: a late terminal report
                 # from the owning worker must still prove ownership.
                 job.lease_issued_at = None
@@ -304,7 +303,7 @@ class InMemoryJobRepository(JobRepository):
                 job.log_lines = list(job.log_lines or [])
                 if interruption_log not in job.log_lines:
                     job.log_lines.append(interruption_log)
-                job.finished_at = now
+                job.finished_at = None
                 job.updated_at = now
                 reconciled += 1
         return reconciled
@@ -333,12 +332,13 @@ class InMemoryJobRepository(JobRepository):
                 or job.status != JobStatus.IN_PROGRESS
                 or job.owner_worker_id != worker_id
                 or not hmac.compare_digest(job.lease_token or "", lease_token or "")
-                or not lease_expires_at
-                or lease_expires_at <= now
             ):
                 return None
             job.lease_expires_at = now + timedelta(seconds=lease_duration_seconds)
             summary = dict(job.result_summary) if isinstance(job.result_summary, dict) else {}
+            if summary.get("diagnostic_code") == LEASE_DIAGNOSTIC_CODE:
+                for key in ("diagnostic_code", "diagnostic_category", "diagnostic_message", "lease_diagnostics", "recovery"):
+                    summary.pop(key, None)
             context = _lease_context_for_job(job, now)
             context["lease_expires_at"] = _datetime_text(job.lease_expires_at)
             context["last_repository_update_at"] = _datetime_text(now)
@@ -368,8 +368,6 @@ class InMemoryJobRepository(JobRepository):
                 or job.status != JobStatus.IN_PROGRESS
                 or job.owner_worker_id != worker_id
                 or not hmac.compare_digest(job.lease_token or "", lease_token or "")
-                or not lease_expires_at
-                or lease_expires_at <= now
             ):
                 return None
 

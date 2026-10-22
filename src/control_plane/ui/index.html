@@ -455,7 +455,7 @@
        ];
        return `<section class="job-lease-diagnostics" role="status" aria-live="polite">
          <div><strong>El worker no confirmó el fin del job</strong></div>
-         <div>El plazo de reserva (lease) venció antes de que el Control Plane recibiera el resultado final, así que marcó el job como fallido. Este diagnóstico no revela por sí solo qué ocurrió dentro del worker o del runtime.</div>
+         <div>El plazo de reserva (lease) venció antes de que el Control Plane recibiera el resultado final. El job sigue pendiente de confirmación: una pérdida de comunicación no demuestra que el backup haya fallado. El worker reenviará los datos al recuperar la conexión.</div>
          <div>No se pudo determinar si el worker se detuvo, quedó esperando o perdió comunicación con el Control Plane.</div>
          <details class="job-lease-diagnostics-technical">
            <summary>Detalles técnicos</summary>

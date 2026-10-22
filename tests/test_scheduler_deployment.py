@@ -153,7 +153,7 @@ class SchedulerDeploymentTests(unittest.TestCase):
                 repository.save(job)
                 self.assertEqual(repository.get(job.id).trigger, trigger)
 
-    def test_expired_in_progress_lease_fails_before_pending_claim(self):
+    def test_expired_in_progress_lease_awaits_confirmation_before_pending_claim(self):
         self._assert_expired_lease_failed(InMemoryJobRepository())
         with tempfile.TemporaryDirectory() as directory:
             self._assert_expired_lease_failed(SQLiteJobRepository(str(Path(directory) / "control-plane.db")))
@@ -270,17 +270,17 @@ class SchedulerDeploymentTests(unittest.TestCase):
 
         failed = repository.get(interrupted.id)
         self.assertIsNotNone(failed)
-        self.assertEqual(failed.status, JobStatus.FAILED)
+        self.assertEqual(failed.status, JobStatus.IN_PROGRESS)
         self.assertEqual(failed.attempt_count, 1)
-        self.assertIsNotNone(failed.finished_at)
+        self.assertIsNone(failed.finished_at)
         self.assertIsNotNone(failed.updated_at)
         # Ownership evidence is retained so the owner's late terminal report can prove itself.
         self.assertEqual(failed.owner_worker_id, "worker-a")
         self.assertEqual(failed.lease_token, stale_token)
         self.assertIsNone(failed.lease_issued_at)
         self.assertIsNone(failed.lease_expires_at)
-        self.assertEqual(failed.result_summary["error"], "worker lease expired before the job reported a terminal result")
-        self.assertEqual(failed.result_summary["recovery"], "worker_interrupted")
+        self.assertNotIn("error", failed.result_summary)
+        self.assertEqual(failed.result_summary["recovery"], "awaiting_worker_confirmation")
         self.assertEqual(failed.result_summary["diagnostic_code"], "worker_lease_expired")
         self.assertEqual(failed.result_summary["diagnostic_category"], "worker_interrupted")
         observed = failed.result_summary["lease_diagnostics"]["observed"]
@@ -299,7 +299,7 @@ class SchedulerDeploymentTests(unittest.TestCase):
                 status=JobStatus.SUCCEEDED,
                 lease_token="not-the-lease",
             )
-        self.assertEqual(repository.get(interrupted.id).status, JobStatus.FAILED)
+        self.assertEqual(repository.get(interrupted.id).status, JobStatus.IN_PROGRESS)
 
         # The owning worker's real result outlives the liveness timer.
         service.update_job_status(

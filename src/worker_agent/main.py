@@ -606,7 +606,7 @@ def main():
                     sweep = sweep if isinstance(sweep, dict) else {}
                     logger.info(
                         "Runtime orphan sweep %s: inspected=%s removed=%s failed=%s skipped=%s; "
-                        "expired in-progress leases fail closed as worker_interrupted",
+                        "expired in-progress leases await worker confirmation",
                         "partial" if sweep.get("error") else "complete",
                         sweep.get("inspected", 0),
                         sweep.get("removed", 0),
@@ -615,7 +615,7 @@ def main():
                     )
                 except Exception as exc:
                     logger.warning(
-                        "Runtime orphan sweep failed; expired in-progress leases fail closed as worker_interrupted "
+                        "Runtime orphan sweep failed; expired in-progress leases await worker confirmation "
                         "(error_type=%s)",
                         exc.__class__.__name__,
                     )

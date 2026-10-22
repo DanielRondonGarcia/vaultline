@@ -114,8 +114,8 @@ class JobOwnershipTests(unittest.TestCase):
 
         renewed.lease_expires_at = utcnow() - timedelta(seconds=1)
         service.job_repository.save(renewed)
-        with self.assertRaisesRegex(ValueError, "expired"):
-            service.renew_job_lease("worker-a", job.id, claimed.lease_token)
+        resumed = service.renew_job_lease("worker-a", job.id, claimed.lease_token)
+        self.assertGreater(resumed.lease_expires_at, utcnow())
 
         with tempfile.TemporaryDirectory() as directory:
             sqlite_service = self.make_service(SQLiteJobRepository(f"{directory}/control-plane.db"))
@@ -173,8 +173,8 @@ class JobOwnershipTests(unittest.TestCase):
 
         observed = service.get_job(interrupted.id)
 
-        self.assertEqual(observed.status, JobStatus.FAILED)
-        self.assertEqual(observed.result_summary["recovery"], "worker_interrupted")
+        self.assertEqual(observed.status, JobStatus.IN_PROGRESS)
+        self.assertEqual(observed.result_summary["recovery"], "awaiting_worker_confirmation")
         self.assertEqual(observed.result_summary["diagnostic_code"], "worker_lease_expired")
         self.assertEqual(observed.result_summary["diagnostic_category"], "worker_interrupted")
         self.assertIn("terminal result", observed.result_summary["diagnostic_message"])
@@ -195,7 +195,7 @@ class JobOwnershipTests(unittest.TestCase):
         self.assertEqual(observed.lease_token, "lease-token")
         self.assertIsNone(observed.lease_expires_at)
         self.assertEqual(observed.log_lines.count("Worker lease expired before terminal status was reported."), 1)
-        self.assertEqual(service.get_job(interrupted.id).status, JobStatus.FAILED)
+        self.assertEqual(service.get_job(interrupted.id).status, JobStatus.IN_PROGRESS)
 
     def _expired_job(self, service, command="backup.run", lease_token="lease-token"):
         interrupted = JobRecord(
@@ -209,7 +209,7 @@ class JobOwnershipTests(unittest.TestCase):
         )
         service.job_repository.save(interrupted)
         expired = service.get_job(interrupted.id)
-        self.assertEqual(expired.status, JobStatus.FAILED)
+        self.assertEqual(expired.status, JobStatus.IN_PROGRESS)
         self.assertEqual(expired.result_summary["diagnostic_code"], "worker_lease_expired")
         return interrupted
 
@@ -278,7 +278,7 @@ class JobOwnershipTests(unittest.TestCase):
             service.update_job_status("worker-a", interrupted.id, JobStatus.SUCCEEDED, lease_token=None)
 
         stored = service.get_job(interrupted.id)
-        self.assertEqual(stored.status, JobStatus.FAILED)
+        self.assertEqual(stored.status, JobStatus.IN_PROGRESS)
         self.assertEqual(stored.result_summary["diagnostic_code"], "worker_lease_expired")
         self.assertEqual(service.get_job_view(interrupted.id)["diagnostics"]["code"], "worker_lease_expired")
 
@@ -300,8 +300,8 @@ class JobOwnershipTests(unittest.TestCase):
         job = service.dispatch_job("worker-a", "worker.self_check")
         claimed = service.fetch_jobs_for_worker("worker-a")[0]
         service.update_job_status("worker-a", job.id, JobStatus.SUCCEEDED, lease_token=claimed.lease_token)
-        with self.assertRaisesRegex(ValueError, "not in progress"):
-            service.update_job_status("worker-a", job.id, JobStatus.SUCCEEDED, lease_token=claimed.lease_token)
+        acknowledged = service.update_job_status("worker-a", job.id, JobStatus.SUCCEEDED, lease_token=claimed.lease_token)
+        self.assertEqual(acknowledged.status, JobStatus.SUCCEEDED)
 
         canceled = service.dispatch_job("worker-a", "worker.self_check")
         canceled_claim = service.fetch_jobs_for_worker("worker-a")[0]

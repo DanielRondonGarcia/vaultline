@@ -552,6 +552,8 @@ const state = ''' + json.dumps(state_fields, ensure_ascii=False) + ''';
             "workers": [], "targets": [], "jobs": [], "jobStats": None,
             "currentView": "dashboard", "storageProfiles": [], "readModels": None,
         }) + wrap_async(r'''
+  // The fixture models UTC-5 explicitly; CI runners need not use this timezone.
+  Date.prototype.getTimezoneOffset = () => 300;
   const statsEntries = [];
   respond = (path, options) => {
     if (!path.startsWith("/api/v1/jobs/stats?")) return Promise.resolve({ items: [] });

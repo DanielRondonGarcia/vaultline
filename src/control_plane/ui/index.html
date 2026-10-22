@@ -8452,10 +8452,10 @@ docker compose up -d
     function renderUsers(content) {
       const canManage = state.currentRole === "admin";
       const canResetPasswords = canManage && state.userManagement?.manageable === true;
-      const renderUserActions = (user, index) => {
+      const renderPasswordActions = (user, index) => {
         if (!canResetPasswords) return "";
         const isSelfAdmin = user.role === "admin" && user.username === state.currentUser;
-        if (user.role === "admin" && !isSelfAdmin) return '<td><span class="muted">—</span></td>';
+        if (user.role === "admin" && !isSelfAdmin) return "";
         const dialogId = isSelfAdmin ? "changeMyPasswordDialog" : `resetPasswordDialog${index}`;
         const titleId = `${dialogId}Title`;
         const helpId = `${dialogId}Help`;
@@ -8464,7 +8464,25 @@ docker compose up -d
           ? `<form class="user-password-change-form" data-self-change-password data-password-dialog-id="${dialogId}"><div class="modal-body"><div class="field"><label for="${dialogId}CurrentPassword">Contraseña actual</label><input id="${dialogId}CurrentPassword" name="current_password" type="password" required autocomplete="current-password" /></div><div class="field"><label for="${dialogId}NewPassword">Nueva contraseña</label><input id="${dialogId}NewPassword" name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="field"><label for="${dialogId}ConfirmPassword">Confirmar nueva contraseña</label><input id="${dialogId}ConfirmPassword" name="confirm_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper" id="${helpId}">Debes ingresar tu contraseña actual. No puedes cambiar la contraseña de otra cuenta admin desde aquí.</div><div class="helper" role="status" aria-live="polite" data-password-change-feedback></div></div><div class="modal-footer"><button type="button" class="btn ghost" data-close-password-dialog="${dialogId}">Cancelar</button><button type="submit" class="btn primary">Actualizar contraseña</button></div></form>`
           : `<form class="user-password-reset-form" data-reset-password-user="${escapeHtml(user.username)}" data-password-dialog-id="${dialogId}"><div class="modal-body"><div class="field"><label for="${dialogId}NewPassword">Nueva contraseña</label><input id="${dialogId}NewPassword" name="new_password" type="password" minlength="8" required autocomplete="new-password" /></div><div class="helper" id="${helpId}">El usuario deberá cambiarla al iniciar sesión.</div></div><div class="modal-footer"><button type="button" class="btn ghost" data-close-password-dialog="${dialogId}">Cancelar</button><button type="submit" class="btn primary">Guardar contraseña</button></div></form>`;
         const actionLabel = isSelfAdmin ? "Cambiar mi contraseña" : "Restablecer contraseña";
-        return `<td><button type="button" class="btn ghost sm" data-open-password-dialog="${dialogId}">${actionLabel}</button><dialog id="${dialogId}" class="modal user-password-modal" aria-labelledby="${titleId}" aria-describedby="${helpId}"><div class="modal-header"><h3 id="${titleId}">${title}</h3><button type="button" class="close" aria-label="Cerrar" data-close-password-dialog="${dialogId}">&times;</button></div>${form}</dialog></td>`;
+        return `<button type="button" class="btn ghost sm" data-open-password-dialog="${dialogId}">${actionLabel}</button><dialog id="${dialogId}" class="modal user-password-modal" aria-labelledby="${titleId}" aria-describedby="${helpId}"><div class="modal-header"><h3 id="${titleId}">${title}</h3><button type="button" class="close" aria-label="Cerrar" data-close-password-dialog="${dialogId}">&times;</button></div>${form}</dialog>`;
+      };
+      const renderUserActions = (user, index) => {
+        if (!canResetPasswords) return "";
+        const passwordActions = renderPasswordActions(user, index);
+        if (user.username === state.currentUser) return `<td>${passwordActions}</td>`;
+        const dialogId = `changeRoleDialog${index}`;
+        const username = escapeHtml(user.username);
+        const roleOptions = ["viewer", "operator", "admin"].map(role => `<option value="${role}"${role === user.role ? " selected" : ""}>${role}</option>`).join("");
+        return `<td><div class="btn-row">${passwordActions}
+          <button type="button" class="btn ghost sm" data-open-role-dialog="${dialogId}">Cambiar rol</button>
+          <button type="button" class="btn danger sm" data-delete-user="${username}">Eliminar</button>
+          </div><dialog id="${dialogId}" class="modal user-password-modal" aria-labelledby="${dialogId}Title">
+            <div class="modal-header"><h3 id="${dialogId}Title">Cambiar rol · ${username}</h3><button type="button" class="close" aria-label="Cerrar" data-close-role-dialog="${dialogId}">&times;</button></div>
+            <form data-change-role-user="${username}" data-role-dialog-id="${dialogId}">
+              <div class="modal-body"><div class="field"><label for="${dialogId}Role">Rol</label><select id="${dialogId}Role" name="role">${roleOptions}</select></div></div>
+              <div class="modal-footer"><button type="button" class="btn ghost" data-close-role-dialog="${dialogId}">Cancelar</button><button type="submit" class="btn primary">Guardar rol</button></div>
+            </form>
+          </dialog></td>`;
       };
       content.innerHTML = `
         <div class="page-header"><div><h2>Usuarios</h2><div class="subtitle">Usuarios locales del Control Plane</div></div></div>
@@ -8498,6 +8516,41 @@ docker compose up -d
           }, "Creando...").catch(() => {});
         });
       }
+      content.querySelectorAll("button[data-open-role-dialog]").forEach(button => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(button.dataset.openRoleDialog);
+          if (dialog && !dialog.open && typeof dialog.showModal === "function") dialog.showModal();
+        });
+      });
+      content.querySelectorAll("button[data-close-role-dialog]").forEach(button => {
+        button.addEventListener("click", () => {
+          const dialog = document.getElementById(button.dataset.closeRoleDialog);
+          if (dialog && dialog.open && typeof dialog.close === "function") dialog.close();
+        });
+      });
+      content.querySelectorAll("form[data-change-role-user]").forEach(form => {
+        form.addEventListener("submit", async (e) => {
+          e.preventDefault();
+          await withBtnLoading(e.submitter, async () => {
+            await apiPost(`/api/v1/admin/users/${encodeURIComponent(form.dataset.changeRoleUser)}/update`, { role: form.elements.role.value });
+            const dialog = document.getElementById(form.dataset.roleDialogId);
+            if (dialog && dialog.open && typeof dialog.close === "function") dialog.close();
+            await loadPageData("users", true);
+            setView("users");
+          }, "Guardando...").catch(() => {});
+        });
+      });
+      content.querySelectorAll("button[data-delete-user]").forEach(button => {
+        button.addEventListener("click", async (e) => {
+          const username = button.dataset.deleteUser;
+          if (!confirm(`¿Eliminar el usuario ${username}? Esta acción no se puede deshacer.`)) return;
+          await withBtnLoading(e.currentTarget, async () => {
+            await apiDelete(`/api/v1/admin/users/${encodeURIComponent(username)}`);
+            await loadPageData("users", true);
+            setView("users");
+          }, "Eliminando...").catch(() => {});
+        });
+      });
       content.querySelectorAll("button[data-open-password-dialog]").forEach(button => {
         button.addEventListener("click", () => {
           const dialog = document.getElementById(button.dataset.openPasswordDialog);

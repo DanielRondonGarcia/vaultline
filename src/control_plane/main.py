@@ -1289,8 +1289,12 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                 and parts[:4] == ["api", "v1", "admin", "users"]
                 and parts[5] == "update"
             ):
-                if not self._require_auth(ROLE_ADMIN, api_mode=True):
+                session = self._require_auth(ROLE_ADMIN, api_mode=True)
+                if not session:
                     return
+                if (parts[4].strip() == session["username"]
+                        and body.get("role") is not None and body["role"] != session["role"]):
+                    return self._write_json(403, {"error": "cannot change your own role"})
                 user = self._auth_service().update_user(
                     username=parts[4],
                     role=body.get("role"),
@@ -1671,10 +1675,21 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         try:
-            if not self._require_auth(ROLE_ADMIN, api_mode=True):
+            session = self._require_auth(ROLE_ADMIN, api_mode=True)
+            if not session:
                 return
             path = urlparse(self.path).path
             parts = self._path_parts(path)
+            if len(parts) == 5 and parts[:4] == ["api", "v1", "admin", "users"]:
+                if parts[4].strip() == session["username"]:
+                    return self._write_json(403, {"error": "cannot delete your own account"})
+                try:
+                    deleted = self._auth_service().delete_user(parts[4])
+                except RuntimeError as exc:
+                    return self._write_json(400, {"error": str(exc)})
+                if not deleted:
+                    return self._write_json(404, {"error": "user not found"})
+                return self._write_empty(204)
             if len(parts) == 4 and parts[:3] == ["api", "v1", "targets"]:
                 deleted = self._control_plane_service().delete_target(parts[3])
                 if not deleted:

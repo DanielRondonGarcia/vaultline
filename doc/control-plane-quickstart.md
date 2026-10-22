@@ -548,13 +548,19 @@ Capacidades actuales:
 
 - listar usuarios locales,
 - crear usuarios locales,
-- reasignar rol,
+- reasignar rol desde la acción **Cambiar rol** (viewer, operator o admin),
+- eliminar usuarios con confirmación desde la acción **Eliminar**,
 - marcar o desmarcar cambio obligatorio de contraseña,
 - resetear contraseña y forzar nuevo cambio en el siguiente login.
 
 Si en cambio defines `CONTROL_PLANE_USERS_JSON`, la autenticación queda
 respaldada por variables de entorno y la administración local se muestra en modo
 solo lectura para dejar claro que no hay persistencia editable desde la UI.
+
+Un administrador no puede eliminar su propia cuenta ni cambiar su propio rol,
+ni desde la UI ni desde la API. Puede administrar las demás cuentas, incluidas
+otras cuentas admin. Eliminar un usuario invalida sus sesiones existentes;
+los cambios de rol se aplican a las sesiones existentes en la siguiente petición.
 
 Listar usuarios:
 
@@ -577,6 +583,16 @@ curl -b cp-cookie.txt -X POST http://127.0.0.1:8080/api/v1/admin/users/operator1
   -H "Content-Type: application/json" `
   -d "{\"role\":\"viewer\",\"must_change_password\":true}"
 ```
+
+Eliminar otro usuario (respuesta `204`; `404` si no existe):
+
+```powershell
+curl -b cp-cookie.txt -X DELETE http://127.0.0.1:8080/api/v1/admin/users/operator1
+```
+
+Eliminar la cuenta propia o cambiar su rol devuelve `403` sin modificar usuarios.
+Las operaciones sobre usuarios definidos mediante `CONTROL_PLANE_USERS_JSON`
+permanecen deshabilitadas.
 
 Resetear contraseña temporal:
 

@@ -218,6 +218,19 @@ class AuthService:
         self._save_users_file()
         return updated_user
 
+    def delete_user(self, username: str) -> bool:
+        self._require_file_backed_management()
+        normalized_username = _validate_username(username)
+        user = self.users.pop(normalized_username, None)
+        if user is None:
+            return False
+        try:
+            self._save_users_file()
+        except Exception:
+            self.users[normalized_username] = user
+            raise
+        return True
+
     def _require_file_backed_management(self):
         if self.users_file_path is None:
             raise RuntimeError("local user administration requires CONTROL_PLANE_USERS_FILE and is disabled for environment-backed users")

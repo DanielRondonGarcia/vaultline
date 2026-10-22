@@ -1,5 +1,6 @@
 import hmac
 import json
+import logging
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.control_plane.application.ports.ports import (
     CacheRepository,
+    DashboardReadSnapshotRepository,
     IndexRepository,
     InventoryRepository,
     JobRepository,
@@ -28,6 +30,7 @@ from src.control_plane.application.ports.ports import (
 from src.control_plane.domain.models import (
     BackupTargetRecord,
     CacheGenerationRecord,
+    DashboardReadSnapshotRecord,
     IndexStatusRecord,
     InventorySnapshot,
     JobRecord,
@@ -44,6 +47,8 @@ from src.control_plane.domain.models import (
     utcnow,
 )
 from src.control_plane.infrastructure.sqlite_runtime import SQLiteConnection as _SQLiteConnection
+
+logger = logging.getLogger(__name__)
 
 
 LEASE_DIAGNOSTIC_CODE = "worker_lease_expired"
@@ -349,6 +354,14 @@ class SQLiteRepositoryBase:
                     control_plane_public_url TEXT NOT NULL DEFAULT '',
                     snapshot_explorer_listing_max_output_bytes INTEGER NOT NULL DEFAULT 4194304,
                     updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS dashboard_read_snapshots (
+                    storage_key TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    tz_offset_minutes INTEGER,
+                    payload_json TEXT NOT NULL,
+                    generated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -1667,6 +1680,64 @@ class SQLiteTargetStatsRepository(SQLiteRepositoryBase, TargetStatsRepository):
         with self._lock, self._connect() as connection:
             cursor = connection.execute("DELETE FROM target_stats WHERE worker_id = ?", (worker_id,))
             return cursor.rowcount > 0
+
+
+class SQLiteDashboardReadSnapshotRepository(SQLiteRepositoryBase, DashboardReadSnapshotRepository):
+    """Atomic persisted last-good read-model snapshots.
+
+    Only the read-model maintenance lane writes here; a single INSERT OR
+    REPLACE per successful refresh keeps each payload whole and readers never
+    wait on this store (they serve the in-process RAM copy).
+    """
+
+    def save(self, record: DashboardReadSnapshotRecord) -> None:
+        with self._lock, self._connect() as connection:
+            # One statement per refresh: the persisted payload is atomic.
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO dashboard_read_snapshots (
+                    storage_key, kind, tz_offset_minutes, payload_json, generated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    record.storage_key(),
+                    record.kind,
+                    record.tz_offset_minutes,
+                    # Exact conversion, no default=str: a non-serializable
+                    # payload must surface as a refresh failure (last-good kept)
+                    # instead of silently stringifying hidden errors.
+                    json.dumps(record.payload),
+                    record.generated_at.isoformat(),
+                ),
+            )
+
+    def load_all(self) -> List[DashboardReadSnapshotRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT storage_key, kind, tz_offset_minutes, payload_json, generated_at "
+                "FROM dashboard_read_snapshots ORDER BY storage_key"
+            ).fetchall()
+        records: List[DashboardReadSnapshotRecord] = []
+        for row in rows:
+            try:
+                payload = _json_load(row["payload_json"], None)
+                generated_at = _dt(row["generated_at"])
+                if not isinstance(payload, dict) or generated_at is None:
+                    raise ValueError("snapshot row is incomplete")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.warning(
+                    "Skipping corrupt dashboard read snapshot row for key %s", row["storage_key"]
+                )
+                continue
+            records.append(
+                DashboardReadSnapshotRecord(
+                    kind=row["kind"],
+                    tz_offset_minutes=row["tz_offset_minutes"],
+                    payload=payload,
+                    generated_at=generated_at,
+                )
+            )
+        return records
 
 
 class SQLiteSettingsRepository(SQLiteRepositoryBase, SettingsRepository):

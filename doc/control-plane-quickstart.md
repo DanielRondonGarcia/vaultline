@@ -812,6 +812,15 @@ El listado siempre es paginado (25 por defecto, máximo 200) y acepta filtros y 
 curl "http://127.0.0.1:8080/api/v1/jobs?limit=50&status=failed&sort=started_at&order=desc"
 ```
 
+### Read model del dashboard (stats y targets)
+
+`GET /api/v1/jobs/stats` y `GET /api/v1/targets` se sirven desde snapshots "last-good" del dashboard, no desde la agregación en caliente:
+
+- Un único hilo de mantenimiento interno refresca por defecto cada 5 segundos (`CONTROL_PLANE_READ_MODEL_REFRESH_SECONDS`) solo las claves activas/cargadas de forma coalescente (máximo un refresco pendiente/en curso por clave). La cola del read model nunca crea jobs (ni de backup ni `stats.get`) ni toca la cola de trabajos del worker.
+- Las lecturas exitosas conservan los cuerpos legados (`{total, by_status, by_day}` y `{items}`) y añaden `X-Read-Model-Updated-At`, `X-Read-Model-Age-Seconds` y `Cache-Control: no-store`; un desfase de unos segundos de frescura es esperado y no crítico.
+- Mientras el modelo arranca (o si un refresco falla y aún no hay snapshot) la respuesta es `503` con `code: "read_model_warming_up"` y cabecera `Retry-After`; nunca se devuelven datos falsos vacíos. Si un refresco falla con snapshot previo, se sigue sirviendo el último dato bueno sin bloqueo.
+- Al reiniciar el Control Plane los snapshots persistidos en SQLite (`dashboard_read_snapshots`) se hidratan antes de servir: la convergencia del arranque no requiere recargar el navegador.
+
 ## 7. Enrolamiento HMAC y transporte
 
 HMAC usa secreto de un solo uso, digest en CP y archivo `0600`; no hay

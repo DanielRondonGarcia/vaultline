@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from src.control_plane.domain.models import (
     BackupTargetRecord,
     CacheGenerationRecord,
+    DashboardReadSnapshotRecord,
     IndexStatusRecord,
     InventorySnapshot,
     JobRecord,
@@ -426,6 +427,22 @@ class IndexRepository(ABC):
 
     @abstractmethod
     def cleanup_orphaned(self, active_target_ids: List[str]) -> int:
+        raise NotImplementedError
+
+
+class DashboardReadSnapshotRepository(ABC):
+    """Persisted last-good dashboard read-model snapshots.
+
+    Written only by the read-model maintenance lane after a successful
+    refresh; read requests never touch it (they serve the RAM copy).
+    """
+
+    @abstractmethod
+    def save(self, record: DashboardReadSnapshotRecord) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_all(self) -> List[DashboardReadSnapshotRecord]:
         raise NotImplementedError
 
 

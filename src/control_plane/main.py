@@ -27,6 +27,10 @@ from src.control_plane.application.services.control_plane_service import (
     SMTP_TEST_RECIPIENTS_OMITTED,
     WorkerDeletionConflict,
 )
+from src.control_plane.application.services.dashboard_read_service import (
+    DashboardReadService,
+    READ_MODEL_WARMUP_CODE,
+)
 from src.control_plane.application.services.live_file_service import (
     LiveCursorError,
     LiveFileService,
@@ -41,6 +45,7 @@ from src.control_plane.application.services.scheduler_service import (
 )
 from src.control_plane.domain.models import JobStatus
 from src.control_plane.infrastructure.repositories.in_memory import (
+    InMemoryDashboardReadSnapshotRepository,
     InMemoryInventoryRepository,
     InMemoryCacheRepository,
     InMemoryIndexRepository,
@@ -56,6 +61,7 @@ from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryWorkerRepository,
 )
 from src.control_plane.infrastructure.repositories.sqlite import (
+    SQLiteDashboardReadSnapshotRepository,
     SQLiteInventoryRepository,
     SQLiteCacheRepository,
     SQLiteIndexRepository,
@@ -189,6 +195,43 @@ def _to_jsonable(value):
     if isinstance(value, list):
         return [_to_jsonable(item) for item in value]
     return value
+
+
+def build_target_view(target, control_plane_service: ControlPlaneService, scheduler: "SchedulerService | None" = None):
+    """Shared target view build: live for HTTP routes, snapshot for read models.
+
+    Callable without a request handler so the dashboard read-model builder and
+    the legacy routes reuse the exact same target/runtime-volume, worker
+    eligibility and scheduling-preview fields.
+    """
+    payload = _to_jsonable(target)
+    payload["runtime_volumes"] = _to_jsonable(control_plane_service._target_runtime_volumes_for_view(target))
+    worker = control_plane_service.worker_repository.get(target.worker_id)
+    if worker is None:
+        worker_name = None
+        worker_status = "missing"
+        blocked_reason = "worker_missing"
+    else:
+        worker_name = worker.name
+        worker_status = control_plane_service._worker_status(worker)
+        if worker_status == "disabled":
+            blocked_reason = "worker_revoked"
+        elif worker_status != "online":
+            blocked_reason = "worker_offline"
+        else:
+            blocked_reason = "target_disabled" if not target.enabled else None
+    payload.update(
+        {
+            "worker_name": worker_name,
+            "worker_status": worker_status,
+            "execution_blocked": blocked_reason not in (None, "target_disabled"),
+            "blocked_reason": blocked_reason,
+            "scheduling_disabled": not bool(target.enabled),
+        }
+    )
+    if scheduler is not None:
+        payload.update(scheduler.preview(target=target))
+    return payload
 
 
 def _secret_to_public(secret):
@@ -403,6 +446,7 @@ class ControlPlaneApplication:
     live_file_service: LiveFileService | None = None
     live_lane: "LiveWorkerLane | None" = None
     filesystem_size_estimates: dict | None = None
+    dashboard_read_service: "DashboardReadService | None" = None
 
 
 class ControlPlaneHTTPServer(ThreadingHTTPServer):
@@ -509,36 +553,38 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
         return getattr(application, "scheduler", None)
 
     def _target_jsonable(self, target):
-        payload = _to_jsonable(target)
-        service = self._control_plane_service()
-        payload["runtime_volumes"] = _to_jsonable(service._target_runtime_volumes_for_view(target))
-        worker = service.worker_repository.get(target.worker_id)
-        if worker is None:
-            worker_name = None
-            worker_status = "missing"
-            blocked_reason = "worker_missing"
-        else:
-            worker_name = worker.name
-            worker_status = service._worker_status(worker)
-            if worker_status == "disabled":
-                blocked_reason = "worker_revoked"
-            elif worker_status != "online":
-                blocked_reason = "worker_offline"
-            else:
-                blocked_reason = "target_disabled" if not target.enabled else None
-        payload.update(
-            {
-                "worker_name": worker_name,
-                "worker_status": worker_status,
-                "execution_blocked": blocked_reason not in (None, "target_disabled"),
-                "blocked_reason": blocked_reason,
-                "scheduling_disabled": not bool(target.enabled),
-            }
+        return build_target_view(target, self._control_plane_service(), self._scheduler())
+
+    def _dashboard_read_service(self) -> DashboardReadService | None:
+        server = getattr(self, "server", None)
+        application = getattr(server, "application", None)
+        return getattr(application, "dashboard_read_service", None)
+
+    def _serve_dashboard_read_model(self, result, head_only: bool):
+        """Serve a coalesced snapshot result: warm-up 503 or cached body + freshness headers."""
+        if result.warming_up or result.snapshot is None:
+            return self._write_json(
+                503,
+                {"error": "dashboard read model is warming up", "code": READ_MODEL_WARMUP_CODE},
+                head_only=head_only,
+                extra_headers={
+                    "Retry-After": str(result.retry_after_seconds),
+                    "Cache-Control": "no-store",
+                },
+            )
+        snapshot = result.snapshot
+        read_service = self._dashboard_read_service()
+        age_seconds = read_service.age_seconds(snapshot) if read_service is not None else 0
+        return self._write_json(
+            200,
+            snapshot.payload,
+            head_only=head_only,
+            extra_headers={
+                "X-Read-Model-Updated-At": _to_jsonable(snapshot.generated_at),
+                "X-Read-Model-Age-Seconds": str(max(0, int(age_seconds))),
+                "Cache-Control": "no-store",
+            },
         )
-        scheduler = self._scheduler()
-        if scheduler is not None:
-            payload.update(scheduler.preview(target=target))
-        return payload
 
     def _worker_auth(self) -> WorkerAuthState:
         return self._control_plane_service().worker_auth
@@ -732,6 +778,9 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     tz_offset = _parse_jobs_stats_query(urlparse(self.path).query)
                 except ValueError as exc:
                     return self._write_json(400, {"error": str(exc)}, head_only=head_only)
+                read_service = self._dashboard_read_service()
+                if read_service is not None:
+                    return self._serve_dashboard_read_model(read_service.read_stats(tz_offset), head_only=head_only)
                 return self._write_json(200, self._control_plane_service().job_stats(tz_offset_minutes=tz_offset), head_only=head_only)
             if path == "/api/v1/reports/backups":
                 if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
@@ -779,6 +828,11 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/targets":
                 if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
                     return
+                read_service = self._dashboard_read_service()
+                if read_service is not None:
+                    # The list reads the persisted projection; detail and
+                    # mutation endpoints below stay live.
+                    return self._serve_dashboard_read_model(read_service.read_targets(), head_only=head_only)
                 return self._write_json(
                     200,
                     {"items": [self._target_jsonable(target) for target in self._control_plane_service().list_targets()]},
@@ -2186,6 +2240,33 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
         return True
 
 
+def _build_dashboard_read_service(control_plane_service, scheduler, interval_seconds: float) -> DashboardReadService:
+    """Wire the coalesced read-model lane over the shared scheduler-aware builders.
+
+    Stats use the compact `job_stats` aggregate (T1); targets reuse the shared
+    view builder (runtime volumes, worker eligibility, scheduling preview).
+    No backup or stats.get JobRecords are created for page refreshing.
+    """
+    repository_mode = os.environ.get("CONTROL_PLANE_REPOSITORY", "sqlite").strip().lower()
+    if repository_mode == "memory":
+        snapshot_repository = InMemoryDashboardReadSnapshotRepository()
+    else:
+        snapshot_repository = SQLiteDashboardReadSnapshotRepository(
+            os.environ.get("CONTROL_PLANE_DB_PATH", "control_plane.db")
+        )
+    return DashboardReadService(
+        snapshot_repository=snapshot_repository,
+        stats_builder=lambda tz_offset_minutes: control_plane_service.job_stats(tz_offset_minutes=tz_offset_minutes),
+        targets_builder=lambda: {
+            "items": [
+                build_target_view(target, control_plane_service, scheduler)
+                for target in control_plane_service.list_targets()
+            ]
+        },
+        refresh_interval_seconds=interval_seconds,
+    )
+
+
 def build_application() -> ControlPlaneApplication:
     control_plane_service = _build_service()
     scheduler_interval = int(os.environ.get("SCHEDULER_INTERVAL_SECONDS", "60"))
@@ -2195,6 +2276,16 @@ def build_application() -> ControlPlaneApplication:
         interval_seconds=scheduler_interval,
         timezone_name=scheduler_timezone,
     )
+    raw_read_interval = os.environ.get("CONTROL_PLANE_READ_MODEL_REFRESH_SECONDS", "5")
+    try:
+        read_model_interval = max(1.0, float(raw_read_interval))
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid CONTROL_PLANE_READ_MODEL_REFRESH_SECONDS=%r; using the 5s default",
+            raw_read_interval,
+        )
+        read_model_interval = 5.0
+    dashboard_read_service = _build_dashboard_read_service(control_plane_service, scheduler, read_model_interval)
     app = ControlPlaneApplication(
         auth_service=AuthService.from_runtime(),
         control_plane_service=control_plane_service,
@@ -2202,14 +2293,24 @@ def build_application() -> ControlPlaneApplication:
         scheduler=scheduler,
         live_file_service=LiveFileService(),
         live_lane=LiveWorkerLane(),
+        dashboard_read_service=dashboard_read_service,
     )
     return app
 
 
-def main():
-    host = os.environ.get("CONTROL_PLANE_HOST", "0.0.0.0")
-    port = int(os.environ.get("CONTROL_PLANE_PORT", "8080"))
-    application = build_application()
+def run_control_plane(
+    application: ControlPlaneApplication,
+    host: str,
+    port: int,
+    ready_event: "threading.Event | None" = None,
+) -> None:
+    """Bind, start the maintenance lanes, serve and always stop them again.
+
+    The dashboard read-model lane starts (hydrated snapshots already loaded)
+    together with an asynchronous first refresh of the targets key and the
+    default stats offset, before serving; the finally block stops the lane and
+    the backup scheduler without changing any cron evaluation semantics.
+    """
     if application.scheduler is not None:
         application.scheduler.start()
     if application.tls_manager is not None:
@@ -2223,8 +2324,29 @@ def main():
     else:
         server = ControlPlaneHTTPServer((host, port), ControlPlaneRequestHandler, application=application)
         logger.warning("Control Plane HTTP is non-confidential; use HTTPS for remote or confidential deployments")
-    logger.info("Control Plane listening on %s:%s", host, port)
-    server.serve_forever()
+    application.server = server
+    read_service = application.dashboard_read_service
+    try:
+        if read_service is not None:
+            read_service.start()
+            read_service.prime()  # asynchronous: the lane builds without blocking startup
+        if ready_event is not None:
+            ready_event.set()
+        logger.info("Control Plane listening on %s:%s", host, server.server_address[1])
+        server.serve_forever()
+    finally:
+        if read_service is not None:
+            read_service.stop()
+        if application.scheduler is not None:
+            application.scheduler.stop()
+        server.server_close()
+
+
+def main():
+    host = os.environ.get("CONTROL_PLANE_HOST", "0.0.0.0")
+    port = int(os.environ.get("CONTROL_PLANE_PORT", "8080"))
+    application = build_application()
+    run_control_plane(application, host, port)
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.control_plane.application.ports.ports import (
     CacheRepository,
+    DashboardReadSnapshotRepository,
     IndexRepository,
     InventoryRepository,
     JobRepository,
@@ -26,6 +27,7 @@ from src.control_plane.application.ports.ports import (
 from src.control_plane.domain.models import (
     BackupTargetRecord,
     CacheGenerationRecord,
+    DashboardReadSnapshotRecord,
     IndexStatusRecord,
     InventorySnapshot,
     JobRecord,
@@ -577,6 +579,22 @@ class InMemorySettingsRepository(SettingsRepository):
         with self._lock:
             self._item = settings
         return settings
+
+
+class InMemoryDashboardReadSnapshotRepository(DashboardReadSnapshotRepository):
+    """Memory-backed last-good dashboard read-model snapshots (same port as SQLite)."""
+
+    def __init__(self):
+        self._items: Dict[str, DashboardReadSnapshotRecord] = {}
+        self._lock = Lock()
+
+    def save(self, record: DashboardReadSnapshotRecord) -> None:
+        with self._lock:
+            self._items[record.storage_key()] = record
+
+    def load_all(self) -> List[DashboardReadSnapshotRecord]:
+        with self._lock:
+            return [self._items[key] for key in sorted(self._items)]
 
 
 class InMemoryCacheRepository(CacheRepository):

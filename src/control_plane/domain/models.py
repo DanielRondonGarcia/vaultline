@@ -210,6 +210,25 @@ class SettingsRecord:
 
 
 @dataclass
+class DashboardReadSnapshotRecord:
+    """Persisted last-good dashboard read-model snapshot.
+
+    One snapshot per read-model key: the job-stats aggregate for an exact
+    minute-based timezone offset or the enriched target list. Payload keeps
+    the legacy public body shape; ``generated_at`` is naive UTC and feeds the
+    freshness headers (restart hydration never rebuilds or reconciles).
+    """
+
+    kind: str
+    tz_offset_minutes: Optional[int] = None
+    payload: Dict[str, Any] = field(default_factory=dict)
+    generated_at: datetime = field(default_factory=utcnow)
+
+    def storage_key(self) -> str:
+        return "targets" if self.kind == "targets" else f"stats:{self.tz_offset_minutes}"
+
+
+@dataclass
 class SnapshotReadRequest:
     """Typed interactive snapshot read request (schema version 1)."""
 

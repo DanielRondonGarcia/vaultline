@@ -25,6 +25,8 @@ from src.worker_agent.infrastructure.api_client.control_plane_client import Cont
 from src.worker_agent.application.services.live_target_session_manager import LiveTargetSessionKey, LiveTargetSessionManager
 from src.worker_agent.infrastructure.security.job_recovery_journal import WorkerJobRecoveryJournal
 from src.worker_agent.infrastructure.security.terminal_report_journal import WorkerTerminalReportJournal
+from src.worker_agent.infrastructure.security.progress_report_journal import WorkerProgressReportJournal
+import hashlib
 
 logger = logging.getLogger(__name__)
 LIVE_MOUNT_SOURCES_LIMIT = 64
@@ -269,13 +271,21 @@ class _JobProgressReporter:
     MAX_PENDING_LINES = 32
     MAX_QUEUED_FLUSHES = 64
     FINISH_TIMEOUT_SECONDS = 5.0
+    RETRY_MIN_SECONDS = 1.0
+    RETRY_MAX_SECONDS = 30.0
 
-    def __init__(self, client, worker_id: str, job: Dict[str, Any], lease_diagnostics: Optional[_LeaseDiagnosticState] = None):
+    def __init__(self, client, worker_id: str, job: Dict[str, Any], lease_diagnostics: Optional[_LeaseDiagnosticState] = None, spool_directory=None):
         self.client = client
         self.worker_id = worker_id
         self.job_id = job.get("id")
         self.lease_token = job.get("lease_token")
         self.lease_diagnostics = lease_diagnostics
+        self._job = job
+        self._retention_warning_logged = False
+        self._journal = None
+        if spool_directory and self.job_id and self.lease_token:
+            name = hashlib.sha256(f"{worker_id}:{self.job_id}:{self.lease_token}".encode()).hexdigest()
+            self._journal = WorkerProgressReportJournal(str(Path(spool_directory) / f"{name}.json"))
         self.sequence = 0
         self.latest_progress: Dict[str, Any] = {}
         self._backup_size_metrics: Dict[str, int] = {}
@@ -285,6 +295,13 @@ class _JobProgressReporter:
         self._last_sent = 0.0
         self._lock = threading.Lock()
         self._outbox: Deque[tuple[int, Dict[str, Any], List[str]]] = deque()
+        if self._journal:
+            for record in self._journal.load():
+                if (record["worker_id"], record["job_id"], record["lease_token"]) != (worker_id, self.job_id, self.lease_token):
+                    continue
+                summary = record["result_summary"]
+                self._outbox.append((summary["sequence"], summary["progress"], record["log_lines"]))
+                self.sequence = max(self.sequence, summary["sequence"])
         self._outbox_ready = threading.Condition(self._lock)
         self._closing = False
         self._sender: Optional[threading.Thread] = None
@@ -320,7 +337,7 @@ class _JobProgressReporter:
                 for part in parts:
                     line = part.rstrip("\r\n")
                     if line:
-                        self._pending_lines.append(line[:16 * 1024])
+                        self._pending_lines.append(WorkerAgentService._safe_job_text(self._job, line)[:16 * 1024])
                         self._backup_size_metrics.update(_restic_backup_size_metrics(line))
                 # Some runtimes do not terminate their final output line. The
                 # summary can still be complete JSON, so inspect the partial line
@@ -361,7 +378,7 @@ class _JobProgressReporter:
     def finish(self) -> None:
         with self._lock:
             if self._partial_line:
-                self._pending_lines.append(self._partial_line[:16 * 1024])
+                self._pending_lines.append(WorkerAgentService._safe_job_text(self._job, self._partial_line)[:16 * 1024])
                 self._partial_line = ""
         self.emit("", force=True)
         with self._lock:
@@ -372,43 +389,71 @@ class _JobProgressReporter:
             return
         sender.join(timeout=self.FINISH_TIMEOUT_SECONDS)
         if sender.is_alive():
-            with self._lock:
-                dropped = len(self._outbox)
-                self._outbox.clear()
-            logger.warning(
-                "Job progress sender for %s is still blocked after %.1fs; dropped %s queued updates",
-                self.job_id,
-                self.FINISH_TIMEOUT_SECONDS,
-                dropped,
-            )
+            logger.warning("Job progress sender for %s remains blocked; pending updates retained", self.job_id)
+
+    def _persist_locked(self):
+        if self._journal is None:
+            return
+        records = [WorkerProgressReportJournal.batch(
+            self.worker_id, self.job_id, self.lease_token, sequence, progress, lines
+        ) for sequence, progress, lines in self._outbox]
+        try:
+            self._journal.write(records)
+        except (OSError, ValueError) as exc:
+            logger.warning("Progress spool unavailable for %s (error_type=%s)", self.job_id, type(exc).__name__)
+
+    def replay_pending(self):
+        """One ordered replay pass; leave unacknowledged batches on disk."""
+        while self._outbox:
+            sequence, progress, lines = self._outbox[0]
+            if not self._send(sequence, progress, lines):
+                return
+            self._outbox.popleft()
+            self._persist_locked()
 
     def _enqueue_locked(self, sequence: int, progress: Dict[str, Any], lines: List[str]) -> None:
         if not callable(self._send_method) or not self.job_id or not isinstance(self.lease_token, str):
             return
         if len(self._outbox) >= self.MAX_QUEUED_FLUSHES:
-            _, _, dropped_lines = self._outbox.popleft()
-            if self._outbox:
-                next_sequence, next_progress, next_lines = self._outbox[0]
-                self._outbox[0] = (next_sequence, next_progress, (dropped_lines + next_lines)[-self.MAX_PENDING_LINES :])
-            else:
-                lines = (dropped_lines + lines)[-self.MAX_PENDING_LINES :]
+            # The head may be in flight: never mutate or merge its acknowledged logs.
+            _, _, dropped_lines = self._outbox[1]
+            del self._outbox[1]
+            next_sequence, next_progress, next_lines = self._outbox[1]
+            combined = dropped_lines + next_lines
+            self._outbox[1] = (next_sequence, next_progress, combined[-self.MAX_PENDING_LINES :])
+            if len(combined) > self.MAX_PENDING_LINES and not self._retention_warning_logged:
+                self._retention_warning_logged = True
+                logger.warning("Progress log retention limit reached for job %s; oldest lines omitted", self.job_id)
         self._outbox.append((sequence, progress, lines))
+        self._persist_locked()
         if self._sender is None:
             self._sender = threading.Thread(target=self._drain, daemon=True, name=f"job-progress-{self.job_id}")
             self._sender.start()
         self._outbox_ready.notify()
 
     def _drain(self) -> None:
+        retry_delay = self.RETRY_MIN_SECONDS
         while True:
             with self._outbox_ready:
                 while not self._outbox and not self._closing:
                     self._outbox_ready.wait()
                 if not self._outbox:
                     return
-                sequence, progress, lines = self._outbox.popleft()
-            self._send(sequence, progress, lines)
+                sequence, progress, lines = self._outbox[0]
+            delivered = self._send(sequence, progress, lines)
+            with self._outbox_ready:
+                if delivered:
+                    if self._outbox and self._outbox[0][0] == sequence:
+                        self._outbox.popleft()
+                    self._persist_locked()
+                    retry_delay = self.RETRY_MIN_SECONDS
+                elif self._closing:
+                    return
+                else:
+                    self._outbox_ready.wait(timeout=retry_delay)
+                    retry_delay = min(self.RETRY_MAX_SECONDS, retry_delay * 2)
 
-    def _send(self, sequence: int, progress: Dict[str, Any], lines: List[str]) -> None:
+    def _send(self, sequence: int, progress: Dict[str, Any], lines: List[str]) -> bool:
         if not callable(self._send_method) or not self.job_id or not isinstance(self.lease_token, str):
             return
         kwargs = {
@@ -436,16 +481,21 @@ class _JobProgressReporter:
                         self.job_id,
                         exc.__class__.__name__,
                     )
-                    return
+                    return False
             else:
                 logger.warning("Job progress update failed for %s (error_type=TypeError)", self.job_id)
+                return False
         except Exception as exc:
+            if WorkerAgentService._is_definitive_control_plane_rejection(exc):
+                logger.warning("Progress for job %s rejected by the Control Plane; batch discarded (error_type=%s)", self.job_id, type(exc).__name__)
+                return True
             logger.warning(
                 "Job progress update failed for %s (error_type=%s)",
                 self.job_id,
                 exc.__class__.__name__,
             )
-            return
+            return False
+        return True
 
 
 class _RemoteCancellationProbe:
@@ -544,9 +594,11 @@ class WorkerAgentService:
             if recovery_file
             else None
         )
+        self.progress_spool_directory = str(Path(recovery_file).with_name("worker_progress")) if recovery_file else None
         self._pending_terminal_reports: Optional[List[Dict[str, Any]]] = None
         self._terminal_retry_delay = self.TERMINAL_REPORT_RETRY_MIN_SECONDS
         self._terminal_retry_at = 0.0
+        self._progress_reporters = {}
         self.live_sessions = live_session_manager or LiveTargetSessionManager(runtime_factory=self._live_runtime_factory, change_publisher=self._publish_live_change)
 
     def ensure_registered(self) -> str:
@@ -783,7 +835,7 @@ class WorkerAgentService:
         job: Dict[str, Any],
         execution: WorkerJobExecutionResult,
         result_summary: Dict[str, Any],
-        error: Exception,
+        error: Optional[Exception],
     ) -> bool:
         record = WorkerTerminalReportJournal.bounded_record(
             job_id=job.get("id"),
@@ -801,6 +853,7 @@ class WorkerAgentService:
             )
             return False
         pending = self._pending_terminal_reports_loaded()
+        pending[:] = [item for item in pending if item["job_id"] != record["job_id"]]
         pending.append(record)
         overflow = len(pending) - WorkerTerminalReportJournal.MAX_RECORDS
         if overflow > 0:
@@ -808,12 +861,42 @@ class WorkerAgentService:
                 logger.warning("Dropped pending terminal report for job %s: retry queue is full", lost["job_id"])
             del pending[:overflow]
         self._persist_pending_terminal_reports()
+        if error is None:
+            return True
         logger.warning(
             "Terminal report for job %s deferred (error_type=%s); it is retried until the Control Plane accepts it",
             job.get("id"),
             _safe_worker_error_type(error),
         )
         return True
+
+    def _ack_terminal_report(self, job_id):
+        self._progress_reporters.pop(job_id, None)
+        pending = self._pending_terminal_reports_loaded()
+        pending[:] = [item for item in pending if item["job_id"] != job_id]
+        self._persist_pending_terminal_reports()
+
+    def flush_pending_progress(self, worker_id):
+        if not self.progress_spool_directory:
+            return
+        for job_id, reporter in list(self._progress_reporters.items()):
+            if reporter._sender is None or not reporter._sender.is_alive():
+                self._progress_reporters.pop(job_id, None)
+        for path in Path(self.progress_spool_directory).glob("*.json"):
+            records = WorkerProgressReportJournal(str(path)).load()
+            if not records or records[0]["worker_id"] != worker_id:
+                logger.warning("Discarding expired, invalid or foreign worker progress spool %s", path.name)
+                WorkerProgressReportJournal(str(path)).clear()
+                continue
+            record = records[0]
+            if record["job_id"] in self._progress_reporters:
+                continue  # A blocked sender still owns this spool file.
+            reporter = _JobProgressReporter(
+                self.control_plane_client, worker_id,
+                {"id": record["job_id"], "lease_token": record["lease_token"]},
+                spool_directory=self.progress_spool_directory,
+            )
+            reporter.replay_pending()
 
     def flush_pending_terminal_reports(self, worker_id: str) -> int:
         """Retry deferred terminal reports with backoff; never raises."""
@@ -828,6 +911,10 @@ class WorkerAgentService:
                 pending.pop(0)
                 continue
             try:
+                if self.progress_spool_directory:
+                    name = hashlib.sha256(f"{worker_id}:{record['job_id']}:{record['lease_token']}".encode()).hexdigest()
+                    if (Path(self.progress_spool_directory) / f"{name}.json").exists():
+                        break  # Deliver sequenced logs before committing the final result.
                 self.control_plane_client.update_job_status(
                     worker_id=worker_id,
                     job_id=record["job_id"],
@@ -1957,7 +2044,9 @@ class WorkerAgentService:
                 worker_id,
                 job,
                 lease_diagnostics=lease_diagnostics,
+                spool_directory=self.progress_spool_directory,
             )
+            self._progress_reporters[job.get("id")] = progress_reporter
             progress_reporter.start()
             try:
                 execution = self.execute_job(job, progress_reporter=progress_reporter)
@@ -1969,6 +2058,9 @@ class WorkerAgentService:
                 lease_context = lease_diagnostics.snapshot()
                 if lease_context:
                     result_summary["lease_context"] = lease_context
+                self._defer_terminal_report(worker_id, job, execution, result_summary, None)
+                if progress_reporter._outbox:
+                    raise ConnectionError("progress delivery pending")
                 updated = self.control_plane_client.update_job_status(
                     worker_id=worker_id,
                     job_id=job["id"],
@@ -1979,9 +2071,11 @@ class WorkerAgentService:
                 )
             except Exception as exc:
                 if execution.status == JobStatus.CANCELED and isinstance(exc, ValueError) and "canceled" in str(exc).lower():
+                    self._ack_terminal_report(job.get("id"))
                     self._clear_recovery_record(job.get("id"))
                     updated = job
                 elif self._is_definitive_control_plane_rejection(exc):
+                    self._ack_terminal_report(job.get("id"))
                     self._clear_recovery_record(job.get("id"))
                     raise
                 elif self._defer_terminal_report(worker_id, job, execution, result_summary, exc):
@@ -1992,6 +2086,7 @@ class WorkerAgentService:
                 else:
                     raise
             else:
+                self._ack_terminal_report(job.get("id"))
                 self._clear_recovery_record(job.get("id"))
             results.append(updated)
         return results
@@ -2003,6 +2098,7 @@ class WorkerAgentService:
 
     def poll_once(self, interactive: bool = False):
         worker_id = self.ensure_registered()
+        self.flush_pending_progress(worker_id)
         self.flush_pending_terminal_reports(worker_id)
         jobs = self._fetch_jobs(worker_id, interactive=interactive)
         if interactive:

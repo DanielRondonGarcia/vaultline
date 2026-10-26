@@ -1239,6 +1239,7 @@
       const versionCell = (wv) => {
         const cur = (wv || "").replace(/^v/, "").trim();
         if (!cur || cur === "dev") return `<span class="mono">—</span>`;
+        if (!latest) return `<span class="version-badge unknown" title="Sin comprobar: version publicada no disponible">v${escapeHtml(cur)}</span>`;
         if (isOutdated(wv)) return `<span class="version-badge outdated" title="Desactualizado: ultima version es v${escapeHtml(latest)}">${ICONS.warn || "⚠"} v${escapeHtml(cur)}</span>`;
         return `<span class="version-badge current" title="Actualizado">✓ v${escapeHtml(cur)}</span>`;
       };
@@ -9310,6 +9311,8 @@ docker compose up -d
           state.latestVersionUrl = latest.html_url || "https://github.com/DanielRondonGarcia/vaultline/releases/latest";
           state.latestAssets = latest.assets && typeof latest.assets === "object" ? latest.assets : {};
           renderVersionBanner();
+          const content = document.getElementById("content");
+          if (content && state.currentView === "workers") renderWorkers(content);
         }
       } catch (error) {}
     }

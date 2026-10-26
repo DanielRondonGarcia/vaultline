@@ -134,6 +134,48 @@ process.stdout.write(JSON.stringify({{
         ):
             self.assertIn(expected, output["genuineHtml"])
 
+    def test_worker_badges_wait_for_latest_release_after_page_reload(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        blocks = [extract_block(pattern, label) for pattern, label in (
+            (r"const state = \{.*?\n    \};\n    let workersNotice = null;", "state"),
+            (r"function escapeHtml\(str\) \{.*?\n    \}", "escapeHtml"),
+            (r"function isVersionOutdated\(current, latest\) \{.*?\n    \}", "comparator"),
+            (r"function renderWorkers\(content\) \{.*?\n    \}", "workers"),
+            (r"async function refreshLatestVersion\(\) \{.*?\n    \}", "latest refresh"),
+        )]
+        script = "\n".join(blocks) + r'''
+const content = { innerHTML: "", querySelectorAll: () => [] };
+const document = { getElementById: id => id === "content" ? content : null };
+const startWorkersPolling = () => {};
+const openAddWorkerModal = () => {};
+const openEditWorkerLabelsModal = () => {};
+const openRenewWorkerModal = () => {};
+const revokeWorker = () => {};
+const deleteWorker = () => {};
+const fmtStatus = () => "";
+const fmtDate = () => "—";
+const ICONS = { warn: "⚠" };
+const renderVersionBanner = () => {};
+const apiGet = async () => ({ tag_name: "3.15.13" });
+state.currentRole = "viewer";
+state.currentView = "workers";
+state.workers = [
+  { id: "old", name: "old", version: "3.3.5", status: "online" },
+  { id: "new", name: "new", version: "3.15.13", status: "online" },
+];
+renderWorkers(content);
+const before = content.innerHTML;
+refreshLatestVersion().then(() => {
+  const after = content.innerHTML;
+  if (before.includes("version-badge current") || !before.includes("version-badge unknown")) throw new Error("unknown release painted all versions green");
+  if (!after.includes("⚠ v3.3.5") || !after.includes("✓ v3.15.13")) throw new Error("workers were not repainted when release arrived");
+  process.stdout.write("badges refreshed");
+}).catch(error => { console.error(error); process.exitCode = 1; });
+'''
+        result = run_node_eval(script)
+        self.assertEqual((result.returncode, result.stdout), (0, "badges refreshed"), result.stderr)
+
     def test_worker_badges_only_outdated_for_strictly_newer_release(self):
         state_block = extract_block(
             r"const state = \{.*?\n    \};\n    let workersNotice = null;",

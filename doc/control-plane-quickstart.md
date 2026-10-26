@@ -644,7 +644,7 @@ Avisos de versión: el banner de actualización de la UI y la marca
 conocida es numéricamente superior a la instalada (se comparan mayor, menor y
 patch). Con una versión igual o más nueva instalada no hay aviso, aunque los
 datos del release conocido fueran más antiguos; sin datos de versión válidos
-tampoco se muestra un aviso de actualización. La versión del worker sigue visible.
+tampoco se muestra un aviso de actualización. Mientras se consulta el último release, o si la consulta falla, la versión del worker se muestra en gris como «sin comprobar», nunca como actualizada. Al recibir el release, la tabla se actualiza sin esperar otro heartbeat del worker.
 
 ## 5. Configuración de backup
 

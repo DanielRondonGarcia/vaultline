@@ -211,6 +211,10 @@
   border-radius: 10px;
   white-space: nowrap;
 }
+.version-badge.unknown {
+  background: var(--muted);
+  color: var(--muted-foreground);
+}
 .version-badge.current {
   background: rgba(34, 197, 94, .12);
   color: #16a34a;

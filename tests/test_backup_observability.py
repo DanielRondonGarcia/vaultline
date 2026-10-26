@@ -395,6 +395,31 @@ class BackupObservabilityServiceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     repository.list_for_listing(order="sideways")
 
+    def test_jobs_identity_search_uses_names_before_pagination_and_preserves_missing_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for repository in (InMemoryJobRepository(), SQLiteJobRepository(f"{directory}/jobs.db")):
+                with self.subTest(repository=type(repository).__name__):
+                    service = self.make_service(job_repository=repository)
+                    service.worker_repository.get("worker-a").name = "worker-act-twc-11"
+                    service.target_repository.get("target-a").name = "chatwoot"
+                    for index, (target_id, worker_id) in enumerate((
+                        ("target-a", "worker-a"), ("missing-target", "worker-b"),
+                        ("target-a", "worker-a"),
+                    )):
+                        repository.save(JobRecord(id=f"job-{index}", target_id=target_id, worker_id=worker_id,
+                            command="backup.run", submitted_at=datetime(2026, 1, 10, 12, index)))
+                    jobs, total = service.list_job_views(limit=1, offset=1, filters={"identity_search": "CHAT"})
+                    self.assertEqual((total, [job["id"] for job in jobs]), (2, ["job-0"]))
+                    self.assertEqual((jobs[0]["target_name"], jobs[0]["worker_name"]), ("chatwoot", "worker-act-twc-11"))
+                    jobs, total = service.list_job_views(filters={"identity_search": "TWC-11"})
+                    self.assertEqual((total, [job["id"] for job in jobs]), (2, ["job-2", "job-0"]))
+                    jobs, total = service.list_job_views(filters={"identity_search": "missing-target"})
+                    self.assertEqual((total, jobs[0]["target_name"], jobs[0]["worker_name"]), (1, "missing-target", "worker-b"))
+                    jobs, total = service.list_job_views(filters={"target_id": "target-a"})
+                    self.assertEqual(total, 2)
+                    jobs, total = service.list_job_views(filters={"identity_search": "%"})
+                    self.assertEqual((jobs, total), ([], 0))
+
     def test_job_stats_shape_matches_across_repositories(self):
         now = datetime(2026, 1, 11, 2, 0, 0)
         repositories = [InMemoryJobRepository()]
@@ -1236,6 +1261,16 @@ class JobsListingRouteTests(unittest.TestCase):
                 self.assertEqual(status_code, 400)
                 self.assertEqual(set(payload), {"error"})
                 self.assertTrue(payload["error"].startswith("invalid "))
+
+    def test_listing_forwards_optional_identity_search(self):
+        service, write_json = self.listing("target_worker=Chatwoot%20TWC")
+        self.assertEqual(service.listing_calls[0]["filters"], {"identity_search": "Chatwoot TWC"})
+        self.assertEqual(write_json.call_args.args[0], 200)
+
+    def test_listing_rejects_overlong_identity_search(self):
+        service, write_json = self.listing("target_worker=" + "x" * 129)
+        self.assertEqual(service.listing_calls, [])
+        self.assertEqual(write_json.call_args.args, (400, {"error": "invalid target_worker: must be at most 128 characters"}))
 
     def test_listing_requires_viewer_auth(self):
         service = _RecordingJobsService()

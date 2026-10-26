@@ -4373,8 +4373,23 @@ class ControlPlaneService:
         order: str = "desc",
     ) -> tuple:
         self._reconcile_expired_jobs()
-        jobs, total = self.job_repository.list_for_listing(limit=limit, offset=offset, filters=filters, sort=sort, order=order)
-        return [self._job_listing_view(job) for job in jobs], total
+        targets = {target.id: target.name for target in self.target_repository.list()}
+        workers = {worker.id: worker.name for worker in self.worker_repository.list()}
+        listing_filters = dict(filters or {})
+        if listing_filters.get("identity_search"):
+            needle = str(listing_filters["identity_search"]).casefold()
+            listing_filters["identity_target_ids"] = [key for key, name in targets.items() if needle in (name or "").casefold()]
+            listing_filters["identity_worker_ids"] = [key for key, name in workers.items() if needle in (name or "").casefold()]
+        jobs, total = self.job_repository.list_for_listing(
+            limit=limit, offset=offset, filters=listing_filters, sort=sort, order=order,
+        )
+        views = []
+        for job in jobs:
+            view = self._job_listing_view(job)
+            view["target_name"] = targets.get(job.target_id) or job.target_id or ""
+            view["worker_name"] = workers.get(job.worker_id) or job.worker_id or ""
+            views.append(view)
+        return views, total
 
     def backup_audit_report(self, start_date: str, end_date: str, timezone_name: str) -> Dict[str, Any]:
         period = parse_audit_period(start_date, end_date, timezone_name)

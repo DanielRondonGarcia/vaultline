@@ -295,6 +295,11 @@ def _parse_jobs_listing_query(query: str) -> dict:
         value = (qs.get(name, [""])[0] or "").strip()
         if value:
             filters[name] = value
+    identity_search = (qs.get("target_worker", [""])[0] or "").strip()
+    if identity_search:
+        if len(identity_search) > 128:
+            raise ValueError("invalid target_worker: must be at most 128 characters")
+        filters["identity_search"] = identity_search
     id_prefix = (qs.get("id", [""])[0] or "").strip()
     if id_prefix:
         filters["id_prefix"] = id_prefix

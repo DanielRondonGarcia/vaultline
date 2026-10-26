@@ -867,6 +867,14 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             if key in active:
                 clauses.append(f"{key} = ?")
                 parameters.append(active[key])
+        if "identity_search" in active:
+            escaped = str(active["identity_search"]).lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            clauses.append(
+                "(lower(target_id) LIKE ? ESCAPE '\\' OR lower(worker_id) LIKE ? ESCAPE '\\' "
+                "OR target_id IN (SELECT value FROM json_each(?)) "
+                "OR worker_id IN (SELECT value FROM json_each(?)))"
+            )
+            parameters.extend((f"%{escaped}%", f"%{escaped}%", json.dumps(active.get("identity_target_ids", [])), json.dumps(active.get("identity_worker_ids", []))))
         if "id_prefix" in active:
             escaped = str(active["id_prefix"]).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             clauses.append("id LIKE ? ESCAPE '\\'")

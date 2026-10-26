@@ -109,6 +109,16 @@ def _job_matches_listing_filters(job: JobRecord, filters: Dict[str, Any]) -> boo
         value = filters.get(key)
         if value and getattr(job, key) != value:
             return False
+    identity_search = filters.get("identity_search")
+    if identity_search:
+        needle = str(identity_search).casefold()
+        if not (
+            needle in str(job.target_id or "").casefold()
+            or needle in str(job.worker_id or "").casefold()
+            or job.target_id in filters.get("identity_target_ids", ())
+            or job.worker_id in filters.get("identity_worker_ids", ())
+        ):
+            return False
     id_prefix = filters.get("id_prefix")
     if id_prefix and not str(job.id).lower().startswith(str(id_prefix).lower()):
         return False

@@ -436,11 +436,12 @@ Native filesystem targets use `runtime_type: "native"`, require at least one `fi
 | `status` | `pending`, `in_progress`, `succeeded`, `failed`, `canceled` (se normalizan `running`/`cancelled`) | — |
 | `command`, `trigger`, `target_id` | coincidencia exacta | — |
 | `id` | prefijo del id del job (insensible a mayúsculas) | — |
+| `target_worker` | texto de hasta 128 caracteres; busca por nombre o ID de target o worker (sin distinguir mayúsculas), antes de paginar | — |
 | `started_from`, `finished_to` | timestamp ISO-8601 (`started_at >= from`, `finished_at <= to`) | — |
 | `sort` | `submitted_at`, `started_at`, `finished_at`, `status`, `command`, `trigger`, `target_id`, `id` | `submitted_at` |
 | `order` | `asc`, `desc` (desempate siempre por `id DESC`) | `desc` |
 
-Un parámetro inválido responde `400 {"error": "invalid <param>: ..."}`.
+Cada job listado incluye `target_name` y `worker_name` legibles; si el registro asociado ya no existe, usa su ID. `target_id` conserva la coincidencia exacta para los clientes existentes. Un parámetro inválido responde `400 {"error": "invalid <param>: ..."}`.
 
 `GET /api/v1/jobs/stats` devuelve los agregados que usa el dashboard sin listar jobs: `{"total", "by_status": {status: count}, "by_day": [{"date", "total", "success", "failed"}]}` para los últimos 7 días calendario según `started_at`. El parámetro opcional `tz_offset` (minutos respecto a UTC, `-840..840`) desplaza el corte de día al huso del cliente.
 

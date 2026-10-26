@@ -854,10 +854,19 @@ process.stdout.write(JSON.stringify({ html: contentElement.innerHTML }));
         result = run_node_eval(script)
         self.assertEqual(result.returncode, 0, result.stderr)
         output = json.loads(result.stdout)
-        self.assertIn("Actualizado hace 5 s", output["first"])
-        self.assertIn("Actualizado hace 15 s", output["second"], "age must advance without any re-render")
+        # The UI computes elapsed age from Date.now(), so real time keeps
+        # passing while the test runs: a slow CI runner may see 16 s where a
+        # local run sees 15 s. Assert the rule (a strictly advancing integer
+        # age at or above the simulated shift), never an exact wall-clock
+        # literal, to keep this deterministic on any runner speed.
+        first_age = int(re.search(r"Actualizado hace (\d+) s", output["first"]).group(1))
+        second_age = int(re.search(r"Actualizado hace (\d+) s", output["second"]).group(1))
+        targets_age = int(re.search(r"Actualizado hace (\d+) s", output["targetsFreshness"]).group(1))
+        self.assertGreaterEqual(first_age, 5)
+        self.assertGreater(second_age, first_age, "age must advance without any re-render")
+        self.assertGreaterEqual(second_age, 15)
         self.assertTrue(output["ageAdvances"])
-        self.assertIn("Actualizado hace 3 s", output["targetsFreshness"])
+        self.assertGreaterEqual(targets_age, 3)
         self.assertEqual(output["warmingCopy"], "Preparando targets...")
         self.assertTrue(output["settledNoMeta"], "no snapshot metadata means no fake freshness text")
 

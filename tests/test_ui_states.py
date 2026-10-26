@@ -1938,6 +1938,21 @@ if (fmtDate(instant) !== expectedBrowser) throw new Error("event timestamp fell 
         self.assertIsNotNone(trigger_renderer)
         self.assertIn("escapeHtml", trigger_renderer.group(0))
 
+    def test_jobs_show_target_name_above_muted_worker_name(self):
+        self.assertIn('class="job-identity"', self.source)
+        self.assertIn('class="job-identity-target"', self.source)
+        self.assertIn('class="job-identity-worker"', self.source)
+        self.assertIn('j.target_name', self.source)
+        self.assertIn('j.worker_name', self.source)
+        self.assertIn('Target / Worker', self.source)
+        self.assertIn('.job-identity-target { font-size: 13px; font-weight: 600;', self.source)
+        self.assertIn('.job-identity-worker { color: var(--muted-foreground); font-size: 11px;', self.source)
+
+    def test_jobs_search_field_queries_target_or_worker_name(self):
+        self.assertIn('["target_worker", filters.target]', self.source)
+        self.assertIn('<input type="text" class="dt-filter" data-col="target"', self.source)
+        self.assertIn('aria-label="Buscar target o worker"', self.source)
+
     def test_jobs_filter_controls_use_typed_values_and_date_bounds(self):
         render_jobs = re.search(
             r"function renderJobs\(content\) \{.*?\n    let _jobsRenderTableBody",
@@ -1948,13 +1963,13 @@ if (fmtDate(instant) !== expectedBrowser) throw new Error("event timestamp fell 
         render_source = render_jobs.group(0)
         for marker in (
             '<input type="text" class="dt-filter" data-col="id"',
-            '<select class="dt-filter" data-col="target"',
+            '<input type="text" class="dt-filter" data-col="target"',
             '<select class="dt-filter" data-col="command"',
             '<select class="dt-filter" data-col="origin"',
             '<select class="dt-filter" data-col="status"',
             '<input type="datetime-local" class="dt-filter" data-col="started"',
             '<input type="datetime-local" class="dt-filter" data-col="finished"',
-            'aria-label="Filtrar target"',
+            'aria-label="Buscar target o worker"',
             'aria-label="Inicio desde"',
             'placeholder="Inicio desde"',
             'aria-label="Fin hasta"',
@@ -1965,10 +1980,8 @@ if (fmtDate(instant) !== expectedBrowser) throw new Error("event timestamp fell 
             "...JOB_COMMAND_OPTIONS",
             "...JOB_TRIGGER_OPTIONS",
             "status: JOB_STATUS_OPTIONS.slice()",
-            "(state.targets || []).slice().sort(",
             "jobTriggerLabel(value)",
             "jobStatusLabel(value)",
-            "targetMap[value] || value",
             "escapeHtml(value)",
             "!valueSet.has(jobsTableState.filters[column])",
             "select.value = valueSet.has(jobsTableState.filters[column])",
@@ -1984,7 +1997,7 @@ if (fmtDate(instant) !== expectedBrowser) throw new Error("event timestamp fell 
             "function parseJobTimestamp(value)",
             "startedAt < startedBound",
             "finishedAt > finishedBound",
-            '<input type="text" class="dt-filter" data-col="target"',
+            '<select class="dt-filter" data-col="target"',
         ):
             self.assertNotIn(removed, render_source)
 
@@ -2042,7 +2055,7 @@ const flush = () => new Promise(resolve => setTimeout(resolve, 0));
 async function main() {
   const query = jobsListQuery({ page: 3, pageSize: 50, sortKey: "started_at", sortDir: "asc", filters: { id: "ab", target: "t-1", command: "backup.run", status: "failed", origin: "schedule", started: "2026-01-10T07:00", finished: "" } });
   const params = new URLSearchParams(query);
-  const expected = { limit: "50", offset: "100", sort: "started_at", order: "asc", id: "ab", target_id: "t-1", command: "backup.run", status: "failed", trigger: "schedule", started_from: new Date("2026-01-10T07:00").toISOString() };
+  const expected = { limit: "50", offset: "100", sort: "started_at", order: "asc", id: "ab", target_worker: "t-1", command: "backup.run", status: "failed", trigger: "schedule", started_from: new Date("2026-01-10T07:00").toISOString() };
   for (const [key, value] of Object.entries(expected)) {
     if (params.get(key) !== value) throw new Error(`query param ${key} was ${params.get(key)}, expected ${value}`);
   }
@@ -2053,7 +2066,7 @@ async function main() {
   if (tbody.attributes["aria-busy"] !== "true") throw new Error("tbody was not marked busy while loading");
   if (!tbody.innerHTML.includes("snapshot-skeleton-row")) throw new Error("loading state did not render skeleton rows");
   if (tbody.innerHTML.includes("Sin jobs que coincidan con los filtros")) throw new Error("empty message rendered before the response arrived");
-  if (!selects.target.innerHTML.includes('<option value="t-1">Alpha</option><option value="t-2">Zeta</option>')) throw new Error(`target filter did not list targets by name: ${selects.target.innerHTML}`);
+  if (!content.innerHTML.includes('data-col="target" aria-label="Buscar target o worker"')) throw new Error("target/worker text search missing");
   if (!selects.status.innerHTML.includes('<option value="in_progress">')) throw new Error("status filter lost its fixed options");
 
   pending.shift().resolve({ items: [], total: 0 });
@@ -2067,10 +2080,11 @@ async function main() {
   await flush();
   if (tbody.attributes["aria-busy"] !== "true" || !tbody.innerHTML.includes("snapshot-skeleton-row")) throw new Error("reload did not show the loading state");
   if (calls.length !== 2 || !calls[1].includes("status=failed")) throw new Error(`reload did not send the new filter: ${JSON.stringify(calls)}`);
-  pending.shift().resolve({ items: [{ id: "job-1234abcd", target_id: "t-1", command: "backup.run", trigger: "manual", status: "failed", started_at: "2026-01-10T07:00:00Z" }], total: 77 });
+  pending.shift().resolve({ items: [{ id: "job-1234abcd", target_id: "t-1", target_name: "Alpha", worker_id: "w-1", worker_name: "worker-act-twc-11", command: "backup.run", trigger: "manual", status: "failed", started_at: "2026-01-10T07:00:00Z" }], total: 77 });
   await reload;
   await flush();
   if (!tbody.innerHTML.includes("job-row-job-1234abcd")) throw new Error("page rows were not rendered after reload");
+  if (!tbody.innerHTML.includes('<span class="job-identity-target">Alpha</span><span class="job-identity-worker">worker-act-twc-11</span>')) throw new Error("target and worker names were not stacked");
   if (jobsListTotal !== 77) throw new Error("server total was not stored");
 
   jobsTableState.page = 1;

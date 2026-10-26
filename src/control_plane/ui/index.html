@@ -157,6 +157,9 @@
     .snapshot-pagination-control { display: flex; justify-content: center; padding: 12px 0 4px; }
     .snapshot-pagination-control .btn { min-width: 128px; touch-action: manipulation; }
      .snapshot-safe-note { margin-top: 8px; color: var(--muted-foreground); font-size: 11px; line-height: 1.5; }
+     .job-identity { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+     .job-identity-target { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+     .job-identity-worker { color: var(--muted-foreground); font-size: 11px; overflow-wrap: anywhere; }
      .job-lease-diagnostics { display: grid; gap: 6px; margin-bottom: 10px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--destructive) 42%, var(--border)); border-radius: var(--radius); background: color-mix(in srgb, var(--destructive) 7%, var(--card)); color: var(--muted-foreground); font-size: 12px; line-height: 1.45; }
      .job-lease-diagnostics strong { color: var(--foreground); }
      .job-lease-diagnostics code { color: var(--destructive); font: 600 11px/1.4 var(--font-mono); }
@@ -6699,7 +6702,7 @@ docker compose up -d
       };
       const mapping = [
         ["id", filters.id],
-        ["target_id", filters.target],
+        ["target_worker", filters.target],
         ["command", filters.command],
         ["status", filters.status],
         ["trigger", filters.origin],
@@ -6718,7 +6721,7 @@ docker compose up -d
       const newJobs = Array.isArray(jobsResp.items) ? jobsResp.items : [];
       const wasLoaded = jobsListLoaded;
       const mergedJobs = mergeJobList(newJobs);
-      const jobFingerprint = j => JSON.stringify([j.id, j.command || "", j.trigger || "", normalizeJobStatus(j.status), j.updated_at || "", j.progress || (j.result_summary && j.result_summary.progress) || null, (j.log_lines || []).length]);
+      const jobFingerprint = j => JSON.stringify([j.id, j.command || "", j.trigger || "", normalizeJobStatus(j.status), j.updated_at || "", j.target_name || "", j.worker_name || "", j.progress || (j.result_summary && j.result_summary.progress) || null, (j.log_lines || []).length]);
       const hasChanged = JSON.stringify(mergedJobs.map(jobFingerprint)) !== JSON.stringify((state.jobs || []).map(jobFingerprint));
       const total = Number.isFinite(Number(jobsResp.total)) ? Number(jobsResp.total) : newJobs.length;
       const totalChanged = total !== jobsListTotal;
@@ -6967,6 +6970,8 @@ docker compose up -d
     function renderJobs(content) {
       const targetMap = {};
       (state.targets || []).forEach(t => { targetMap[t.id] = t.name; });
+      const workerMap = {};
+      (state.workers || []).forEach(w => { workerMap[w.id] = w.name; });
 
       const jobFilterValue = (value) => value === null || value === undefined ? "" : String(value);
       const uniqueJobFilterValues = (values) => Array.from(new Set(values.filter(value => value !== ""))).sort((a, b) => a.localeCompare(b));
@@ -6976,7 +6981,6 @@ docker compose up -d
           command: uniqueJobFilterValues([...JOB_COMMAND_OPTIONS, ...pageJobs.map(j => jobFilterValue(j.command)), jobsTableState.filters.command]),
           origin: uniqueJobFilterValues([...JOB_TRIGGER_OPTIONS, ...pageJobs.map(j => jobFilterValue(j.trigger)), jobsTableState.filters.origin]),
           status: JOB_STATUS_OPTIONS.slice(),
-          target: (state.targets || []).slice().sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id))).map(t => String(t.id)),
         };
         Object.entries(optionValues).forEach(([column, values]) => {
           const select = content.querySelector(`select.dt-filter[data-col="${column}"]`);
@@ -6988,7 +6992,6 @@ docker compose up -d
           select.innerHTML = renderJobFilterOptions(values, value => {
             if (column === "origin") return jobTriggerLabel(value);
             if (column === "status") return jobStatusLabel(value);
-            if (column === "target") return targetMap[value] || value;
             return value;
           });
           select.value = valueSet.has(jobsTableState.filters[column]) ? jobsTableState.filters[column] : "";
@@ -7041,10 +7044,12 @@ docker compose up -d
           const unavailableRow = `<tr><td colspan="8" class="empty-state">No se pudo cargar la lista de jobs.</td></tr>`;
           tbody.innerHTML = isLoading ? skeletonRows : !jobsListLoaded ? unavailableRow : pagedJobs.length === 0 ? emptyRow : pagedJobs.map(j => {
             const canCancel = normalizeJobStatus(j.status) === "pending" || normalizeJobStatus(j.status) === "in_progress";
+            const targetName = j.target_name || targetMap[j.target_id] || j.target_id || "—";
+            const workerName = j.worker_name || workerMap[j.worker_id] || j.worker_id || "—";
             return `
             <tr id="job-row-${escapeHtml(j.id)}">
               <td class="mono">${escapeHtml(String(j.id).slice(0,8))}</td>
-              <td>${escapeHtml(targetMap[j.target_id] || j.target_id || "—")}</td>
+              <td><div class="job-identity"><span class="job-identity-target">${escapeHtml(targetName)}</span><span class="job-identity-worker">${escapeHtml(workerName)}</span></div></td>
               <td>${fmtJobCommand(j.command)}</td>
               <td>${fmtJobTrigger(j.trigger)}</td>
               <td>${fmtJobStatus(j.status)}</td>
@@ -7076,7 +7081,7 @@ docker compose up -d
         const sortThs = content.querySelectorAll("[data-sort]");
         sortThs.forEach(th => {
           const key = th.dataset.sort;
-          th.innerHTML = `${key === "id" ? "ID" : key === "target_id" ? "Target" : key === "command" ? "Comando" : key === "trigger" ? "Origen" : key === "status" ? "Status" : key === "started_at" ? "Inicio" : "Fin"}${sortIcon(key)}`;
+          th.innerHTML = `${key === "id" ? "ID" : key === "target_id" ? "Target / Worker" : key === "command" ? "Comando" : key === "trigger" ? "Origen" : key === "status" ? "Status" : key === "started_at" ? "Inicio" : "Fin"}${sortIcon(key)}`;
         });
 
         bindJobsRowEvents();
@@ -7096,7 +7101,7 @@ docker compose up -d
             <thead>
               <tr>
                 <th ${sortAttrs("id")}>ID${sortIcon("id")}</th>
-                <th ${sortAttrs("target_id")}>Target${sortIcon("target_id")}</th>
+                <th ${sortAttrs("target_id")}>Target / Worker${sortIcon("target_id")}</th>
                 <th ${sortAttrs("command")}>Comando${sortIcon("command")}</th>
                 <th ${sortAttrs("trigger")}>Origen${sortIcon("trigger")}</th>
                 <th ${sortAttrs("status")}>Status${sortIcon("status")}</th>
@@ -7106,7 +7111,7 @@ docker compose up -d
               </tr>
               <tr class="filter-row">
                 <th><input type="text" class="dt-filter" data-col="id" aria-label="Filtrar ID" placeholder="ID empieza por..." value="${escapeHtml(jobsTableState.filters.id)}" /></th>
-                <th><select class="dt-filter" data-col="target" aria-label="Filtrar target"><option value="">Todos</option></select></th>
+                <th><input type="text" class="dt-filter" data-col="target" aria-label="Buscar target o worker" placeholder="Buscar target o worker..." maxlength="128" value="${escapeHtml(jobsTableState.filters.target)}" /></th>
                 <th><select class="dt-filter" data-col="command" aria-label="Filtrar comando"><option value="">Todos</option></select></th>
                 <th><select class="dt-filter" data-col="origin" aria-label="Filtrar origen"><option value="">Todos</option></select></th>
                 <th><select class="dt-filter" data-col="status" aria-label="Filtrar status"><option value="">Todos</option></select></th>

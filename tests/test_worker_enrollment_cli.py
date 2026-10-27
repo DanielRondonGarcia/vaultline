@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import socket
 import stat
 import tempfile
 import unittest
@@ -334,6 +335,10 @@ class WorkerEnrollmentCLITests(unittest.TestCase):
             (
                 URLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate"),
                 "Enrollment failed: URLError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate",
+            ),
+            (
+                URLError(socket.gaierror(11001, "getaddrinfo failed")),
+                "Enrollment failed: DNS lookup failed for the Control Plane host. Verify the hostname in --control-plane-url and confirm this server can resolve it (DNS/VPN/network). The bootstrap token was not validated.",
             ),
             (TimeoutError(), "Enrollment failed: TimeoutError"),
             (OSError(f"connection to https://cp.invalid/?token={token} refused"), "Enrollment failed: OSError: connection to <url> refused"),

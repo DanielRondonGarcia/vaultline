@@ -177,6 +177,12 @@ def _enrollment_failure_detail(exc: BaseException) -> str:
         return str(exc)
     # URLError wraps the socket/TLS cause in .reason; that is the useful part.
     reason = getattr(exc, "reason", None)
+    if isinstance(reason, socket.gaierror) or "getaddrinfo failed" in str(reason or exc).lower():
+        return (
+            "DNS lookup failed for the Control Plane host. Verify the hostname in "
+            "--control-plane-url and confirm this server can resolve it (DNS/VPN/network). "
+            "The bootstrap token was not validated."
+        )
     detail = safe_diagnostic_text(reason if reason is not None else exc)
     if not detail:
         return exc.__class__.__name__

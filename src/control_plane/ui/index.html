@@ -1752,6 +1752,19 @@
     const NATIVE_WORKER_TOKEN_PLACEHOLDER = "<BOOTSTRAP_TOKEN>";
     const NATIVE_WORKER_ASSET_URL_PLACEHOLDER = "<ASSET_URL>";
 
+    function renderNativeWorkerWizard(nativeTab) {
+      const installCurrent = nativeTab === "install";
+      const enrollmentCurrent = nativeTab === "enroll";
+      const infoCurrent = nativeTab === "info";
+      return `<nav class="native-worker-wizard" aria-label="Configuración del worker nativo">
+        <ol class="native-wizard-steps">
+          <li><button type="button" class="native-wizard-step ${installCurrent ? "active" : ""}" aria-label="Paso 1: Instalar" data-native-tab="install" aria-current="${installCurrent ? "step" : "false"}"><span class="native-wizard-number">1</span><span>Instalar</span></button></li>
+          <li><button type="button" class="native-wizard-step ${enrollmentCurrent ? "active" : ""}" aria-label="Paso 2: Enrollment" data-native-tab="enroll" aria-current="${enrollmentCurrent ? "step" : "false"}"><span class="native-wizard-number">2</span><span>Enrollment</span></button></li>
+        </ol>
+        <button type="button" class="native-info-button ${infoCurrent ? "active" : ""}" data-native-tab="info" aria-pressed="${infoCurrent ? "true" : "false"}">Info</button>
+      </nav>`;
+    }
+
     function renderNativeWorkerTab(cpUrl) {
       const { platform, info, asset, secondaryAsset, checksums } = assetForSelectedNativePlatform();
       const downloadUrl = asset ? asset.url : nativeWorkerReleaseUrl();
@@ -1792,19 +1805,26 @@ vaultline-worker service status`;
         ? ""
         : `<div class="alert warning" role="alert"><strong>Sin URL de descarga.</strong> Los comandos muestran <code>${escapeHtml(NATIVE_WORKER_ASSET_URL_PLACEHOLDER)}</code>: reemplázalo por la URL del asset <code>${escapeHtml(packageName)}</code> desde la pagina de release.</div>`;
       const commandPanel = (label, commands) => `<div class="code-block"><div class="code-block-heading">${label}</div><button class="copy-btn" data-code-id="modalCode">Copiar comandos</button><pre id="modalCode">${escapeHtml(commands)}</pre></div>`;
-      const nativeContent = nativeTab === "install"
-        ? `<div class="field"><label for="nativePlatformSelect">Plataforma</label><select id="nativePlatformSelect" aria-describedby="nativePlatformHint">${Object.entries(NATIVE_WORKER_PLATFORMS).map(([key, value]) => `<option value="${escapeHtml(key)}" ${key === platform ? "selected" : ""}>${escapeHtml(value.label)}</option>`).join("")}</select><div class="hint" id="nativePlatformHint">Elige la plataforma del host donde instalarás el worker.</div></div><a class="btn secondary sm native-download" href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener">${downloadLabel}</a>${assetNotice}<p class="helper">Instala el paquete; el servicio quedará listo para enrollment.</p>${commandPanel("Instalación", installCommands)}`
+      const stepNavigation = nativeTab === "install"
+        ? `<div class="native-wizard-navigation"><span class="native-wizard-position">Paso 1 de 2</span><button type="button" class="btn primary sm" data-native-tab="enroll">Siguiente: Enrollment</button></div>`
         : nativeTab === "enroll"
-          ? `${tokenNotice}<p class="helper">Ejecuta este paso después de instalar el worker.</p>${commandPanel("Enrollment", enrollmentCommands)}`
+          ? `<div class="native-wizard-navigation"><button type="button" class="btn secondary sm" data-native-tab="install">Anterior: Instalar</button><span class="native-wizard-position">Paso 2 de 2</span></div>`
+          : "";
+      const nativeContent = nativeTab === "install"
+        ? `<div class="field"><label for="nativePlatformSelect">Plataforma</label><select id="nativePlatformSelect" aria-describedby="nativePlatformHint">${Object.entries(NATIVE_WORKER_PLATFORMS).map(([key, value]) => `<option value="${escapeHtml(key)}" ${key === platform ? "selected" : ""}>${escapeHtml(value.label)}</option>`).join("")}</select><div class="hint" id="nativePlatformHint">Elige la plataforma del host donde instalarás el worker.</div></div><a class="btn secondary sm native-download" href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener">${downloadLabel}</a>${assetNotice}<p class="helper">Instala el paquete; el servicio quedará listo para enrollment.</p>${commandPanel("Instalación", installCommands)}${stepNavigation}`
+        : nativeTab === "enroll"
+          ? `${tokenNotice}<p class="helper">Ejecuta este paso después de instalar el worker.</p>${commandPanel("Enrollment", enrollmentCommands)}${stepNavigation}`
           : `<div class="native-worker-info"><h4>Información</h4><div class="card compact"><div class="eyebrow">Descarga y versión</div>${renderAssetMetadata(asset, checksums, secondaryAsset, info.secondaryLabel)}</div><p>${escapeHtml(platformNote)}</p><p>El servicio arranca y espera el enrolamiento. Al actualizar, instala el paquete nuevo sobre el existente: se conservan el estado y las credenciales sin reiniciar ni volver a enrolar. Los ejecutables de Restic y rclone se incluyen con el worker nativo; mantén <code>rclone.conf</code> y las credenciales del repositorio en secretos separados. Instala por separado las demás herramientas externas (tar, gpg, aws, ssh y scp) cuando las necesites.</p>${tokenNotice}`;
       return `<div class="native-worker-panel" data-native-worker-platform="${escapeHtml(platform)}">
-        <div class="tabs native-worker-tabs" role="tablist" aria-label="Pasos del worker nativo">
-          <button class="native-subtab ${nativeTab === "install" ? "active" : ""}" role="tab" aria-selected="${nativeTab === "install" ? "true" : "false"}" data-native-tab="install">Instalar</button>
-          <button class="native-subtab ${nativeTab === "enroll" ? "active" : ""}" role="tab" aria-selected="${nativeTab === "enroll" ? "true" : "false"}" data-native-tab="enroll">Enrollment</button>
-          <button class="native-subtab ${nativeTab === "info" ? "active" : ""}" role="tab" aria-selected="${nativeTab === "info" ? "true" : "false"}" data-native-tab="info">Info</button>
-        </div>
+        ${renderNativeWorkerWizard(nativeTab)}
         <div class="native-worker-content">${nativeContent}</div>
       </div>`;
+    }
+
+    function bindNativeWorkerTabs(overlay, onSelect) {
+      overlay.querySelectorAll("[data-native-tab]").forEach(tab => {
+        tab.addEventListener("click", () => onSelect(tab.dataset.nativeTab));
+      });
     }
 
     async function renderAddWorkerCommands() {
@@ -1909,16 +1929,15 @@ docker compose up -d
         addWorkerState.activeTab = tab.dataset.tab;
         renderAddWorkerCommands();
       }));
-      overlay.querySelectorAll("[data-native-tab]").forEach(tab => tab.addEventListener("click", () => {
-        addWorkerState.nativeTab = tab.dataset.nativeTab;
-        renderAddWorkerCommands();
-      }));
-
       const tabContent = document.getElementById("tabContent");
       const code = composeYml;
       tabContent.innerHTML = addWorkerState.activeTab === "native"
         ? renderNativeWorkerTab(cpUrl)
         : `<div class="code-block"><button class="copy-btn" data-code-id="modalCode">Copiar</button><pre id="modalCode">${escapeHtml(code)}</pre></div>`;
+      bindNativeWorkerTabs(overlay, nativeTab => {
+        addWorkerState.nativeTab = nativeTab;
+        renderAddWorkerCommands();
+      });
       const nativePlatformSelect = document.getElementById("nativePlatformSelect");
       if (nativePlatformSelect) nativePlatformSelect.addEventListener("change", () => { addWorkerState.nativePlatform = nativePlatformSelect.value; renderAddWorkerCommands(); });
       const copyBtn = tabContent.querySelector(".copy-btn");

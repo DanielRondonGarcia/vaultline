@@ -2507,8 +2507,11 @@ class WorkerUiStateTests(unittest.TestCase):
         tab = re.search(r"function renderNativeWorkerTab\(.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(tab)
         tab_source = tab.group(0)
-        for marker in ('data-native-tab="install"', 'data-native-tab="enroll"', 'data-native-tab="info"', 'class="native-worker-info"'):
+        for marker in ('data-native-tab="install"', 'data-native-tab="enroll"', 'class="native-worker-info"'):
             self.assertIn(marker, tab_source)
+        wizard = re.search(r"function renderNativeWorkerWizard\(nativeTab\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(wizard)
+        self.assertIn('data-native-tab="info"', wizard.group(0))
         command_blocks = {}
         for name in ("windowsInstall", "linuxInstall", "windowsEnrollment", "linuxEnrollment"):
             match = re.search(rf"const {name}Commands = `(.*?)`;", tab_source, re.S)
@@ -2573,6 +2576,67 @@ class WorkerUiStateTests(unittest.TestCase):
         self.assertIn("worker.env es opcional", tab_source)
         self.assertIn("vaultline-worker.exe daemon", tab_source)
         self.assertIn("service install", tab_source)
+
+    def test_native_worker_install_and_enrollment_use_numbered_wizard_steps(self):
+        wizard = re.search(r"function renderNativeWorkerWizard\(nativeTab\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(wizard)
+        native_tab = re.search(r"function renderNativeWorkerTab\(.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(native_tab)
+        self.assertIn("renderNativeWorkerWizard(nativeTab)", native_tab.group(0))
+        self.assertIn('data-native-tab="info"', wizard.group(0))
+        self.assertIn('data-native-tab="enroll">Siguiente: Enrollment', native_tab.group(0))
+        self.assertIn('data-native-tab="install">Anterior: Instalar', native_tab.group(0))
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = wizard.group(0) + r'''
+const install = renderNativeWorkerWizard("install");
+const enroll = renderNativeWorkerWizard("enroll");
+const info = renderNativeWorkerWizard("info");
+const output = { install, enroll, info };
+process.stdout.write(JSON.stringify(output));
+'''
+        result = subprocess.run(["node", "--input-type=commonjs", "--eval", script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rendered = json.loads(result.stdout)
+        self.assertIn('aria-label="Paso 1: Instalar"', rendered["install"])
+        self.assertIn('aria-label="Paso 2: Enrollment"', rendered["install"])
+        self.assertEqual(rendered["install"].count('aria-current="step"'), 1)
+        self.assertEqual(rendered["enroll"].count('aria-current="step"'), 1)
+        self.assertIn('aria-current="step"', rendered["install"].split('data-native-tab="install"')[1].split(">", 1)[0])
+        self.assertIn('aria-current="step"', rendered["enroll"].split('data-native-tab="enroll"')[1].split(">", 1)[0])
+        self.assertIn('>1</span><span>Instalar</span>', rendered["install"])
+        self.assertIn('>2</span><span>Enrollment</span>', rendered["enroll"])
+        self.assertNotIn('aria-current="step"', rendered["info"])
+
+    def test_native_wizard_controls_switch_content_when_clicked(self):
+        binder = re.search(r"function bindNativeWorkerTabs\(overlay, onSelect\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(binder)
+        renderer = re.search(r"async function renderAddWorkerCommands\(\) \{.*?\n    \}\n\n    let targetModalState", self.source, re.S)
+        self.assertIsNotNone(renderer)
+        renderer_source = renderer.group(0)
+        self.assertLess(renderer_source.index("tabContent.innerHTML ="), renderer_source.index("bindNativeWorkerTabs(overlay,"))
+        self.assertIn("addWorkerState.nativeTab = nativeTab", renderer_source)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = binder.group(0) + r'''
+const buttons = ["install", "enroll", "info"].map(nativeTab => ({
+  dataset: { nativeTab },
+  listeners: {},
+  addEventListener(name, callback) { this.listeners[name] = callback; },
+}));
+const overlay = { querySelectorAll(selector) { if (selector !== "[data-native-tab]") throw new Error(`unexpected selector: ${selector}`); return buttons; } };
+let visibleContent = "install";
+const rendered = [];
+bindNativeWorkerTabs(overlay, nativeTab => { visibleContent = nativeTab; rendered.push(nativeTab); });
+for (const nativeTab of ["enroll", "install", "info"]) {
+  buttons.find(button => button.dataset.nativeTab === nativeTab).listeners.click();
+  if (visibleContent !== nativeTab) throw new Error(`clicking ${nativeTab} left ${visibleContent} visible`);
+}
+process.stdout.write(JSON.stringify(rendered));
+'''
+        result = subprocess.run(["node", "--input-type=commonjs", "--eval", script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), ["enroll", "install", "info"])
 
     def test_new_worker_host_is_derived_from_lowercase_name(self):
         helper = re.search(r"function syncNewWorkerIdentity\(.*?\n    \}", self.source, re.S)

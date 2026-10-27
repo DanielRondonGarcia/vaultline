@@ -9,8 +9,8 @@ Scope: Preserve source-mode and non-rclone behavior; release evidence is recorde
 ## Tasks
 - T1 | S1 | Parent inline: add regression coverage and explicitly configure the packaged rclone path for frozen rclone-backed Restic commands | status: done (4 focused tests pass) | commit: eff40e6
 - T2 | S1 | Parent + gentle-ai-verify: run focused and relevant suites; independently inspect shared Restic command behavior | status: done (213 suite tests pass; independent S1 verdict: met) | commit: eff40e6
-- T3 | S2 | Parent inline: reproduce the Windows path-with-spaces failure, add a failing regression, and quote the executable within the `rclone.program` value | status: done (214 passed, 1 skipped, 122 subtests; independent review unavailable and user accepted gap for follow-up release) | commit: pending
-- T4 | S2 | Parent inline: commit the correction, publish a stable patch release, and verify workflow/assets/checksums | status: in progress; user authorized follow-up release despite the documented review gap | commit: pending
+- T3 | S2 | Parent inline: reproduce the Windows path-with-spaces failure, add a failing regression, and quote the executable within the `rclone.program` value | status: done (214 passed, 1 skipped, 122 subtests; independent review unavailable and user accepted gap for follow-up release) | commit: `aa487d8`
+- T4 | S2 | Parent inline: publish a stable patch release and verify workflow/assets/checksums | status: in progress; source/test slice `aa487d8`; release workflow pending
 - T5 | S2 | User: install the follow-up MSI on Server 2022 and report whether backup succeeds | status: blocked pending user runtime result | commit: N/A
 
 ## Log
@@ -33,4 +33,5 @@ Scope: Preserve source-mode and non-rclone behavior; release evidence is recorde
 - L17: `gentle_review assess` rated the shared-helper change high risk (item 3), set `reviewDue: true`, and requested an independent verifier. The verifier previously timed out because its tool had no API key and was not retried. Native review status reported `applicability: unrelated`, `rdd_disabled`, and no candidate; no independent review was completed for this follow-up.
 - L18: At this point, the fix remained local and uncommitted; no follow-up package or release had been built or published.
 - L19: User selected “Autorizar un release de seguimiento”, accepting publication based on the passing local tests despite the unavailable independent verifier.
-- L20: Delivery boundary: one follow-up work-unit commit will contain only the Restic path-quoting helper, its regression, and this task evidence; unrelated dirty paths remain excluded.
+- L20: Delivery boundary: the follow-up source/test slice and task evidence were committed as `aa487d8`; only the Restic helper, its regression, and this task record were included. Unrelated dirty paths remain excluded.
+- L21: Release follow-up: push the authorized feature branch and dispatch a stable patch workflow; release tag and asset evidence remain pending.

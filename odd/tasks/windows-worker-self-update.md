@@ -1,5 +1,5 @@
 # On-demand Windows Worker Self-update
-Outcome: Add an explicit `vaultline-worker update` command that fetches the latest stable Windows MSI from GitHub Releases, verifies its SHA256SUMS entry, and invokes the MSI upgrade.
+Outcome: Add an explicit `vaultline-worker update` command that fetches the latest stable Windows MSI from GitHub Releases, verifies its SHA256SUMS entry, and invokes the MSI upgrade; publish stable release 3.15.16 for testing.
 Scope: Windows MSI path for the current Server 2022 test; no background updater and no Linux package-manager changes.
 
 ## Specs
@@ -10,7 +10,8 @@ Scope: Windows MSI path for the current Server 2022 test; no background updater 
 ## Tasks
 - T1 [done] | S1-S2 | Parent inline: add `vaultline-worker update` for the latest stable Windows MSI, with strict release asset selection and SHA256SUMS verification | commit: `2db8e41`
 - T2 [done] | S1-S2 | Parent inline: hand off MSI execution safely, preserve the existing per-machine MajorUpgrade/service lifecycle, and update CLI help/docs/tests | commit: `2db8e41`; focused suite 82 passed, 21 subtests; full-suite runtime mismatch is recorded in L9 and user accepted release with that gap
-- T3 [in progress] | S1-S3 | Parent inline: create the requested release after available focused checks; do not retry unavailable independent verifier | commit: pending; user explicitly accepted publication with known proof gaps
+- T3 [done] | S1-S3 | Parent inline: dispatch stable release and confirm workflow/assets; no verifier retry | commit: release tag `3.15.16` (peels to `ab0ec327`; workflow `40600335772`)
+- T4 [blocked] | S1-S3 | User: install the first MSI manually on Server 2022 and report the Restic/rclone result; actual self-update installation requires a later release | commit: N/A; waiting for user runtime evidence
 
 ## Log
 - L1: no, si ya terminaste, genera un release para probar. Pero antes, si me leiste lo que te dije antes? agregar funcionalidad al cli de vaultline de auto update
@@ -24,3 +25,9 @@ Scope: Windows MSI path for the current Server 2022 test; no background updater 
 - L9: Focused command: `python -m pytest tests/test_worker_cli.py tests/test_worker_update.py tests/test_worker_packaging.py tests/test_release_asset_workflow.py -q` — 82 passed, 21 subtests. Full suite: 1105 passed, 6 skipped, 2 failed, 373 subtests; the failures are runtime-pin tests because this host runs CPython 3.14.5 while `.python-version` requires 3.11.17.
 - L10: The independent `gentle-ai-verify` task timed out after 30 minutes because its tool reported no API key; per policy it was not retried. Pre-commit `gentle_review assess` was unassessable because the feature files were untracked then. No release or push occurred at that point.
 - L11: User authorization: “na, autorizo publicarlo, yo lo pruebo de una”. Proceed with release publication despite the documented local full-suite runtime mismatch and unavailable independent verifier; user will test the installed build.
+- L12: Pushed `feat/jobs-target-worker-search` to `origin` at `ab0ec32` so GitHub Actions can build from the requested feature branch. No PR or merge was created; release workflow dispatch and asset confirmation remain.
+- L13: Dispatched stable patch release workflow run `40600335772` from branch `feat/jobs-target-worker-search` at `ab0ec32`; latest stable was `3.15.15`, and no `3.15.16` tag existed at preflight.
+- L14: Run `40600335772` completed successfully on `feat/jobs-target-worker-search`, commit `ab0ec327bba267e9f151d63391f829f2a2ad834e`. Stable release `3.15.16` was published 2026-10-27; the tag peels to `ab0ec32`. The five assets are amd64 `.deb`, arm64 `.deb`, Windows x64 `.exe`, Windows x64 `.msi`, and `SHA256SUMS`. The downloaded checksum manifest entries match GitHub API asset digests for all four binaries. No PR or merge was created.
+- L15: The user will test on Server 2022. The first MSI containing `vaultline-worker update` must still be installed manually because earlier binaries lack the command; since `3.15.16` is latest, an actual self-update installation path needs a later release. No live Server 2022 installation or Restic run was performed by the agent.
+- L16: Release completed with non-blocking runner annotations for Node.js 20 deprecation and the upcoming `ubuntu-latest` migration; no workflow job failed.
+- L17: Closing delivery boundary: source/tests/docs remain in code commit `2db8e41`; stable release tag `3.15.16` targets `ab0ec32`. The next local work-unit commit contains only the two ODD task-record updates; no additional source changes or push are part of that slice.

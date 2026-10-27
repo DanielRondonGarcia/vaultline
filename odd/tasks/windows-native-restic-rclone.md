@@ -1,6 +1,6 @@
 # Windows Native Restic/rclone Failure
 Outcome: Frozen Windows worker Restic commands use an explicit absolute path to the packaged rclone for rclone-backed repositories.
-Scope: Preserve source-mode and non-rclone behavior; do not publish artifacts.
+Scope: Preserve source-mode and non-rclone behavior; release evidence is recorded here and in `windows-worker-self-update.md`.
 
 ## Specs
 1. S1: “y tengo este bug, acabé de instalarlo en un Microsoft Windows Server 2022 Standard 10.0.20348 20348 - C:\Users\DANIEL~1.RON\AppData\Local\Temp\orca-paste-1793137812864-5ce8435b-4088-4ad1-9e1e-7c00fe077876.png y vea, falla” — address the Restic initialization failure shown in the screenshot, where Restic rejects the implicit relative `rclone.exe` executable and directs callers to set `-o rclone.program`.
@@ -18,3 +18,5 @@ Scope: Preserve source-mode and non-rclone behavior; do not publish artifacts.
 - L6: Relevant suites: `python -m pytest tests/test_backup_observability.py tests/test_native_restore.py tests/test_native_tool_executable.py tests/test_worker_packaging.py tests/test_snapshot_browser.py tests/test_control_plane_dispatch.py -q` → 213 passed, 1 skipped (the Windows-inapplicable POSIX executable-bit check), 122 subtests passed; 1,412 pre-existing datetime deprecation warnings. `git diff --check` emitted no whitespace errors.
 - L7: `gentle_review assess` could not create a candidate because the new feature task file is untracked and needs an explicit intended-untracked selection; the report has `rddLine: off`. No native review was started.
 - L8: Independent verifier returned S1 met with no blockers: all Restic call paths, option order, fail-closed path resolution, policy-before-injection, and source/non-rclone behavior checked. Its additional scratch boundary probe passed 12/12; the verifier made no repository changes.
+- L9: User authorization: “na, autorizo publicarlo, yo lo pruebo de una”. The Restic fix is included in stable release 3.15.16 together with the on-demand Windows updater; detailed release evidence is in `windows-worker-self-update.md`.
+- L10: No live Server 2022 install or Restic run was performed by the agent. The user will install the first MSI containing the updater manually and report the Restic/rclone result.

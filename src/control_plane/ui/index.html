@@ -1452,6 +1452,22 @@
       });
     }
 
+    function findConnectedEnrollmentWorker(workers, workerId, previousLastSeenAt = null) {
+      const expectedId = String(workerId || "").trim();
+      if (!expectedId || !Array.isArray(workers)) return null;
+      const worker = workers.find(item => String(item.id) === expectedId && item.status === "online");
+      if (!worker) return null;
+      const previousSeen = previousLastSeenAt ? Date.parse(previousLastSeenAt) : NaN;
+      const currentSeen = Date.parse(worker.last_seen_at || "");
+      if (Number.isFinite(previousSeen) && (!Number.isFinite(currentSeen) || currentSeen <= previousSeen)) return null;
+      return worker;
+    }
+
+    function renderEnrollmentSuccess(worker) {
+      const name = escapeHtml(worker?.name || "Worker");
+      return `<div class="enrollment-success" role="status"><div class="enrollment-success-icon" aria-hidden="true">✓</div><h4>Conexión exitosa</h4><p><strong>${name}</strong> está conectado y aparece online en el Control Plane.</p><p>Ya puedes cerrar esta ventana y continuar con la configuración.</p></div>`;
+    }
+
     function workerFingerprint(worker) {
       const labels = Object.keys(worker.labels || {})
         .sort((a, b) => a.localeCompare(b, "es"))
@@ -1498,6 +1514,17 @@
           const newWorkers = resp.items || [];
           const hasChanged = JSON.stringify(newWorkers.map(workerFingerprint)) !== JSON.stringify((state.workers || []).map(workerFingerprint));
           state.workers = newWorkers;
+          const enrollment = addWorkerState.enrollment;
+          const previousLastSeenAt = addWorkerState.mode === "renew" ? addWorkerState.worker?.last_seen_at : null;
+          const connectedWorker = addWorkerState.step === "commands" && enrollment && !addWorkerState.connectionSucceeded
+            ? findConnectedEnrollmentWorker(newWorkers, enrollment.worker_id, previousLastSeenAt)
+            : null;
+          if (connectedWorker) {
+            addWorkerState.connectionSucceeded = true;
+            addWorkerState.connectionWorker = connectedWorker;
+            const overlay = document.getElementById("modalOverlay");
+            if (overlay?.classList.contains("open")) void renderAddWorkerCommands();
+          }
           if (hasChanged) {
             const content = document.getElementById("content");
             if (content && state.currentView === "workers") {
@@ -1569,10 +1596,10 @@
       }
     }
 
-    let addWorkerState = { mode: "add", worker: null, step: "form", enrollment: null, activeTab: "compose", nativePlatform: "linux-amd64" };
+    let addWorkerState = { mode: "add", worker: null, step: "form", enrollment: null, connectionSucceeded: false, connectionWorker: null, activeTab: "compose", nativeTab: "install", nativePlatform: "linux-amd64" };
 
     async function openAddWorkerModal() {
-      addWorkerState = { mode: "add", worker: null, step: "form", enrollment: null, activeTab: "compose", nativePlatform: "linux-amd64" };
+      addWorkerState = { mode: "add", worker: null, step: "form", enrollment: null, connectionSucceeded: false, connectionWorker: null, activeTab: "compose", nativeTab: "install", nativePlatform: "linux-amd64" };
       renderAddWorkerModal();
       const overlay = document.getElementById("modalOverlay");
       if (overlay) overlay.classList.add("open");
@@ -1586,7 +1613,7 @@
         if (content && state.currentView === "workers") renderWorkers(content);
         return;
       }
-      addWorkerState = { mode: "renew", worker, step: "form", enrollment: null, activeTab: "compose", nativePlatform: "linux-amd64" };
+      addWorkerState = { mode: "renew", worker, step: "form", enrollment: null, connectionSucceeded: false, connectionWorker: null, activeTab: "compose", nativeTab: "install", nativePlatform: "linux-amd64" };
       renderAddWorkerModal();
       const overlay = document.getElementById("modalOverlay");
       if (overlay) overlay.classList.add("open");
@@ -1595,6 +1622,13 @@
     function closeAddWorkerModal() {
       const overlay = document.getElementById("modalOverlay");
       if (overlay) overlay.classList.remove("open");
+    }
+
+    function syncNewWorkerIdentity(nameInput, hostInput) {
+      if (!nameInput || !hostInput) return;
+      const normalizedName = String(nameInput.value || "").toLowerCase();
+      nameInput.value = normalizedName;
+      hostInput.value = normalizedName;
     }
 
     async function renderAddWorkerModal() {
@@ -1621,7 +1655,7 @@
                    <div class="helper">El secreto se genera en el navegador y se entrega al worker una sola vez: en los comandos del worker nativo o como WORKER_ENROLLMENT_TOKEN en Compose. Expira según el TTL y se invalida al usarse.</div>
                    <div class="field-row">
                      <div class="field"><label for="awName">Nombre del worker</label><input id="awName" name="worker_name" autocomplete="off" placeholder="worker-prod-01" value="worker" /></div>
-                     <div class="field"><label for="awHost">Host</label><input id="awHost" name="worker_host" autocomplete="off" placeholder="srv-prod-01" value="unknown-host" /></div>
+                     <div class="field"><label for="awHost">Host</label><input id="awHost" name="worker_host" autocomplete="off" readonly value="worker" /></div>
                    </div>`}
               <div class="field-row">
                 <div class="field"><label for="awTtl">TTL (minutos)</label><input id="awTtl" name="enrollment_ttl" type="number" min="1" value="60" /></div>
@@ -1637,6 +1671,12 @@
         document.getElementById("modalClose").addEventListener("click", closeAddWorkerModal);
         document.getElementById("awCancel").addEventListener("click", closeAddWorkerModal);
         overlay.addEventListener("click", (e) => { if (e.target === overlay) closeAddWorkerModal(); });
+        if (!isRenewal) {
+          const nameInput = document.getElementById("awName");
+          const hostInput = document.getElementById("awHost");
+          nameInput.addEventListener("input", () => syncNewWorkerIdentity(nameInput, hostInput));
+          syncNewWorkerIdentity(nameInput, hostInput);
+        }
         document.getElementById("awGenerate").addEventListener("click", generateEnrollment);
       } else if (addWorkerState.step === "commands") {
         renderAddWorkerCommands();
@@ -1650,8 +1690,11 @@
       errorBox.textContent = "";
       const isRenewal = addWorkerState.mode === "renew";
       const workerId = isRenewal ? addWorkerState.worker?.id : null;
-      const name = document.getElementById("awName").value.trim() || "worker";
-      const host_name = document.getElementById("awHost").value.trim() || "unknown-host";
+      const nameInput = document.getElementById("awName");
+      const hostInput = document.getElementById("awHost");
+      if (!isRenewal) syncNewWorkerIdentity(nameInput, hostInput);
+      const name = isRenewal ? nameInput.value.trim() : (nameInput.value.trim() || "worker").toLowerCase();
+      const host_name = isRenewal ? hostInput.value.trim() : name;
       const ttl_minutes = parseInt(document.getElementById("awTtl").value) || 60;
       const genBtn = document.getElementById("awGenerate");
       await withBtnLoading(genBtn, async () => {
@@ -1662,6 +1705,8 @@
         const payload = isRenewal ? { ttl_minutes, secret } : { name, host_name, ttl_minutes, secret };
         const enrollment = await apiPost(endpoint, payload);
         addWorkerState.enrollment = { ...enrollment, worker_id: enrollment.worker_id || workerId, name, host_name, secret, ttl_minutes };
+        addWorkerState.connectionSucceeded = false;
+        addWorkerState.connectionWorker = null;
         addWorkerState.step = "commands";
         renderAddWorkerModal();
       }, "Generando...").catch((error) => {
@@ -1718,39 +1763,47 @@
       const enrollment = addWorkerState.enrollment;
       const secret = (enrollment && enrollment.secret) || NATIVE_WORKER_TOKEN_PLACEHOLDER;
       const ttlMinutes = (enrollment && enrollment.ttl_minutes) || null;
-      const linuxCommands = `curl -fsSL -o ${packageName} ${assetUrl}
-sudo dpkg -i ${packageName}
-sudo vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}
+      const linuxInstallCommands = `curl -fsSL -o ${packageName} ${assetUrl}
+sudo dpkg -i ${packageName}`;
+      const linuxEnrollmentCommands = `sudo vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}
 sudo systemctl status docker-volume-backup-worker.service --no-pager`;
       // msiexec returns immediately in PowerShell; Start-Process -Wait keeps the
       // pasted block sequential. The MSI appends C:\Program Files\Vaultline to
       // the machine PATH, which the current session does not see until reloaded.
       // Defender's Behavior:Win32/SuspRclone.A detection terminates the unsigned
       // rclone mid-backup; the exclusion is scoped to the single installed file.
-      const windowsCommands = `$msi = "$env:TEMP\\${packageName}"
+      const windowsInstallCommands = `$msi = "$env:TEMP\\${packageName}"
 Invoke-WebRequest -Uri ${assetUrl} -OutFile $msi
 Start-Process msiexec.exe -ArgumentList ('/i "{0}" /qn /norestart' -f $msi) -Wait
 $env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [Environment]::GetEnvironmentVariable("Path", "User")
-Add-MpPreference -ExclusionPath "C:\\Program Files\\Vaultline\\rclone.exe"
-vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}
+Add-MpPreference -ExclusionPath "C:\\Program Files\\Vaultline\\rclone.exe"`;
+      const windowsEnrollmentCommands = `vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}
 vaultline-worker service status`;
-      const commands = info.os === "windows" ? windowsCommands : linuxCommands;
+      const nativeTab = addWorkerState.nativeTab || "install";
+      const installCommands = info.os === "windows" ? windowsInstallCommands : linuxInstallCommands;
+      const enrollmentCommands = info.os === "windows" ? windowsEnrollmentCommands : linuxEnrollmentCommands;
       const platformNote = info.os === "windows"
         ? "Windows x64: ejecuta el bloque en una PowerShell elevada (Run as administrator). Instala el servicio SCM VaultlineWorker desde el MSI (LocalSystem, inicio automatico). Estado y credenciales en C:\\ProgramData\\Vaultline\\worker; logs en C:\\ProgramData\\Vaultline\\worker\\logs\\worker.log. El MSI y el ejecutable no estan firmados: puede aparecer SmartScreen. El bloque agrega una exclusion de Microsoft Defender acotada a un unico archivo instalado, C:\\Program Files\\Vaultline\\rclone.exe: la deteccion de comportamiento Behavior:Win32/SuspRclone.A (eventos 1116/1117) termina rclone a mitad del backup y el job falla con 'rclone stdio connection already closed'. El ejecutable portable queda solo para diagnostico (vaultline-worker.exe daemon) o para registrar el servicio a mano (service install)."
         : "Linux requiere glibc >= 2.17. El .deb crea el usuario dvb-worker, /var/lib/docker-volume-backup y docker-volume-backup-worker.service; sigue los logs con journalctl -u docker-volume-backup-worker.service -f. /etc/docker-volume-backup/worker.env es opcional: solo para overrides como WORKER_NAME o WORKER_POLL_INTERVAL_SECONDS (el entorno siempre gana sobre worker.json).";
       const tokenNotice = enrollment && enrollment.secret
-        ? `<div class="alert info" role="status"><strong>Token de un solo uso en el comando.</strong> El comando <code>enroll</code> ya incluye el bootstrap token: expira ${ttlMinutes ? `en ${escapeHtml(String(ttlMinutes))} minutos` : "al cumplirse el TTL configurado"} (${escapeHtml(fmtDate(enrollment.expires_at))}) y se invalida al usarse. Si el enrolamiento falla después de ese plazo, vuelve a <strong>Generar credencial</strong> y copia los comandos de nuevo. Si lo prefieres, limpia el historial de la terminal después de enrolar.</div>`
-        : `<div class="alert warning" role="alert"><strong>Falta el bootstrap token.</strong> Los comandos muestran <code>${escapeHtml(NATIVE_WORKER_TOKEN_PLACEHOLDER)}</code> porque aún no hay una credencial generada. Pulsa <strong>Volver</strong> y luego <strong>Generar credencial</strong> para obtener comandos listos para pegar.</div>`;
+        ? `<div class="alert info" role="status">Token de un solo uso; vence ${ttlMinutes ? `en ${escapeHtml(String(ttlMinutes))} min` : "al cumplirse el TTL configurado"} (${escapeHtml(fmtDate(enrollment.expires_at))}).</div>`
+        : `<div class="alert warning" role="alert">Falta la credencial. Pulsa <strong>Volver</strong> y luego <strong>Generar credencial</strong>.</div>`;
       const assetNotice = asset
         ? ""
         : `<div class="alert warning" role="alert"><strong>Sin URL de descarga.</strong> Los comandos muestran <code>${escapeHtml(NATIVE_WORKER_ASSET_URL_PLACEHOLDER)}</code>: reemplázalo por la URL del asset <code>${escapeHtml(packageName)}</code> desde la pagina de release.</div>`;
+      const commandPanel = (label, commands) => `<div class="code-block"><div class="code-block-heading">${label}</div><button class="copy-btn" data-code-id="modalCode">Copiar comandos</button><pre id="modalCode">${escapeHtml(commands)}</pre></div>`;
+      const nativeContent = nativeTab === "install"
+        ? `<div class="field"><label for="nativePlatformSelect">Plataforma</label><select id="nativePlatformSelect" aria-describedby="nativePlatformHint">${Object.entries(NATIVE_WORKER_PLATFORMS).map(([key, value]) => `<option value="${escapeHtml(key)}" ${key === platform ? "selected" : ""}>${escapeHtml(value.label)}</option>`).join("")}</select><div class="hint" id="nativePlatformHint">Elige la plataforma del host donde instalarás el worker.</div></div><a class="btn secondary sm native-download" href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener">${downloadLabel}</a>${assetNotice}<p class="helper">Instala el paquete; el servicio quedará listo para enrollment.</p>${commandPanel("Instalación", installCommands)}`
+        : nativeTab === "enroll"
+          ? `${tokenNotice}<p class="helper">Ejecuta este paso después de instalar el worker.</p>${commandPanel("Enrollment", enrollmentCommands)}`
+          : `<div class="native-worker-info"><h4>Información</h4><div class="card compact"><div class="eyebrow">Descarga y versión</div>${renderAssetMetadata(asset, checksums, secondaryAsset, info.secondaryLabel)}</div><p>${escapeHtml(platformNote)}</p><p>El servicio arranca y espera el enrolamiento. Al actualizar, instala el paquete nuevo sobre el existente: se conservan el estado y las credenciales sin reiniciar ni volver a enrolar. Los ejecutables de Restic y rclone se incluyen con el worker nativo; mantén <code>rclone.conf</code> y las credenciales del repositorio en secretos separados. Instala por separado las demás herramientas externas (tar, gpg, aws, ssh y scp) cuando las necesites.</p>${tokenNotice}`;
       return `<div class="native-worker-panel" data-native-worker-platform="${escapeHtml(platform)}">
-        <div class="field"><label for="nativePlatformSelect">Plataforma del worker remoto</label><select id="nativePlatformSelect" aria-describedby="nativePlatformHint">${Object.entries(NATIVE_WORKER_PLATFORMS).map(([key, value]) => `<option value="${escapeHtml(key)}" ${key === platform ? "selected" : ""}>${escapeHtml(value.label)}</option>`).join("")}</select><div class="hint" id="nativePlatformHint">Selecciona explicitamente la plataforma del host remoto. No se infiere desde el navegador.</div></div>
-        <div class="card compact"><div class="eyebrow">Asset nativo</div>${renderAssetMetadata(asset, checksums, secondaryAsset, info.secondaryLabel)}<a class="btn secondary sm" href="${escapeHtml(downloadUrl)}" target="_blank" rel="noopener">${downloadLabel}</a></div>
-        ${tokenNotice}
-        ${assetNotice}
-        <p class="helper">Pega el bloque completo como administrador o root: descarga el paquete, lo instala (el servicio arranca y espera el enrolamiento), enrola una vez con el token y muestra el estado; el servicio toma la credencial sin reiniciar. Al actualizar, instala el paquete nuevo sobre el existente: se conservan el estado y las credenciales, sin necesidad de volver a enrolar. ${escapeHtml(platformNote)} Los ejecutables de Restic y rclone se incluyen con el worker nativo. Mantén <code>rclone.conf</code> y las credenciales del repositorio en secretos separados; no se incluyen en el paquete. Instala por separado las demás herramientas externas (tar, gpg, aws, ssh y scp) según lo requiera el destino.</p>
-        <div class="code-block"><button class="copy-btn" data-code-id="modalCode">Copiar comandos</button><pre id="modalCode">${escapeHtml(commands)}</pre></div>
+        <div class="tabs native-worker-tabs" role="tablist" aria-label="Pasos del worker nativo">
+          <button class="native-subtab ${nativeTab === "install" ? "active" : ""}" role="tab" aria-selected="${nativeTab === "install" ? "true" : "false"}" data-native-tab="install">Instalar</button>
+          <button class="native-subtab ${nativeTab === "enroll" ? "active" : ""}" role="tab" aria-selected="${nativeTab === "enroll" ? "true" : "false"}" data-native-tab="enroll">Enrollment</button>
+          <button class="native-subtab ${nativeTab === "info" ? "active" : ""}" role="tab" aria-selected="${nativeTab === "info" ? "true" : "false"}" data-native-tab="info">Info</button>
+        </div>
+        <div class="native-worker-content">${nativeContent}</div>
       </div>`;
     }
 
@@ -1813,41 +1866,51 @@ docker compose up -d
       overlay.innerHTML = `
           <div class="modal" role="dialog" aria-modal="true" aria-labelledby="workerEnrollmentCommandsTitle">
             <div class="modal-header">
-             <h3 id="workerEnrollmentCommandsTitle">${isRenewal ? `Renovacion de enrollment: ${escapeHtml(wName)}` : "Comandos para desplegar el worker"}</h3>
+             <h3 id="workerEnrollmentCommandsTitle">${addWorkerState.connectionSucceeded ? "Conexión exitosa" : (isRenewal ? `Renovacion de enrollment: ${escapeHtml(wName)}` : "Comandos para desplegar el worker")}</h3>
              <button class="close" id="modalClose" aria-label="Cerrar">&times;</button>
             </div>
             <div class="modal-body">
+              ${addWorkerState.connectionSucceeded
+                ? renderEnrollmentSuccess(addWorkerState.connectionWorker)
+                : `
               ${isRenewal ? `<div class="alert info" role="status">El nuevo Compose conserva el mismo <code>worker_id</code> y no crea un registro duplicado. La credencial anterior se reemplazara cuando este token se consuma correctamente.</div>` : ""}
-             <div class="card compact"><div class="eyebrow">${isRenewal ? "Enrollment renovado" : "Credencial HMAC lista"}</div><div class="value" style="font-size:13px;font-family:var(--font-mono);word-break:break-all">Worker ID: ${escapeHtml(workerId)}</div><div class="meta">Nombre: ${escapeHtml(wName)}. Host: ${escapeHtml(wHost)}. Expira: ${escapeHtml(fmtDate(e.expires_at))}. El secreto es de un solo uso: la pestaña Worker nativo lo incluye en el comando <code>enroll</code>; en Compose va en <code>WORKER_ENROLLMENT_TOKEN</code>.</div><button class="btn ghost sm" id="copyEnrollmentSecret">Copiar secreto</button><div class="support">Si lo guardas en un gestor de secretos, elimina WORKER_ENROLLMENT_TOKEN después del primer arranque y conserva el archivo 0600.</div></div>
+             <div class="card compact"><div class="eyebrow">${isRenewal ? "Enrollment renovado" : "Credencial HMAC lista"}</div><div class="value" style="font-size:13px;font-family:var(--font-mono);word-break:break-all">Worker ID: ${escapeHtml(workerId)}</div><div class="meta">Nombre: ${escapeHtml(wName)}. Host: ${escapeHtml(wHost)}. Expira: ${escapeHtml(fmtDate(e.expires_at))}. El secreto es de un solo uso: la pestaña Worker nativo lo incluye en el comando <code>enroll</code>; en Compose va en <code>WORKER_ENROLLMENT_TOKEN</code>.</div><button class="btn secondary sm copy-secret-btn" id="copyEnrollmentSecret">Copiar secreto</button><div class="support">Si lo guardas en un gestor de secretos, elimina WORKER_ENROLLMENT_TOKEN después del primer arranque y conserva el archivo 0600.</div></div>
             <div class="card compact">
               <div class="eyebrow">URL del Control Plane en los comandos</div>
               <div class="value" style="font-size:13px;font-family:var(--font-mono);word-break:break-all">${escapeHtml(cpUrl)}</div>
               <div class="support">Si esta URL no es correcta (proxy, puerto distinto, dominio), configura <code>CONTROL_PLANE_PUBLIC_URL</code> en Settings.</div>
             </div>
-            <div class="tabs" role="tablist" aria-label="Opciones de despliegue del worker">
+            <div class="tabs deployment-tabs" role="tablist" aria-label="Opciones de despliegue del worker">
               <button role="tab" aria-selected="${addWorkerState.activeTab === "compose" ? "true" : "false"}" class="tab ${addWorkerState.activeTab === "compose" ? "active" : ""}" data-tab="compose">docker-compose.yml</button>
               <button role="tab" aria-selected="${addWorkerState.activeTab === "native" ? "true" : "false"}" class="tab ${addWorkerState.activeTab === "native" ? "active" : ""}" data-tab="native">Worker nativo</button>
             </div>
             <div id="tabContent"></div>
+              `}
+            </div>
             <div class="btn-row">
               <button class="btn primary sm" id="awDone">Listo</button>
-              <button class="btn ghost sm" id="awBack">Volver</button>
+              ${addWorkerState.connectionSucceeded ? "" : `<button class="btn ghost sm" id="awBack">Volver</button>`}
             </div>
-            <div class="helper">El secreto de enrolamiento se usa una sola vez. Si necesitas re-enrolar, genera una credencial nueva.</div>
+            ${addWorkerState.connectionSucceeded ? "" : `<div class="helper">El secreto de enrolamiento se usa una sola vez. Si necesitas re-enrolar, genera una credencial nueva.</div>`}
           </div>
         </div>
       `;
       document.getElementById("modalClose").addEventListener("click", closeAddWorkerModal);
       document.getElementById("awDone").addEventListener("click", async () => { closeAddWorkerModal(); await refreshAll(); });
-      document.getElementById("awBack").addEventListener("click", () => { addWorkerState.step = "form"; renderAddWorkerModal(); });
+      const backButton = document.getElementById("awBack");
+      if (backButton) backButton.addEventListener("click", () => { addWorkerState.step = "form"; renderAddWorkerModal(); });
       overlay.addEventListener("click", (e2) => { if (e2.target === overlay) closeAddWorkerModal(); });
 
       const copySecretBtn = document.getElementById("copyEnrollmentSecret");
       if (copySecretBtn) copySecretBtn.addEventListener("click", () => navigator.clipboard?.writeText(e.secret).then(() => copySecretBtn.textContent = "Secreto copiado").catch(() => {}));
 
-      const tabs = overlay.querySelectorAll(".tab");
+      const tabs = overlay.querySelectorAll(".deployment-tabs .tab");
       tabs.forEach(tab => tab.addEventListener("click", () => {
         addWorkerState.activeTab = tab.dataset.tab;
+        renderAddWorkerCommands();
+      }));
+      overlay.querySelectorAll("[data-native-tab]").forEach(tab => tab.addEventListener("click", () => {
+        addWorkerState.nativeTab = tab.dataset.nativeTab;
         renderAddWorkerCommands();
       }));
 

@@ -398,6 +398,27 @@ details.form-section[open] > .form-body { border-top: 1px solid var(--border); p
 .tab:focus-visible { outline: 0; box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--ring); }
 .tab.active, .tab[aria-selected="true"] { background: var(--secondary); color: var(--secondary-foreground); border-color: var(--border); }
 .native-worker-panel { display: flex; flex-direction: column; gap: 12px; }
+.native-worker-tabs { margin-bottom: 2px; }
+.native-subtab {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--background);
+  color: var(--muted-foreground);
+  font: 600 12px/1 var(--font-sans);
+  cursor: pointer;
+}
+.native-subtab:hover, .native-subtab.active, .native-subtab[aria-selected="true"] { background: var(--secondary); color: var(--secondary-foreground); }
+.native-subtab:focus-visible { outline: 0; box-shadow: 0 0 0 2px var(--background), 0 0 0 4px var(--ring); }
+.native-worker-content { display: flex; flex-direction: column; gap: 12px; }
+.native-worker-info { display: flex; flex-direction: column; gap: 10px; color: var(--muted-foreground); font-size: 12px; line-height: 1.5; }
+.native-worker-info h4, .native-worker-info p { margin: 0; }
+.native-download { align-self: flex-start; }
+.copy-secret-btn { min-height: 32px; }
+.enrollment-success { margin: auto; padding: 28px 20px; text-align: center; }
+.enrollment-success-icon { display: grid; width: 44px; height: 44px; margin: 0 auto 12px; place-items: center; border-radius: 50%; background: color-mix(in srgb, var(--success) 16%, var(--background)); color: var(--success); font-size: 24px; font-weight: 700; }
+.enrollment-success h4 { margin: 0 0 8px; color: var(--foreground); font-size: 18px; }
+.enrollment-success p { margin: 6px 0 0; color: var(--muted-foreground); }
 .native-asset-meta { display: grid; gap: 8px; margin: 0 0 10px; }
 .native-asset-meta div { display: grid; grid-template-columns: 88px minmax(0, 1fr); gap: 8px; align-items: baseline; }
 .native-asset-meta dt { color: var(--muted-foreground); font-size: 11px; font-weight: 700; text-transform: uppercase; }

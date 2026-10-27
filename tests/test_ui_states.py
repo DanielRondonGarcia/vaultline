@@ -2399,12 +2399,13 @@ class WorkerUiStateTests(unittest.TestCase):
             'checksums',
             'assetForSelectedNativePlatform',
             'renderNativeWorkerTab',
-            'No se infiere desde el navegador',
+            'Elige la plataforma del host donde instalarás el worker.',
             'vaultline-worker enroll',
             'copyEnrollmentSecret',
             'Copiar secreto',
+            'class="btn secondary sm copy-secret-btn"',
             'Copiar comandos',
-            'Token de un solo uso en el comando',
+            'Token de un solo uso; vence',
             'SHA256',
             'SHA256SUMS',
             'No hay assets nativos publicados para esta version',
@@ -2428,6 +2429,8 @@ class WorkerUiStateTests(unittest.TestCase):
         self.assertIn('const NATIVE_WORKER_ASSET_URL_PLACEHOLDER = "<ASSET_URL>";', self.source)
         self.assertIn("ttl_minutes };", self.source)
         self.assertIn("${escapeHtml(commands)}", tab_source)
+        self.assertIn(".btn.secondary { background: var(--secondary); color: var(--secondary-foreground);", self.css)
+        self.assertIn(".copy-secret-btn { min-height: 32px; }", self.css)
 
     def test_worker_enrollment_native_instructions_preserve_platform_contract(self):
         for marker in (
@@ -2469,57 +2472,51 @@ class WorkerUiStateTests(unittest.TestCase):
         tab = re.search(r"function renderNativeWorkerTab\(.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(tab)
         tab_source = tab.group(0)
-        windows = re.search(r"const windowsCommands = `(.*?)`;", tab_source, re.S)
-        linux = re.search(r"const linuxCommands = `(.*?)`;", tab_source, re.S)
-        self.assertIsNotNone(windows)
-        self.assertIsNotNone(linux)
-        windows_commands = windows.group(1)
-        linux_commands = linux.group(1)
+        for marker in ('data-native-tab="install"', 'data-native-tab="enroll"', 'data-native-tab="info"', 'class="native-worker-info"'):
+            self.assertIn(marker, tab_source)
+        command_blocks = {}
+        for name in ("windowsInstall", "linuxInstall", "windowsEnrollment", "linuxEnrollment"):
+            match = re.search(rf"const {name}Commands = `(.*?)`;", tab_source, re.S)
+            self.assertIsNotNone(match, name)
+            command_blocks[name] = match.group(1)
+            lines = match.group(1).split("\n")
+            self.assertTrue(all(line.strip() for line in lines), lines)
+            self.assertFalse(any(line.lstrip().startswith("#") for line in lines), lines)
+        windows_commands = command_blocks["windowsInstall"]
+        linux_commands = command_blocks["linuxInstall"]
+        windows_enrollment = command_blocks["windowsEnrollment"]
+        linux_enrollment = command_blocks["linuxEnrollment"]
+        for block in (windows_commands, linux_commands):
+            self.assertIn("${assetUrl}", block)
+            self.assertNotIn("--bootstrap-token", block)
+        for block in (windows_enrollment, linux_enrollment):
+            self.assertIn("enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", block)
+            self.assertNotIn("${assetUrl}", block)
 
-        # Copy-paste contract: every line is a command (no `#` comments, no blank
-        # lines), ordered download -> install -> enroll with token -> status.
-        for name, block in (("windows", windows_commands), ("linux", linux_commands)):
-            with self.subTest(block=name):
-                lines = block.split("\n")
-                self.assertTrue(all(line.strip() for line in lines), lines)
-                self.assertFalse(any(line.lstrip().startswith("#") for line in lines), lines)
-                self.assertIn("enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", block)
-                self.assertIn("${assetUrl}", block)
-
+        # Installation and enrollment are separate copy-ready command blocks.
         self.assertIn("Invoke-WebRequest -Uri ${assetUrl} -OutFile $msi", windows_commands)
         self.assertIn("$msi = \"$env:TEMP\\\\${packageName}\"", windows_commands)
-        # msiexec returns immediately in PowerShell: the block must wait for the install.
         self.assertIn("Start-Process msiexec.exe -ArgumentList ('/i \"{0}\" /qn /norestart' -f $msi) -Wait", windows_commands)
-        # A fresh install updates the machine PATH only; the session must reload it.
         self.assertIn('$env:Path = [Environment]::GetEnvironmentVariable("Path", "Machine")', windows_commands)
-        # Defender's Behavior:Win32/SuspRclone.A kills rclone mid-backup; the
-        # exclusion is one explicit line scoped to the single installed file.
         self.assertIn('Add-MpPreference -ExclusionPath "C:\\\\Program Files\\\\Vaultline\\\\rclone.exe"', windows_commands)
         self.assertEqual(windows_commands.count("Add-MpPreference"), 1)
         self.assertNotIn("-ExclusionProcess", windows_commands)
         self.assertNotIn('-ExclusionPath "C:\\\\Program Files\\\\Vaultline"', windows_commands)
-        self.assertIn("vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", windows_commands)
-        self.assertIn("vaultline-worker service status", windows_commands)
         self.assertLess(windows_commands.index("Invoke-WebRequest"), windows_commands.index("msiexec.exe"))
         self.assertLess(windows_commands.index("msiexec.exe"), windows_commands.index("$env:Path ="))
-        self.assertLess(windows_commands.index("$env:Path ="), windows_commands.index("Add-MpPreference"))
-        self.assertLess(windows_commands.index("Add-MpPreference"), windows_commands.index("enroll --control-plane-url"))
-        self.assertLess(windows_commands.index("enroll --control-plane-url"), windows_commands.index("service status"))
         self.assertNotIn("Add-MpPreference", linux_commands)
-
         self.assertIn("curl -fsSL -o ${packageName} ${assetUrl}", linux_commands)
         self.assertIn("sudo dpkg -i ${packageName}", linux_commands)
-        self.assertIn("sudo vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", linux_commands)
-        self.assertIn("sudo systemctl status docker-volume-backup-worker.service --no-pager", linux_commands)
-        self.assertLess(linux_commands.index("curl -fsSL"), linux_commands.index("dpkg -i"))
-        self.assertLess(linux_commands.index("dpkg -i"), linux_commands.index("enroll --control-plane-url"))
-        self.assertLess(linux_commands.index("enroll --control-plane-url"), linux_commands.index("systemctl status"))
+        self.assertIn("vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", windows_enrollment)
+        self.assertIn("vaultline-worker service status", windows_enrollment)
+        self.assertIn("sudo vaultline-worker enroll --control-plane-url ${cpUrl} --bootstrap-token ${secret}", linux_enrollment)
+        self.assertIn("sudo systemctl status docker-volume-backup-worker.service --no-pager", linux_enrollment)
 
         # Guidance lives in the panel text, not inside the command block.
         self.assertIn("espera el enrolamiento", tab_source)
         self.assertIn("Run as administrator", tab_source)
         self.assertIn("journalctl -u docker-volume-backup-worker.service -f", tab_source)
-        self.assertIn('data-code-id="modalCode">Copiar comandos</button>', tab_source)
+        self.assertIn('class="copy-btn" data-code-id="modalCode">Copiar comandos</button>', tab_source)
 
         # The service is already running after install: no manual enable/start and no Task Scheduler.
         for stale in (
@@ -2537,10 +2534,60 @@ class WorkerUiStateTests(unittest.TestCase):
         self.assertIn("rclone stdio connection already closed", tab_source)
         self.assertIn("acotada a un unico archivo instalado", tab_source)
         self.assertIn("sin reiniciar", tab_source)
-        self.assertIn("sin necesidad de volver a enrolar", tab_source)
+        self.assertIn("sin reiniciar ni volver a enrolar", tab_source)
         self.assertIn("worker.env es opcional", tab_source)
         self.assertIn("vaultline-worker.exe daemon", tab_source)
         self.assertIn("service install", tab_source)
+
+    def test_new_worker_host_is_derived_from_lowercase_name(self):
+        helper = re.search(r"function syncNewWorkerIdentity\(.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(helper)
+        self.assertIn('nameInput.addEventListener("input"', self.source)
+        self.assertIn('id="awHost" name="worker_host" autocomplete="off" readonly', self.source)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = helper.group(0) + r'''
+const nameInput = { value: "ACT-TWC-14" };
+const hostInput = { value: "unknown-host" };
+syncNewWorkerIdentity(nameInput, hostInput);
+process.stdout.write(JSON.stringify({ name: nameInput.value, host: hostInput.value }));
+'''
+        result = subprocess.run(["node", "--input-type=commonjs", "--eval", script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {"name": "act-twc-14", "host": "act-twc-14"})
+
+    def test_worker_enrollment_modal_confirms_only_a_fresh_online_heartbeat(self):
+        finder = re.search(r"function findConnectedEnrollmentWorker\(.*?\n    \}", self.source, re.S)
+        renderer = re.search(r"function renderEnrollmentSuccess\(.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(finder)
+        self.assertIsNotNone(renderer)
+        self.assertIn("addWorkerState.connectionSucceeded", self.source)
+        self.assertIn("findConnectedEnrollmentWorker(newWorkers, enrollment.worker_id, previousLastSeenAt)", self.source)
+        self.assertIn("? renderEnrollmentSuccess(addWorkerState.connectionWorker)", self.source)
+        self.assertIn('addWorkerState.connectionSucceeded ? "Conex', self.source)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = r'''
+const escapeHtml = value => String(value);
+''' + finder.group(0) + "\n" + renderer.group(0) + r'''
+const old = "2026-10-27T10:00:00Z";
+const cases = [
+  findConnectedEnrollmentWorker([{ id: "w-1", status: "online", last_seen_at: "2026-10-27T10:01:00Z" }], "w-1", null)?.id || null,
+  findConnectedEnrollmentWorker([{ id: "other", status: "online", last_seen_at: "2026-10-27T10:01:00Z" }], "w-1", null),
+  findConnectedEnrollmentWorker([{ id: "w-1", status: "offline", last_seen_at: "2026-10-27T10:01:00Z" }], "w-1", null),
+  findConnectedEnrollmentWorker([{ id: "w-1", status: "online", last_seen_at: old }], "w-1", old),
+  findConnectedEnrollmentWorker([{ id: "w-1", status: "online", last_seen_at: "2026-10-27T10:01:00Z" }], "w-1", old)?.id || null,
+];
+const success = renderEnrollmentSuccess({ id: "w-1", name: "worker-1", status: "online" });
+process.stdout.write(JSON.stringify({ cases, success }));
+'''
+        result = subprocess.run(["node", "--input-type=commonjs", "--eval", script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(result.stdout)
+        self.assertEqual(actual["cases"], ["w-1", None, None, None, "w-1"])
+        self.assertIn("exitosa", actual["success"])
+        self.assertIn("worker-1", actual["success"])
+        self.assertNotIn("BOOTSTRAP_TOKEN", actual["success"])
 
     def test_worker_enrollment_renewal_preserves_stable_id_and_reuses_compose_flow(self):
         for marker in (

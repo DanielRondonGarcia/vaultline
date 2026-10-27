@@ -7031,6 +7031,22 @@ docker compose up -d
       container.scrollTop = container.scrollHeight;
     }
 
+    function renderJobTableBodyPreservingAccordion(tbody, markup) {
+      const openJobId = accordionLogJobId;
+      const openContent = accordionContentEl;
+      tbody.innerHTML = markup;
+      if (!openJobId || !openContent) return;
+
+      const row = document.getElementById(`log-accordion-${openJobId}`);
+      const contentSlot = document.getElementById(`log-content-${openJobId}`);
+      if (!row || !contentSlot) {
+        closeJobLogAccordion();
+        return;
+      }
+      row.style.display = "";
+      contentSlot.replaceWith(openContent);
+    }
+
     function renderJobs(content) {
       const targetMap = {};
       (state.targets || []).forEach(t => { targetMap[t.id] = t.name; });
@@ -7106,7 +7122,7 @@ docker compose up -d
           const skeletonRows = `<tr class="jobs-loading-row"><td colspan="8"><div class="snapshot-skeleton-list" aria-hidden="true">${Array.from({ length: Math.min(pageSize, 5) }, () => `<div class="snapshot-skeleton-row"></div>`).join("")}</div></td></tr>`;
           const emptyRow = `<tr><td colspan="8" class="empty-state">Sin jobs que coincidan con los filtros</td></tr>`;
           const unavailableRow = `<tr><td colspan="8" class="empty-state">No se pudo cargar la lista de jobs.</td></tr>`;
-          tbody.innerHTML = isLoading ? skeletonRows : !jobsListLoaded ? unavailableRow : pagedJobs.length === 0 ? emptyRow : pagedJobs.map(j => {
+          renderJobTableBodyPreservingAccordion(tbody, isLoading ? skeletonRows : !jobsListLoaded ? unavailableRow : pagedJobs.length === 0 ? emptyRow : pagedJobs.map(j => {
             const canCancel = normalizeJobStatus(j.status) === "pending" || normalizeJobStatus(j.status) === "in_progress";
             const targetName = j.target_name || targetMap[j.target_id] || j.target_id || "—";
             const workerName = j.worker_name || workerMap[j.worker_id] || j.worker_id || "—";
@@ -7130,7 +7146,7 @@ docker compose up -d
               </td>
             </tr>
           `;
-          }).join("");
+          }).join(""));
         }
 
         const subtitle = content.querySelector(".page-header .subtitle");

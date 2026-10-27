@@ -961,6 +961,40 @@ process.stdout.write(JSON.stringify({ bySource, byLegacyPath, byEmptyLegacy }));
         ):
             self.assertIn(marker, self.source)
 
+    def test_open_job_log_accordion_survives_jobs_table_refresh(self):
+        helper = re.search(
+            r"function renderJobTableBodyPreservingAccordion\(tbody, markup\) \{.*?\n    \}",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(helper)
+        render_jobs = re.search(r"function renderJobs\(content\) \{.*?\n    let _jobsRenderTableBody = null;", self.source, re.S)
+        self.assertIsNotNone(render_jobs)
+        self.assertIn("renderJobTableBodyPreservingAccordion(tbody,", render_jobs.group(0))
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = r'''
+let accordionLogJobId = "job-123";
+const closeJobLogAccordion = () => { throw new Error("open log panel was unexpectedly closed"); };
+const content = { id: "log-content-job-123", closeHandler: true, liveUpdateHandler: true };
+let accordionContentEl = content;
+const row = { style: { display: "none" } };
+const slot = { replacement: null, replaceWith(node) { this.replacement = node; } };
+const nodes = new Map([["log-accordion-job-123", row], ["log-content-job-123", slot]]);
+const document = { getElementById: id => nodes.get(id) || null };
+const tbody = { innerHTML: "" };
+''' + helper.group(0) + r'''
+renderJobTableBodyPreservingAccordion(tbody, '<updated job rows>');
+if (row.style.display !== "") throw new Error("open accordion row was hidden by refresh");
+if (slot.replacement !== content) throw new Error("live log panel node was not restored into the refreshed row");
+if (!slot.replacement.closeHandler || !slot.replacement.liveUpdateHandler) throw new Error("panel handlers were lost during refresh");
+if (tbody.innerHTML !== "<updated job rows>") throw new Error("refreshed table rows were not rendered");
+process.stdout.write("open job log accordion survived table refresh");
+'''
+        result = subprocess.run(["node", "--input-type=commonjs", "--eval", script], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "open job log accordion survived table refresh")
+
     def test_initial_job_log_loaders_fetch_encoded_finite_detail_for_both_panels(self):
         target_loader = re.search(r"async function loadTargetJobLogs\(jobId\) \{.*?\n    \}", self.source, re.S)
         accordion_loader = re.search(r"async function loadAccordionJobLogs\(jobId\) \{.*?\n    \}", self.source, re.S)
@@ -2030,6 +2064,7 @@ const toggleJobLogAccordion = () => {};
 const withBtnLoading = async (btn, fn) => fn();
 const apiPost = async () => ({});
 const confirm = () => true;
+const renderJobTableBodyPreservingAccordion = (tbody, markup) => { tbody.innerHTML = markup; };
 const tbody = { attributes: {}, innerHTML: "", setAttribute(name, value) { this.attributes[name] = value; } };
 const selects = {};
 const makeSelect = () => ({ innerHTML: "", value: "" });

@@ -28,6 +28,7 @@ from src.worker_agent.infrastructure.api_client.control_plane_client import (
     safe_diagnostic_text,
 )
 from src.worker_agent.infrastructure.security.credential_store import WorkerCredentialStore
+from src.worker_agent.update import UpdateError, run_worker_update
 from src.worker_agent.state_paths import (
     resolve_credential_file,
     resolve_enrollment_config_file,
@@ -65,6 +66,16 @@ def _configuration_presence() -> dict[str, bool]:
         "ca_file_configured": _env_present("CONTROL_PLANE_CA_FILE"),
         "ca_file_exists": _file_exists_from_env("CONTROL_PLANE_CA_FILE"),
     }
+
+
+def _update(_args: argparse.Namespace) -> int:
+    try:
+        message = run_worker_update()
+    except UpdateError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(message)
+    return 0
 
 
 def _self_check(_args: argparse.Namespace) -> int:
@@ -453,6 +464,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Debug mode: run a single worker polling cycle instead of the foreground daemon loop.",
     )
     daemon.set_defaults(handler=_daemon)
+
+    update = subcommands.add_parser(
+        "update",
+        help="Download and install the latest stable Windows MSI update (run from elevated PowerShell).",
+    )
+    update.set_defaults(handler=_update)
 
     self_check = subcommands.add_parser(
         "self-check",

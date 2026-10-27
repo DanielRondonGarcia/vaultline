@@ -15,6 +15,32 @@ class WorkerNativeCLITests(unittest.TestCase):
 
         self.assertEqual(cli.build_parser().prog, "vaultline-worker")
 
+    def test_update_command_dispatches_and_prints_result(self):
+        from src.worker_agent import cli
+
+        output = io.StringIO()
+        with patch(
+            "src.worker_agent.cli.run_worker_update", return_value="Update to 3.15.16 started."
+        ), redirect_stdout(output):
+            code = cli.main(["update"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.getvalue(), "Update to 3.15.16 started.\n")
+
+    def test_update_command_reports_update_errors(self):
+        from src.worker_agent import cli
+
+        from src.worker_agent.update import UpdateError
+
+        errors = io.StringIO()
+        with patch(
+            "src.worker_agent.cli.run_worker_update", side_effect=UpdateError("checksum mismatch")
+        ), redirect_stderr(errors):
+            code = cli.main(["update"])
+
+        self.assertEqual(code, 1)
+        self.assertEqual(errors.getvalue(), "error: checksum mismatch\n")
+
     def test_no_arguments_prints_help_and_succeeds(self):
         from src.worker_agent import cli
 
@@ -23,7 +49,7 @@ class WorkerNativeCLITests(unittest.TestCase):
             code = cli.main([])
 
         self.assertEqual(code, 0)
-        for command in ("enroll", "daemon", "service"):
+        for command in ("enroll", "daemon", "service", "update"):
             self.assertIn(command, output.getvalue())
         self.assertIn("usage: vaultline-worker", output.getvalue())
 
@@ -37,6 +63,23 @@ class WorkerNativeCLITests(unittest.TestCase):
 
         self.assertEqual(exit_code.exception.code, 0)
         self.assertEqual(output.getvalue().strip(), "vaultline-worker 3.8.0")
+
+    def test_update_is_not_misparsed_as_an_existing_subcommand_argument(self):
+        from src.worker_agent import cli
+
+        cases = (
+            ("enroll", "unrecognized arguments"),
+            ("daemon", "unrecognized arguments"),
+            ("self-check", "unrecognized arguments"),
+            ("service", "invalid choice"),
+        )
+        for command, expected_error in cases:
+            with self.subTest(command=command):
+                errors = io.StringIO()
+                with redirect_stderr(errors), self.assertRaises(SystemExit) as raised:
+                    cli.main([command, "update"])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn(expected_error, errors.getvalue())
 
     def test_invalid_command_remains_an_argparse_error(self):
         from src.worker_agent import cli

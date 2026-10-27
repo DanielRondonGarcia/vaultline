@@ -1,13 +1,17 @@
 # Windows Native Restic/rclone Failure
-Outcome: Frozen Windows worker Restic commands use an explicit absolute path to the packaged rclone for rclone-backed repositories.
+Outcome: Frozen Windows worker Restic commands use an explicit absolute path to the packaged rclone, quoted so Restic preserves Windows install paths containing spaces.
 Scope: Preserve source-mode and non-rclone behavior; release evidence is recorded here and in `windows-worker-self-update.md`.
 
 ## Specs
 1. S1: “y tengo este bug, acabé de instalarlo en un Microsoft Windows Server 2022 Standard 10.0.20348 20348 - C:\Users\DANIEL~1.RON\AppData\Local\Temp\orca-paste-1793137812864-5ce8435b-4088-4ad1-9e1e-7c00fe077876.png y vea, falla” — address the Restic initialization failure shown in the screenshot, where Restic rejects the implicit relative `rclone.exe` executable and directs callers to set `-o rclone.program`.
+2. S2: “ya pude actualizarlo, pero vea, sigue fallando el backup C:\Users\DANIEL~1.RON\AppData\Local\Temp\orca-paste-1793144675905-3895d572-f2fd-4e49-bb7c-2e626fc37320.png” and screenshot error “cmd.Start: exec: "C:" executable file not found in %PATH%” — keep the packaged Windows rclone executable path containing spaces as one Restic program token.
 
 ## Tasks
 - T1 | S1 | Parent inline: add regression coverage and explicitly configure the packaged rclone path for frozen rclone-backed Restic commands | status: done (4 focused tests pass) | commit: eff40e6
 - T2 | S1 | Parent + gentle-ai-verify: run focused and relevant suites; independently inspect shared Restic command behavior | status: done (213 suite tests pass; independent S1 verdict: met) | commit: eff40e6
+- T3 | S2 | Parent inline: reproduce the Windows path-with-spaces failure, add a failing regression, and quote the executable within the `rclone.program` value | status: done (214 passed, 1 skipped, 122 subtests; independent review unavailable and user accepted gap for follow-up release) | commit: pending
+- T4 | S2 | Parent inline: commit the correction, publish a stable patch release, and verify workflow/assets/checksums | status: in progress; user authorized follow-up release despite the documented review gap | commit: pending
+- T5 | S2 | User: install the follow-up MSI on Server 2022 and report whether backup succeeds | status: blocked pending user runtime result | commit: N/A
 
 ## Log
 - L1: y tengo este bug, acabé de instalarlo en un Microsoft Windows Server 2022 Standard 10.0.20348 20348 - C:\Users\DANIEL~1.RON\AppData\Local\Temp\orca-paste-1793137812864-5ce8435b-4088-4ad1-9e1e-7c00fe077876.png y vea, falla
@@ -20,3 +24,13 @@ Scope: Preserve source-mode and non-rclone behavior; release evidence is recorde
 - L8: Independent verifier returned S1 met with no blockers: all Restic call paths, option order, fail-closed path resolution, policy-before-injection, and source/non-rclone behavior checked. Its additional scratch boundary probe passed 12/12; the verifier made no repository changes.
 - L9: User authorization: “na, autorizo publicarlo, yo lo pruebo de una”. The Restic fix is included in stable release 3.15.16 together with the on-demand Windows updater; detailed release evidence is in `windows-worker-self-update.md`.
 - L10: No live Server 2022 install or Restic run was performed by the agent. The user will install the first MSI containing the updater manually and report the Restic/rclone result.
+- L11: User report: “ya pude actualizarlo, pero vea, sigue fallando el backup C:\Users\DANIEL~1.RON\AppData\Local\Temp\orca-paste-1793144675905-3895d572-f2fd-4e49-bb7c-2e626fc37320.png”.
+- L12: Screenshot failure: `cmd.Start: exec: "C:" executable file not found in %PATH%`; the attempted Restic argv contains `rclone.program=C:\Program Files\Vaultline\rclone.exe`.
+- L13: Restic v0.19.1 source `internal/backend/rclone/backend.go` passes `cfg.Program` through `backend.SplitShellStrings` before `exec.Command`; `internal/backend/shell_split.go` supports quoted strings. The raw unquoted Windows path is split on both backslashes and spaces, so the program value must contain quotes around the full path.
+- L14: Test-first RED: `python -m pytest tests/test_native_tool_executable.py::NativeToolExecutableTests::test_frozen_rclone_program_quotes_windows_path_with_spaces -q` failed as expected (1 failed); expected the quoted program token, got the path without quotes.
+- L15: GREEN: after wrapping the executable in quotes whenever its path contains shell-split separators (backslash or whitespace), the same focused regression passed (1 passed).
+- L16: Relevant suites after the fix: `python -m pytest tests/test_backup_observability.py tests/test_native_restore.py tests/test_native_tool_executable.py tests/test_worker_packaging.py tests/test_snapshot_browser.py tests/test_control_plane_dispatch.py -q` → 214 passed, 1 skipped, 122 subtests passed; 1,412 existing datetime deprecation warnings. `git diff --check` passed.
+- L17: `gentle_review assess` rated the shared-helper change high risk (item 3), set `reviewDue: true`, and requested an independent verifier. The verifier previously timed out because its tool had no API key and was not retried. Native review status reported `applicability: unrelated`, `rdd_disabled`, and no candidate; no independent review was completed for this follow-up.
+- L18: At this point, the fix remained local and uncommitted; no follow-up package or release had been built or published.
+- L19: User selected “Autorizar un release de seguimiento”, accepting publication based on the passing local tests despite the unavailable independent verifier.
+- L20: Delivery boundary: one follow-up work-unit commit will contain only the Restic path-quoting helper, its regression, and this task evidence; unrelated dirty paths remain excluded.

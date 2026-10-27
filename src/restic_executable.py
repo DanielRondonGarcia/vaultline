@@ -30,7 +30,11 @@ def restic_command_with_backend_options(command: list[str], environment: dict[st
         for index, argument in enumerate(prepared[1:], start=1)
     ):
         return prepared
-    return [prepared[0], "-o", f"rclone.program={resolve_rclone_executable()}", *prepared[1:]]
+    rclone_program = resolve_rclone_executable()
+    if "\\" in rclone_program or any(character.isspace() for character in rclone_program):
+        # Restic shell-splits rclone.program itself; quote Windows separators and spaces.
+        rclone_program = f'"{rclone_program}"'
+    return [prepared[0], "-o", f"rclone.program={rclone_program}", *prepared[1:]]
 
 
 def restic_subprocess_environment(environment: dict[str, str]) -> dict[str, str]:

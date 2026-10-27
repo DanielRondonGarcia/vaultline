@@ -146,8 +146,27 @@ class NativeToolExecutableTests(unittest.TestCase):
                 command, {"RESTIC_REPOSITORY": "rclone:remote:/backup"}
             )
 
-        self.assertEqual(prepared, [RESTIC, "-o", f"rclone.program={rclone.resolve()}", "init"])
+        rclone_program = str(rclone.resolve())
+        if "\\" in rclone_program or any(character.isspace() for character in rclone_program):
+            rclone_program = f'"{rclone_program}"'
+        self.assertEqual(prepared, [RESTIC, "-o", f"rclone.program={rclone_program}", "init"])
         self.assertEqual(command, [RESTIC, "init"])
+
+    def test_frozen_rclone_program_quotes_windows_path_with_spaces(self):
+        from src import restic_executable
+
+        rclone_path = r"C:\Program Files\Vaultline\rclone.exe"
+        with patch.object(sys, "frozen", True, create=True), patch.object(
+            restic_executable, "resolve_rclone_executable", return_value=rclone_path
+        ):
+            prepared = restic_executable.restic_command_with_backend_options(
+                [RESTIC, "init"], {"RESTIC_REPOSITORY": "rclone:remote:/backup"}
+            )
+
+        self.assertEqual(
+            prepared,
+            [RESTIC, "-o", f'rclone.program="{rclone_path}"', "init"],
+        )
 
     def test_restic_command_without_frozen_rclone_repository_is_unchanged(self):
         from src import restic_executable

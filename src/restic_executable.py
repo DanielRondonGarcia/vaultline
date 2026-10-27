@@ -16,6 +16,23 @@ def resolve_restic_executable() -> str:
 RESTIC_PROGRESS_FPS_DEFAULT = "1"
 
 
+def restic_command_with_backend_options(command: list[str], environment: dict[str, str]) -> list[str]:
+    """Select the packaged rclone explicitly for frozen rclone-backed Restic commands."""
+    prepared = list(command)
+    if not prepared or not getattr(sys, "frozen", False):
+        return prepared
+    repository = environment.get("RESTIC_REPOSITORY", "")
+    if not isinstance(repository, str) or not repository.startswith("rclone:"):
+        return prepared
+    if any(
+        argument == "-o" and index + 1 < len(prepared) and prepared[index + 1].startswith("rclone.program=")
+        or argument.startswith("-o=rclone.program=")
+        for index, argument in enumerate(prepared[1:], start=1)
+    ):
+        return prepared
+    return [prepared[0], "-o", f"rclone.program={resolve_rclone_executable()}", *prepared[1:]]
+
+
 def restic_subprocess_environment(environment: dict[str, str]) -> dict[str, str]:
     """Copy an environment and expose the packaged rclone to frozen Restic children.
 

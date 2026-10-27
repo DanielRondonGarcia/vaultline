@@ -134,6 +134,41 @@ class NativeToolExecutableTests(unittest.TestCase):
         self.assertEqual(bundled_env["PATH"], os.pathsep.join((str(layout.bundle_dir), "host-tools")))
         self.assertEqual(installed_env["PATH"], os.pathsep.join((str(layout.install_dir.resolve()), "host-tools")))
 
+    def test_frozen_rclone_repository_uses_absolute_rclone_program_option(self):
+        from src import restic_executable
+
+        with tempfile.TemporaryDirectory() as directory, FrozenLayout(Path(directory)) as layout:
+            _write_tool(layout.install_dir, RESTIC)
+            rclone = _write_tool(layout.install_dir, RCLONE)
+            command = [RESTIC, "init"]
+
+            prepared = restic_executable.restic_command_with_backend_options(
+                command, {"RESTIC_REPOSITORY": "rclone:remote:/backup"}
+            )
+
+        self.assertEqual(prepared, [RESTIC, "-o", f"rclone.program={rclone.resolve()}", "init"])
+        self.assertEqual(command, [RESTIC, "init"])
+
+    def test_restic_command_without_frozen_rclone_repository_is_unchanged(self):
+        from src import restic_executable
+
+        command = [RESTIC, "snapshots", "--json"]
+        with patch.object(sys, "frozen", False, create=True):
+            self.assertEqual(
+                restic_executable.restic_command_with_backend_options(
+                    command, {"RESTIC_REPOSITORY": "rclone:remote:/backup"}
+                ),
+                command,
+            )
+
+        with tempfile.TemporaryDirectory() as directory, FrozenLayout(Path(directory)):
+            self.assertEqual(
+                restic_executable.restic_command_with_backend_options(
+                    command, {"RESTIC_REPOSITORY": "s3:https://storage.example/backup"}
+                ),
+                command,
+            )
+
     def test_restic_environment_fails_closed_when_rclone_is_missing_everywhere(self):
         with tempfile.TemporaryDirectory() as directory, FrozenLayout(Path(directory)) as layout:
             _write_tool(layout.install_dir, RESTIC)

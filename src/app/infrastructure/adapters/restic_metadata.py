@@ -19,7 +19,11 @@ from src.app.domain.restore_metadata import (
     ResticMetadataStreamParser,
 )
 from src.app.domain.restore_ownership import RestoreOwnershipPolicy
-from src.restic_executable import resolve_restic_executable, restic_subprocess_environment
+from src.restic_executable import (
+    resolve_restic_executable,
+    restic_command_with_backend_options,
+    restic_subprocess_environment,
+)
 
 MAX_STDERR_TAIL_BYTES = 16 * 1024
 _STDERR_SECRET = re.compile(r"(?i)(password|passphrase|secret|token|credential)(\s*[:=]\s*)[^\s,;]+")
@@ -117,8 +121,11 @@ class ResticMetadataInspectorAdapter(ResticMetadataInspectorPort):
             if repository is not None: env["RESTIC_REPOSITORY"] = str(repository)
             if password is not None: env["RESTIC_PASSWORD"] = str(password)
             env = restic_subprocess_environment(env)
+            command = restic_command_with_backend_options(
+                [resolve_restic_executable(), "ls", "--long", snapshot], env
+            )
             process = self.process_factory(
-                [resolve_restic_executable(), "ls", "--long", snapshot],
+                command,
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,

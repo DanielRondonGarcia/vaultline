@@ -14,7 +14,11 @@ from src.worker_agent.application.policies.runtime_command_policy import Runtime
 from src.worker_agent.application.ports.runtime_port import RuntimePort
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
 from src.worker_agent.infrastructure.adapters.runtime_watchdog import RuntimeWatchdog
-from src.restic_executable import resolve_restic_executable, restic_subprocess_environment
+from src.restic_executable import (
+    resolve_restic_executable,
+    restic_command_with_backend_options,
+    restic_subprocess_environment,
+)
 from src.rclone_executable import resolve_rclone_executable
 
 MAX_RESOLVED_FILES = 32
@@ -234,6 +238,7 @@ class NativeRuntimeAdapter(RuntimePort):
             return self._backup_engine_command(), environment
         if command[0] == "restic":
             environment = restic_subprocess_environment(environment)
+            command = restic_command_with_backend_options(command, environment)
         command[0] = self._require_executable(command[0])
         return command, environment
 

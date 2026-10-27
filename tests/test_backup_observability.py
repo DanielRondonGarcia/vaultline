@@ -1055,6 +1055,48 @@ class ResticStaleLockRecoveryTests(unittest.TestCase):
             result = strategy.perform_backup(config)
         return result, argv
 
+    def test_frozen_rclone_backup_passes_absolute_rclone_program_to_each_restic_command(self):
+        restic_path = "/opt/vaultline/restic"
+        rclone_path = "/opt/vaultline/rclone"
+        commands = []
+        strategy = ResticBackupStrategy()
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            if "snapshots" in command:
+                raise subprocess.CalledProcessError(1, command, output="", stderr="repository is not initialized")
+            return self.completed(stdout="[]")
+
+        process = Mock()
+        process.stdout.readline.side_effect = [self.SUMMARY, ""]
+        process.stderr.readline.side_effect = [""]
+        process.wait.return_value = 0
+        process.returncode = 0
+
+        def popen(command, **_kwargs):
+            commands.append(command)
+            return process
+
+        with patch.object(sys, "frozen", True, create=True), patch(
+            "src.restic_executable.resolve_restic_executable", return_value=restic_path
+        ), patch("src.restic_executable.resolve_rclone_executable", return_value=rclone_path), patch(
+            "src.app.infrastructure.adapters.backup_strategy._require_executable", return_value=restic_path
+        ), patch("src.app.infrastructure.adapters.backup_strategy.subprocess.run", side_effect=run), patch(
+            "src.app.infrastructure.adapters.backup_strategy.subprocess.Popen", side_effect=popen
+        ):
+            result = strategy.perform_backup(
+                BackupConfig(
+                    source_paths=["C:\\Data"],
+                    restic_repository="rclone:remote:/backup",
+                    restic_keep_last=3,
+                )
+            )
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual([command[3] if command[1] == "-o" else command[1] for command in commands], ["snapshots", "init", "backup", "forget"])
+        for command in commands:
+            self.assertEqual(command[1:3], ["-o", f"rclone.program={rclone_path}"])
+
     def test_lock_detector_extracts_age_and_ignores_other_failures(self):
         self.assertEqual(describe_restic_lock(self.LOCK_STDERR, 1), "lock created 47m18.4s ago")
         self.assertEqual(describe_restic_lock("Fatal: repository is already locked by PID 1 on host\n", 1), "lock age unknown")

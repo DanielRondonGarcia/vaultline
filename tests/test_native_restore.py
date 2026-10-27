@@ -280,6 +280,28 @@ class NativeRestoreTests(unittest.TestCase):
                 with self.assertRaisesRegex(FileNotFoundError, "bundled rclone executable"):
                     adapter._command_and_environment(payload)
 
+    def test_frozen_rclone_restic_runtime_adds_program_after_allowlist_validation(self):
+        adapter = NativeRuntimeAdapter(python_executable=sys.executable)
+        restic_path = "/opt/vaultline/restic"
+        rclone_path = "/opt/vaultline/rclone"
+        payload = {
+            "runtime_type": "native",
+            "filesystem_paths": ["/srv/app"],
+            "environment": {"RESTIC_REPOSITORY": "rclone:remote:/backup"},
+            "command": ["restic", "snapshots", "--json"],
+        }
+
+        with patch.object(sys, "frozen", True, create=True), patch(
+            "src.restic_executable.resolve_restic_executable", return_value=restic_path
+        ), patch("src.restic_executable.resolve_rclone_executable", return_value=rclone_path), patch(
+            "src.worker_agent.infrastructure.adapters.native_runtime.resolve_restic_executable",
+            return_value=restic_path,
+        ):
+            command, environment = adapter._command_and_environment(payload)
+
+        self.assertEqual(command, [restic_path, "-o", f"rclone.program={rclone_path}", "snapshots", "--json"])
+        self.assertEqual(environment["RESTIC_REPOSITORY"], "rclone:remote:/backup")
+
     def test_frozen_native_runtime_fails_closed_when_bundled_restic_is_missing(self):
         adapter = NativeRuntimeAdapter(python_executable=sys.executable)
         payload = {

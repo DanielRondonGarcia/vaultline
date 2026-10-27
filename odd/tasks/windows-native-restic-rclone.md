@@ -6,8 +6,8 @@ Scope: Preserve source-mode and non-rclone behavior; do not publish artifacts.
 1. S1: “y tengo este bug, acabé de instalarlo en un Microsoft Windows Server 2022 Standard 10.0.20348 20348 - C:\Users\DANIEL~1.RON\AppData\Local\Temp\orca-paste-1793137812864-5ce8435b-4088-4ad1-9e1e-7c00fe077876.png y vea, falla” — address the Restic initialization failure shown in the screenshot, where Restic rejects the implicit relative `rclone.exe` executable and directs callers to set `-o rclone.program`.
 
 ## Tasks
-- T1 | S1 | Parent inline: add regression coverage and explicitly configure the packaged rclone path for frozen rclone-backed Restic commands | status: done (4 focused tests pass) | commit: pending
-- T2 | S1 | Parent + gentle-ai-verify: run focused and relevant suites; independently inspect shared Restic command behavior | status: done (213 suite tests pass; independent S1 verdict: met) | commit: pending
+- T1 | S1 | Parent inline: add regression coverage and explicitly configure the packaged rclone path for frozen rclone-backed Restic commands | status: done (4 focused tests pass) | commit: eff40e6
+- T2 | S1 | Parent + gentle-ai-verify: run focused and relevant suites; independently inspect shared Restic command behavior | status: done (213 suite tests pass; independent S1 verdict: met) | commit: eff40e6
 
 ## Log
 - L1: y tengo este bug, acabé de instalarlo en un Microsoft Windows Server 2022 Standard 10.0.20348 20348 - C:\Users\DANIEL~1.RON\AppData\Local\Temp\orca-paste-1793137812864-5ce8435b-4088-4ad1-9e1e-7c00fe077876.png y vea, falla

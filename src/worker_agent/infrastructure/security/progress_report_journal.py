@@ -11,11 +11,11 @@ class WorkerProgressReportJournal(WorkerTerminalReportJournal):
     MAX_AGE_SECONDS = WorkerTerminalReportJournal.MAX_AGE_SECONDS
 
     @classmethod
-    def batch(cls, worker_id, job_id, lease_token, sequence, progress, log_lines):
+    def batch(cls, worker_id, job_id, lease_token, sequence, progress, log_lines, log_timestamps=None):
         return cls.bounded_record(
             worker_id=worker_id, job_id=job_id, lease_token=lease_token,
             status="progress", result_summary={"sequence": sequence, "progress": progress},
-            log_lines=log_lines,
+            log_lines=log_lines, log_timestamps=log_timestamps,
         )
 
     @classmethod

@@ -290,17 +290,19 @@ class _JobProgressReporter:
         self.latest_progress: Dict[str, Any] = {}
         self._backup_size_metrics: Dict[str, int] = {}
         self._pending_lines: List[str] = []
+        self._pending_line_timestamps: List[Optional[str]] = []
         self._partial_line = ""
+        self._partial_line_timestamp: Optional[str] = None
         self._last_inferred_phase: Optional[str] = None
         self._last_sent = 0.0
         self._lock = threading.Lock()
-        self._outbox: Deque[tuple[int, Dict[str, Any], List[str]]] = deque()
+        self._outbox: Deque[tuple[int, Dict[str, Any], List[str], Optional[List[Optional[str]]]]] = deque()
         if self._journal:
             for record in self._journal.load():
                 if (record["worker_id"], record["job_id"], record["lease_token"]) != (worker_id, self.job_id, self.lease_token):
                     continue
                 summary = record["result_summary"]
-                self._outbox.append((summary["sequence"], summary["progress"], record["log_lines"]))
+                self._outbox.append((summary["sequence"], summary["progress"], record["log_lines"], record.get("log_timestamps")))
                 self.sequence = max(self.sequence, summary["sequence"])
         self._outbox_ready = threading.Condition(self._lock)
         self._closing = False
@@ -314,8 +316,14 @@ class _JobProgressReporter:
             self._send_method = configured if callable(configured) else None
 
     @property
-    def callback(self) -> Optional[Callable[[str], None]]:
-        return self.emit if self._send_method is not None else None
+    def callback(self) -> Optional[Callable[..., None]]:
+        if self._send_method is None:
+            return None
+
+        def line_callback(chunk: Any, timestamps: Optional[List[Optional[str]]] = None) -> None:
+            self.emit(chunk, timestamps=timestamps)
+
+        return line_callback
 
     @property
     def latest_backup_size_metrics(self) -> Dict[str, int]:
@@ -325,19 +333,34 @@ class _JobProgressReporter:
     def start(self) -> None:
         self.emit("", {"phase": "starting"}, force=True)
 
-    def emit(self, chunk: Any, progress: Optional[Dict[str, Any]] = None, force: bool = False) -> None:
+    def emit(self, chunk: Any, progress: Optional[Dict[str, Any]] = None, force: bool = False, timestamps: Optional[List[Optional[str]]] = None) -> None:
         text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk or "")
         with self._lock:
             if text:
+                had_partial_line = bool(self._partial_line)
+                previous_partial_timestamp = self._partial_line_timestamp
                 text = self._partial_line + text
                 parts = text.splitlines(keepends=True)
                 self._partial_line = ""
+                self._partial_line_timestamp = None
+                timestamp_sources = timestamps if isinstance(timestamps, list) else []
                 if parts and not parts[-1].endswith(("\n", "\r")):
                     self._partial_line = parts.pop()
-                for part in parts:
+                    if had_partial_line and not parts:
+                        self._partial_line_timestamp = previous_partial_timestamp
+                    else:
+                        raw_stamp = timestamp_sources[len(parts)] if len(parts) < len(timestamp_sources) else None
+                        self._partial_line_timestamp = raw_stamp if isinstance(raw_stamp, str) else None
+                for index, part in enumerate(parts):
                     line = part.rstrip("\r\n")
                     if line:
+                        raw_stamp = (
+                            previous_partial_timestamp
+                            if had_partial_line and index == 0
+                            else timestamp_sources[index] if index < len(timestamp_sources) else None
+                        )
                         self._pending_lines.append(WorkerAgentService._safe_job_text(self._job, line)[:16 * 1024])
+                        self._pending_line_timestamps.append(raw_stamp if isinstance(raw_stamp, str) else None)
                         self._backup_size_metrics.update(_restic_backup_size_metrics(line))
                 # Some runtimes do not terminate their final output line. The
                 # summary can still be complete JSON, so inspect the partial line
@@ -345,6 +368,7 @@ class _JobProgressReporter:
                 if self._partial_line:
                     self._backup_size_metrics.update(_restic_backup_size_metrics(self._partial_line))
                 self._pending_lines = self._pending_lines[-self.MAX_PENDING_LINES :]
+                self._pending_line_timestamps = self._pending_line_timestamps[-self.MAX_PENDING_LINES :]
                 phase_changed = False
                 for line in parts:
                     parsed = _restic_progress_from_line(line.rstrip("\r\n"))
@@ -368,18 +392,23 @@ class _JobProgressReporter:
             if not should_flush:
                 return
             lines = self._pending_lines
+            line_times = self._pending_line_timestamps
             self._pending_lines = []
+            self._pending_line_timestamps = []
             self.sequence += 1
             sequence = self.sequence
             progress_payload = dict(self.latest_progress)
             self._last_sent = now
-            self._enqueue_locked(sequence, progress_payload, lines)
+            timestamps_payload = line_times if line_times and any(stamp is not None for stamp in line_times) else None
+            self._enqueue_locked(sequence, progress_payload, lines, timestamps_payload)
 
     def finish(self) -> None:
         with self._lock:
             if self._partial_line:
                 self._pending_lines.append(WorkerAgentService._safe_job_text(self._job, self._partial_line)[:16 * 1024])
+                self._pending_line_timestamps.append(self._partial_line_timestamp)
                 self._partial_line = ""
+                self._partial_line_timestamp = None
         self.emit("", force=True)
         with self._lock:
             self._closing = True
@@ -395,8 +424,8 @@ class _JobProgressReporter:
         if self._journal is None:
             return
         records = [WorkerProgressReportJournal.batch(
-            self.worker_id, self.job_id, self.lease_token, sequence, progress, lines
-        ) for sequence, progress, lines in self._outbox]
+            self.worker_id, self.job_id, self.lease_token, sequence, progress, lines, ts
+        ) for sequence, progress, lines, ts in self._outbox]
         try:
             self._journal.write(records)
         except (OSError, ValueError) as exc:
@@ -405,26 +434,47 @@ class _JobProgressReporter:
     def replay_pending(self):
         """One ordered replay pass; leave unacknowledged batches on disk."""
         while self._outbox:
-            sequence, progress, lines = self._outbox[0]
-            if not self._send(sequence, progress, lines):
+            sequence, progress, lines, ts = self._outbox[0]
+            if not self._send(sequence, progress, lines, ts):
                 return
             self._outbox.popleft()
             self._persist_locked()
 
-    def _enqueue_locked(self, sequence: int, progress: Dict[str, Any], lines: List[str]) -> None:
+    @staticmethod
+    def _merge_retained_timestamps(
+        dropped_lines: List[str],
+        dropped_ts: Optional[List[Optional[str]]],
+        next_lines: List[str],
+        next_ts: Optional[List[Optional[str]]],
+    ) -> Optional[List[Optional[str]]]:
+        """Fold-merge optional line timestamps, keeping line alignment intact."""
+        left = list(dropped_ts) if isinstance(dropped_ts, list) else [None] * len(dropped_lines)
+        right = list(next_ts) if isinstance(next_ts, list) else [None] * len(next_lines)
+        left = (left + [None] * len(dropped_lines))[: len(dropped_lines)]
+        right = (right + [None] * len(next_lines))[: len(next_lines)]
+        merged = (left + right)
+        return merged if any(stamp is not None for stamp in merged) else None
+
+    def _enqueue_locked(self, sequence: int, progress: Dict[str, Any], lines: List[str], timestamps: Optional[List[Optional[str]]] = None) -> None:
         if not callable(self._send_method) or not self.job_id or not isinstance(self.lease_token, str):
             return
         if len(self._outbox) >= self.MAX_QUEUED_FLUSHES:
             # The head may be in flight: never mutate or merge its acknowledged logs.
-            _, _, dropped_lines = self._outbox[1]
+            _, _, dropped_lines, dropped_ts = self._outbox[1]
             del self._outbox[1]
-            next_sequence, next_progress, next_lines = self._outbox[1]
+            next_sequence, next_progress, next_lines, next_ts = self._outbox[1]
             combined = dropped_lines + next_lines
-            self._outbox[1] = (next_sequence, next_progress, combined[-self.MAX_PENDING_LINES :])
+            combined_ts = self._merge_retained_timestamps(
+                dropped_lines, dropped_ts, next_lines, next_ts,
+            )
+            trimmed_lines = combined[-self.MAX_PENDING_LINES :]
+            if combined_ts is not None:
+                combined_ts = combined_ts[len(combined_ts) - len(trimmed_lines) :]
+            self._outbox[1] = (next_sequence, next_progress, trimmed_lines, combined_ts)
             if len(combined) > self.MAX_PENDING_LINES and not self._retention_warning_logged:
                 self._retention_warning_logged = True
                 logger.warning("Progress log retention limit reached for job %s; oldest lines omitted", self.job_id)
-        self._outbox.append((sequence, progress, lines))
+        self._outbox.append((sequence, progress, lines, timestamps))
         self._persist_locked()
         if self._sender is None:
             self._sender = threading.Thread(target=self._drain, daemon=True, name=f"job-progress-{self.job_id}")
@@ -439,8 +489,8 @@ class _JobProgressReporter:
                     self._outbox_ready.wait()
                 if not self._outbox:
                     return
-                sequence, progress, lines = self._outbox[0]
-            delivered = self._send(sequence, progress, lines)
+                sequence, progress, lines, ts = self._outbox[0]
+            delivered = self._send(sequence, progress, lines, ts)
             with self._outbox_ready:
                 if delivered:
                     if self._outbox and self._outbox[0][0] == sequence:
@@ -453,7 +503,7 @@ class _JobProgressReporter:
                     self._outbox_ready.wait(timeout=retry_delay)
                     retry_delay = min(self.RETRY_MAX_SECONDS, retry_delay * 2)
 
-    def _send(self, sequence: int, progress: Dict[str, Any], lines: List[str]) -> bool:
+    def _send(self, sequence: int, progress: Dict[str, Any], lines: List[str], log_timestamps: Optional[List[Optional[str]]] = None) -> bool:
         if not callable(self._send_method) or not self.job_id or not isinstance(self.lease_token, str):
             return
         kwargs = {
@@ -464,22 +514,32 @@ class _JobProgressReporter:
             "log_lines": lines,
             "lease_token": self.lease_token,
         }
+        if log_timestamps and any(stamp is not None for stamp in log_timestamps):
+            kwargs["log_timestamps"] = list(log_timestamps)
         if self.lease_diagnostics is not None:
             lease_context = self.lease_diagnostics.snapshot()
             if lease_context:
                 kwargs["lease_context"] = lease_context
         try:
             self._send_method(**kwargs)
-        except TypeError:
-            if "lease_context" in kwargs:
-                kwargs.pop("lease_context", None)
+        except TypeError as exc:
+            match = re.search(
+                r"unexpected keyword argument ['\"](lease_context|log_timestamps)['\"]",
+                str(exc),
+            )
+            unsupported = [match.group(1)] if match else [
+                key for key in ("lease_context", "log_timestamps") if key in kwargs
+            ]
+            if unsupported:
+                for key in unsupported:
+                    kwargs.pop(key, None)
                 try:
                     self._send_method(**kwargs)
-                except Exception as exc:
+                except Exception as retry_exc:
                     logger.warning(
                         "Job progress update failed for %s (error_type=%s)",
                         self.job_id,
-                        exc.__class__.__name__,
+                        retry_exc.__class__.__name__,
                     )
                     return False
             else:
@@ -844,6 +904,7 @@ class WorkerAgentService:
             status=execution.status,
             result_summary=result_summary,
             log_lines=execution.log_lines,
+            log_timestamps=execution.log_timestamps,
         )
         if record is None:
             logger.warning(
@@ -922,6 +983,7 @@ class WorkerAgentService:
                     result_summary=record["result_summary"],
                     log_lines=record["log_lines"],
                     lease_token=record["lease_token"],
+                    **({"log_timestamps": record["log_timestamps"]} if record.get("log_timestamps") else {}),
                 )
             except Exception as exc:
                 if self._is_definitive_control_plane_rejection(exc):
@@ -1163,6 +1225,7 @@ class WorkerAgentService:
             DockerRuntimeAdapter._redact_text(line, {record["lease_token"]})
             for line in execution.log_lines
         ]
+        execution.log_timestamps = record.get("log_timestamps", [])
         try:
             self.control_plane_client.update_job_status(
                 worker_id=record["worker_id"],
@@ -1171,6 +1234,7 @@ class WorkerAgentService:
                 result_summary=execution.result_summary,
                 log_lines=execution.log_lines,
                 lease_token=record["lease_token"],
+                **({"log_timestamps": execution.log_timestamps} if any(execution.log_timestamps) else {}),
             )
         except Exception as exc:
             if self._is_definitive_control_plane_rejection(exc):
@@ -1889,6 +1953,23 @@ class WorkerAgentService:
         combined = self._safe_job_text(payload, combined)[: self.MAX_LOG_CHARS]
         return combined.strip().splitlines()[-self.MAX_LOG_LINES :]
 
+    def _aligned_runtime_log_timestamps(
+        self,
+        payload: Dict[str, Any],
+        summary: Dict[str, Any],
+        log_lines: List[str],
+        *,
+        prefix_count: int = 0,
+        has_additional_output: bool = False,
+    ) -> List[Optional[str]]:
+        timestamps = summary.get("log_timestamps")
+        if has_additional_output or not isinstance(timestamps, list):
+            return []
+        runtime_lines = self._bounded_log_lines(payload, summary.get("logs"))
+        if runtime_lines != log_lines[prefix_count:] or len(timestamps) != len(runtime_lines):
+            return []
+        return [None] * prefix_count + [value if isinstance(value, str) else None for value in timestamps]
+
     def _runtime_stop_error(self, payload: Dict[str, Any], summary: Dict[str, Any]) -> str:
         """The runtime's own stop reason (wall clock, silence, cleanup) when it is not already in the logs."""
         error = summary.get("error")
@@ -2068,6 +2149,7 @@ class WorkerAgentService:
                     result_summary=result_summary,
                     log_lines=execution.log_lines,
                     lease_token=job.get("lease_token"),
+                    **({"log_timestamps": execution.log_timestamps} if any(execution.log_timestamps) else {}),
                 )
             except Exception as exc:
                 if execution.status == JobStatus.CANCELED and isinstance(exc, ValueError) and "canceled" in str(exc).lower():
@@ -2214,12 +2296,21 @@ class WorkerAgentService:
                 if stop_error:
                     result_summary["error"] = stop_error
                 log_lines = self._bounded_log_lines(payload, summary.get("logs"), summary.get("stderr"), stop_error)
-                if context_line := self._storage_context_log_line(payload):
+                context_line = self._storage_context_log_line(payload)
+                if context_line:
                     log_lines = [context_line] + log_lines
+                log_timestamps = self._aligned_runtime_log_timestamps(
+                    payload,
+                    summary,
+                    log_lines,
+                    prefix_count=1 if context_line else 0,
+                    has_additional_output=bool(summary.get("stderr")) or bool(stop_error),
+                )
                 return WorkerJobExecutionResult(
                     status=self._runtime_status(summary),
                     result_summary=result_summary,
                     log_lines=log_lines,
+                    log_timestamps=log_timestamps,
                 )
 
             if command == "snapshots.list":
@@ -2256,6 +2347,13 @@ class WorkerAgentService:
                     cancel_check,
                     progress_reporter.callback if progress_reporter else None,
                 )
+                log_lines = self._bounded_log_lines(payload, summary.get("logs"), summary.get("stderr"))
+                log_timestamps = self._aligned_runtime_log_timestamps(
+                    payload,
+                    summary,
+                    log_lines,
+                    has_additional_output=bool(summary.get("stderr")),
+                )
                 return WorkerJobExecutionResult(
                     status=self._runtime_status(summary),
                     result_summary={
@@ -2264,7 +2362,8 @@ class WorkerAgentService:
                         "stats": summary.get("stats", {}),
                         "stats_by_mode": summary.get("stats_by_mode", {}),
                     },
-                    log_lines=self._bounded_log_lines(payload, summary.get("logs"), summary.get("stderr")),
+                    log_lines=log_lines,
+                    log_timestamps=log_timestamps,
                 )
 
             if command == "storage.about":
@@ -2287,10 +2386,18 @@ class WorkerAgentService:
                 stop_error = self._runtime_stop_error(payload, summary)
                 if stop_error:
                     retention_summary["error"] = stop_error
+                log_lines = self._bounded_log_lines(payload, summary.get("logs"), summary.get("stderr"), stop_error)
+                log_timestamps = self._aligned_runtime_log_timestamps(
+                    payload,
+                    summary,
+                    log_lines,
+                    has_additional_output=bool(summary.get("stderr")) or bool(stop_error),
+                )
                 return WorkerJobExecutionResult(
                     status=self._runtime_status(summary),
                     result_summary=retention_summary,
-                    log_lines=self._bounded_log_lines(payload, summary.get("logs"), summary.get("stderr"), stop_error),
+                    log_lines=log_lines,
+                    log_timestamps=log_timestamps,
                 )
 
             if command in ("restore.dry_run", "restore.run"):
@@ -2335,10 +2442,17 @@ class WorkerAgentService:
                         if status == JobStatus.FAILED
                         else "Restore runtime completed without logs."
                     ]
+                log_timestamps = self._aligned_runtime_log_timestamps(
+                    payload,
+                    summary,
+                    log_lines,
+                    has_additional_output=bool(summary.get("stderr")) or bool(summary.get("error")),
+                )
                 return WorkerJobExecutionResult(
                     status=status,
                     result_summary=restore_summary,
                     log_lines=log_lines,
+                    log_timestamps=log_timestamps,
                 )
 
             return WorkerJobExecutionResult(

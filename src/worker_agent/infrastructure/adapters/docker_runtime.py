@@ -1,3 +1,4 @@
+import inspect
 import json
 import math
 import os
@@ -22,8 +23,31 @@ except ModuleNotFoundError:
 logger = logging.getLogger(__name__)
 
 
+def accepts_timestamp_callback(callback: Callable[..., Any]) -> bool:
+    """True when a runtime output callback accepts parallel timestamp metadata."""
+    try:
+        parameters = list(inspect.signature(callback).parameters.values())
+    except (TypeError, ValueError):
+        return True
+    positional = 0
+    variadic = False
+    for parameter in parameters:
+        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            positional += 1
+        elif parameter.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+            variadic = True
+    return variadic or positional >= 2
+
+
 class DockerRuntimeAdapter(RuntimePort):
     runtime_kind = "docker"
+    # Real Docker Engine stream timestamps (RFC3339Nano, e.g. "2024-05-05T10:00:00.123456789Z").
+    _DOCKER_LOG_TIMESTAMP_PATTERN = re.compile(
+        r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})) "
+    )
+    _DOCKER_LOG_TIMESTAMP_PREFIX_CANDIDATE = re.compile(
+        r"^\d{0,4}(?:-\d{0,2}(?:-\d{0,2}(?:T\d{0,2}(?::\d{0,2}(?::\d{0,2}(?:\.\d{0,9})?(?:Z|[+-]\d{0,2}(?::\d{0,2})?)?)?)?)?)?)?$"
+    )
     DEFAULT_RESTORE_RUNTIME_TIMEOUT_SECONDS = 6 * 60 * 60
     MAX_RUNTIME_TIMEOUT_SECONDS = 24 * 60 * 60
     DEFAULT_IDLE_TIMEOUT_SECONDS = 900.0
@@ -787,14 +811,32 @@ class DockerRuntimeAdapter(RuntimePort):
             "exceeded": False,
             "error": None,
             "logs": "",
+            "log_timestamps": [],
             "stream": None,
         }
 
         def consume() -> None:
             pending = ""
             safe_parts: List[str] = []
+            line_timestamps: List[Optional[str]] = []
             raw_size = 0
+            multiline_secret = any(("\n" in secret) or ("\r" in secret) for secret in secrets)
+            timestamp_pattern = self._DOCKER_LOG_TIMESTAMP_PATTERN
             max_secret_tail = max((len(secret) - 1 for secret in secrets if secret), default=0)
+
+            def emit_piece(piece: str, piece_ts: List[Optional[str]]) -> None:
+                if not piece:
+                    return
+                safe_parts.append(piece)
+                if output_callback:
+                    try:
+                        if accepts_timestamp_callback(output_callback):
+                            output_callback(piece, piece_ts)
+                        else:
+                            # Legacy callbacks only consume the redacted text.
+                            output_callback(piece)
+                    except Exception:
+                        logger.debug("Runtime output callback failed", exc_info=True)
 
             def safe_cutoff(value: str) -> int:
                 hold = 0
@@ -825,8 +867,72 @@ class DockerRuntimeAdapter(RuntimePort):
                         return max(0, cutoff)
                     cutoff = crossing_end
 
+            timestamp_prefix_pending = ""
+            at_line_start = True
+            current_line_timestamp: Optional[str] = None
+            current_line_timestamp_sent = False
+
+            def process_safe_text(value: str, *, final: bool = False) -> None:
+                nonlocal timestamp_prefix_pending, at_line_start
+                nonlocal current_line_timestamp, current_line_timestamp_sent
+                data = timestamp_prefix_pending + value
+                timestamp_prefix_pending = ""
+                output_parts: List[str] = []
+                callback_timestamps: List[Optional[str]] = []
+                for part in data.splitlines(keepends=True):
+                    terminated = part.endswith(("\n", "\r"))
+                    content = part
+                    if at_line_start:
+                        match = timestamp_pattern.match(part)
+                        if match:
+                            current_line_timestamp = None if multiline_secret else match.group(1)
+                            current_line_timestamp_sent = False
+                            content = part[match.end():]
+                            at_line_start = False
+                        elif (
+                            not terminated
+                            and self._DOCKER_LOG_TIMESTAMP_PREFIX_CANDIDATE.fullmatch(part)
+                        ):
+                            timestamp_prefix_pending = part
+                            continue
+                        else:
+                            current_line_timestamp = None
+                            current_line_timestamp_sent = False
+                            at_line_start = False
+                    if content:
+                        output_parts.append(content)
+                        if not current_line_timestamp_sent:
+                            callback_timestamps.append(current_line_timestamp)
+                            current_line_timestamp_sent = True
+                        else:
+                            callback_timestamps.append(None)
+                    if terminated:
+                        if not current_line_timestamp_sent:
+                            callback_timestamps.append(current_line_timestamp)
+                        line_timestamps.append(current_line_timestamp)
+                        current_line_timestamp = None
+                        current_line_timestamp_sent = False
+                        at_line_start = True
+                if final and timestamp_prefix_pending:
+                    output_parts.insert(0, timestamp_prefix_pending)
+                    callback_timestamps.insert(0, None)
+                    timestamp_prefix_pending = ""
+                    current_line_timestamp = None
+                    current_line_timestamp_sent = True
+                    at_line_start = False
+                safe = self._redact_text("".join(output_parts), secrets)
+                if safe:
+                    if multiline_secret:
+                        callback_timestamps = [None] * len(safe.splitlines())
+                    emit_piece(safe, callback_timestamps)
+                if final and current_line_timestamp_sent:
+                    line_timestamps.append(current_line_timestamp)
+                    current_line_timestamp = None
+                    current_line_timestamp_sent = False
+                    at_line_start = True
+
             try:
-                stream = container.logs(stdout=True, stderr=True, timestamps=False, stream=True, follow=True)
+                stream = container.logs(stdout=True, stderr=True, timestamps=True, stream=True, follow=True)
                 state["stream"] = stream
                 state["started"] = True
                 for chunk in self._iter_output_chunks(stream):
@@ -842,30 +948,26 @@ class DockerRuntimeAdapter(RuntimePort):
                     text = bounded.decode("utf-8", errors="replace")
                     pending += text
                     cutoff = safe_cutoff(pending)
-                    if cutoff:
-                        emit = pending[:cutoff]
-                        pending = pending[cutoff:]
-                        safe = self._redact_text(emit, secrets)
-                        safe_parts.append(safe)
-                        if output_callback and safe:
-                            try:
-                                output_callback(safe)
-                            except Exception:
-                                logger.debug("Runtime output callback failed", exc_info=True)
+                    if not cutoff:
+                        continue
+                    raw_emit = pending[:cutoff]
+                    pending = pending[cutoff:]
+                    process_safe_text(raw_emit)
                     if len(bounded) < len(raw):
                         state["exceeded"] = True
                         break
-                safe = self._redact_text(pending, secrets)
-                safe_parts.append(safe)
-                if output_callback and safe:
-                    try:
-                        output_callback(safe)
-                    except Exception:
-                        logger.debug("Runtime output callback failed", exc_info=True)
+                process_safe_text(pending, final=True)
                 state["logs"] = "".join(safe_parts)
+                if multiline_secret:
+                    line_timestamps = [None] * len(state["logs"].splitlines())
+                state["log_timestamps"] = line_timestamps
             except Exception as exc:
                 state["error"] = exc
-                state["logs"] = "".join(safe_parts) + self._redact_text(pending, secrets)
+                process_safe_text(pending, final=True)
+                state["logs"] = "".join(safe_parts)
+                if multiline_secret:
+                    line_timestamps = [None] * len(state["logs"].splitlines())
+                state["log_timestamps"] = line_timestamps
 
         thread = threading.Thread(target=consume, daemon=True, name="runtime-log-stream")
         thread.start()
@@ -1363,6 +1465,7 @@ class DockerRuntimeAdapter(RuntimePort):
             if stream_state and stream_state.get("started") and not stream_state.get("error"):
                 combined = stream_state.get("logs", "")
                 exceeded = bool(stream_state.get("exceeded"))
+                stream_timestamps = list(stream_state.get("log_timestamps") or [])
             else:
                 combined, exceeded = self._fallback_container_logs(
                     container,
@@ -1370,6 +1473,7 @@ class DockerRuntimeAdapter(RuntimePort):
                     output_limit,
                     output_callback,
                 )
+                stream_timestamps = []
             restore_evidence, restore_error = self._read_restore_result(restore_result_path, secrets) if restore_result_path else (None, None)
             if exceeded:
                 failure = self._failure_result("runtime logs exceeded the permitted limit", False, secrets, 413)
@@ -1382,6 +1486,15 @@ class DockerRuntimeAdapter(RuntimePort):
                 return failure
             success = status_code == 0 and (not restore_evidence or restore_evidence.get("status") == "succeeded")
             output = {"success": success, "status_code": status_code, "logs": combined, "stderr": ""}
+            if (
+                combined
+                and stream_timestamps
+                and len(stream_timestamps) == len(combined.splitlines())
+                and any(stamp is not None for stamp in stream_timestamps)
+            ):
+                # Optional parallel metadata aligned with logs.splitlines();
+                # never fabricated for non-streamed or fallback output.
+                output["log_timestamps"] = stream_timestamps
             if restore_evidence:
                 output["restore_ownership"] = restore_evidence
                 if not success: output["error"] = restore_evidence.get("error") or f"runtime exited with status code {status_code}"

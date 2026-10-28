@@ -65,6 +65,13 @@ class WorkerPackagingTests(unittest.TestCase):
         self.assertIn("rclone-v1.75.2-COPYING", spec)
         self.assertNotIn("tar.exe", spec.lower())
 
+    def test_launcher_version_resource_uses_pyinstaller_varstruct_translation(self):
+        version_file = Path("build/vaultline-worker-launcher.version")
+        source = version_file.read_text(encoding="utf-8")
+
+        self.assertIn("VarFileInfo([VarStruct('Translation', [0x0409, 0x04B0])])", source)
+        self.assertNotIn("Translation(", source)
+
     def test_stable_launcher_and_replaceable_runtime_have_separate_msi_roles(self):
         launcher_spec_path = Path("build/vaultline-worker-launcher.spec")
         runtime_spec = Path("build/vaultline-worker.spec").read_text(encoding="utf-8")

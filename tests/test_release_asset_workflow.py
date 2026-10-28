@@ -288,7 +288,11 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertLess(qemu, buildx)
         self.assertLess(buildx, login)
         self.assertIn("platforms: arm64", image_job)
-        self.assertIn("driver-opts: image=public.ecr.aws/vend/moby/buildkit:buildx-stable-1", image_job)
+        self.assertIn(
+            "driver-opts: image=mirror.gcr.io/moby/buildkit@sha256:cec9f139f45e93c5c69c60f8b07cfad9f43f4ef6b6a6cd917527fea5ff2e3dea",
+            image_job,
+        )
+        self.assertNotIn("public.ecr.aws/vend/moby/buildkit", image_job)
         self.assertEqual(image_job.count("docker buildx build"), 3)
         self.assertEqual(image_job.count("--push"), 3)
         self.assertNotIn('docker push "$tag"', image_job)

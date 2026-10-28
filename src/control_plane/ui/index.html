@@ -5990,14 +5990,14 @@ docker compose up -d
         container.innerHTML = `<div class="log-line info">${terminal ? "Sin logs disponibles para esta ejecucion." : "Esperando logs del worker..."}</div>`;
         return;
       }
-      renderJobLogLinesInto(container, lines, job.id, line => {
+      renderJobLogLinesInto(container, lines, job.id, (line, timestampMarkup = "") => {
         const lower = line.toLowerCase();
         let cls = "info";
         if (lower.includes("error") || lower.includes("err:") || lower.includes("failed") || lower.includes("traceback") || lower.includes("exception")) cls = "error";
         else if (lower.includes("warn") || lower.includes("warning")) cls = "warning";
         else if (lower.includes("info") || lower.includes("status") || lower.includes("starting") || lower.includes("success") || lower.includes("snapshot") || lower.includes("backup")) cls = "info";
-        return `<div class="log-line ${cls}">${escapeHtml(line)}</div>`;
-      });
+        return `<div class="log-line ${cls}">${timestampMarkup}${escapeHtml(line)}</div>`;
+      }, job.log_timestamps);
     }
 
     /* Shared Portainer-style job log viewer: used by both log panels. */
@@ -6033,10 +6033,14 @@ docker compose up -d
           wrapLines: true,
           visibleLines: JOB_LOG_VIEWER_DEFAULT_LINES,
           search: "",
+          showTimestamps: false,
           jobId: null,
           lastLines: [],
+          lastTimestamps: [],
+          hasSourceTimestamps: false,
+          timestampButton: null,
           renderedLines: [],
-          classifyLine: line => `<div class="log-line info">${escapeHtml(line)}</div>`,
+          classifyLine: (line, timestampMarkup = "") => `<div class="log-line info">${timestampMarkup}${escapeHtml(line)}</div>`,
         };
         jobLogViewers.set(container, viewer);
         bindJobLogViewerControls(container, viewer);
@@ -6063,6 +6067,14 @@ docker compose up -d
         wrapButton.setAttribute("aria-pressed", viewer.wrapLines ? "true" : "false");
         applyJobLogViewerState(container, viewer);
       });
+      const timestampButton = control("timestamps");
+      viewer.timestampButton = timestampButton;
+      if (timestampButton) timestampButton.addEventListener("click", () => {
+        if (!viewer.hasSourceTimestamps) return;
+        viewer.showTimestamps = !viewer.showTimestamps;
+        syncJobLogTimestampControl(viewer);
+        if (!viewer.paused) applyJobLogViewerState(container, viewer);
+      });
       const copyButton = control("copy");
       if (copyButton) copyButton.addEventListener("click", () => copyJobLogLines(viewer, copyButton));
       const downloadButton = control("download");
@@ -6076,32 +6088,58 @@ docker compose up -d
       });
     }
 
-    function renderJobLogLinesInto(container, lines, jobId, classifyLine) {
+    function syncJobLogTimestampControl(viewer) {
+      const button = viewer.timestampButton;
+      if (!button) return;
+      button.disabled = !viewer.hasSourceTimestamps;
+      if (!viewer.hasSourceTimestamps) viewer.showTimestamps = false;
+      button.setAttribute("aria-pressed", viewer.showTimestamps ? "true" : "false");
+      button.title = viewer.hasSourceTimestamps
+        ? (viewer.showTimestamps ? "Ocultar marcas de tiempo de origen" : "Mostrar marcas de tiempo de origen")
+        : "Sin marcas de tiempo en el origen de logs";
+    }
+
+    function renderJobLogLinesInto(container, lines, jobId, classifyLine, timestamps) {
       if (!container) return;
       const viewer = jobLogViewerOf(container);
       if (!viewer) return;
       if (typeof jobId === "string" && jobId) viewer.jobId = jobId;
       if (typeof classifyLine === "function") viewer.classifyLine = classifyLine;
       viewer.lastLines = Array.isArray(lines) ? lines : [];
+      viewer.lastTimestamps = Array.isArray(timestamps) && timestamps.length === viewer.lastLines.length
+        ? timestamps.map(timestamp => typeof timestamp === "string" && timestamp ? timestamp : null)
+        : viewer.lastLines.map(() => null);
+      viewer.hasSourceTimestamps = viewer.lastTimestamps.some(timestamp => typeof timestamp === "string");
+      syncJobLogTimestampControl(viewer);
       if (viewer.paused) return;
       applyJobLogViewerState(container, viewer);
     }
 
     function applyJobLogViewerState(container, viewer) {
       const total = viewer.lastLines.length;
-      const visible = total > viewer.visibleLines ? viewer.lastLines.slice(total - viewer.visibleLines) : viewer.lastLines.slice();
+      const firstVisibleIndex = Math.max(0, total - viewer.visibleLines);
+      const visibleIndexes = Array.from({ length: total - firstVisibleIndex }, (_, index) => firstVisibleIndex + index);
       const needle = viewer.search.trim().toLowerCase();
-      const matched = needle ? visible.filter(line => line.toLowerCase().includes(needle)) : null;
-      const displayed = matched || visible;
+      const matchedIndexes = needle
+        ? visibleIndexes.filter(index => viewer.lastLines[index].toLowerCase().includes(needle))
+        : visibleIndexes;
+      const displayed = matchedIndexes.map(index => viewer.lastLines[index]);
       viewer.renderedLines = displayed;
       const filterNote = needle
-        ? `<div class="log-line info log-filter-note">Filtro "${escapeHtml(viewer.search)}": ${displayed.length} de ${visible.length} lineas coinciden</div>`
+        ? `<div class="log-line info log-filter-note">Filtro "${escapeHtml(viewer.search)}": ${displayed.length} de ${visibleIndexes.length} lineas coinciden</div>`
         : "";
       const emptyMessage = displayed.length
         ? ""
         : `<div class="log-line info">${needle ? "Ninguna linea coincide con el filtro." : "Sin lineas dentro del limite seleccionado."}</div>`;
       const atBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - JOB_LOG_SCROLL_BOTTOM_EPSILON;
-      container.innerHTML = emptyMessage || `${filterNote}${displayed.map(line => viewer.classifyLine(line)).join("")}`;
+      const renderedMarkup = matchedIndexes.map(index => {
+        const timestamp = viewer.lastTimestamps[index];
+        const timestampMarkup = viewer.showTimestamps && typeof timestamp === "string"
+          ? `<span class="log-timestamp">${escapeHtml(timestamp)}</span> `
+          : "";
+        return viewer.classifyLine(viewer.lastLines[index], timestampMarkup);
+      }).join("");
+      container.innerHTML = emptyMessage || `${filterNote}${renderedMarkup}`;
       if (container.classList && typeof container.classList.toggle === "function") {
         container.classList.toggle("log-wrap-disabled", !viewer.wrapLines);
       }
@@ -7164,12 +7202,12 @@ docker compose up -d
         container.innerHTML = `<div class="log-line info">Sin logs disponibles</div>`;
         return;
       }
-      renderJobLogLinesInto(container, lines, job.id, l => {
-        const escaped = escapeHtml(l);
-        if (/ERROR|FAILED|CRITICAL/i.test(l)) return `<div class="log-line error">${escaped}</div>`;
-        if (/WARN/i.test(l)) return `<div class="log-line warn">${escaped}</div>`;
-        return `<div class="log-line info">${escaped}</div>`;
-      });
+      renderJobLogLinesInto(container, lines, job.id, (line, timestampMarkup = "") => {
+        const escaped = escapeHtml(line);
+        if (/ERROR|FAILED|CRITICAL/i.test(line)) return `<div class="log-line error">${timestampMarkup}${escaped}</div>`;
+        if (/WARN/i.test(line)) return `<div class="log-line warn">${timestampMarkup}${escaped}</div>`;
+        return `<div class="log-line info">${timestampMarkup}${escaped}</div>`;
+      }, job.log_timestamps);
     }
 
     function renderJobTableBodyPreservingAccordion(tbody, markup) {

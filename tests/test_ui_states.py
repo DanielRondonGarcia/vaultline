@@ -3483,8 +3483,9 @@ class PortainerStyleLogViewerUiStateTests(unittest.TestCase):
         for marker in (
             "const JOB_LOG_VIEWER_DEFAULT_LINES = 1000;",
             "const JOB_LOG_SCROLL_BOTTOM_EPSILON = 32;",
-            "function renderJobLogLinesInto(container, lines, jobId, classifyLine) {",
-            "viewer.lastLines.slice(total - viewer.visibleLines)",
+            "function renderJobLogLinesInto(container, lines, jobId, classifyLine, timestamps) {",
+            "const firstVisibleIndex = Math.max(0, total - viewer.visibleLines);",
+            "visibleIndexes.filter(index => viewer.lastLines[index].toLowerCase().includes(needle))",
             "if (viewer.paused) return;",
         ):
             self.assertIn(marker, self.source)
@@ -3503,7 +3504,7 @@ class PortainerStyleLogViewerUiStateTests(unittest.TestCase):
             apply_source.index("const atBottom ="),
             apply_source.index(scroll_to_bottom),
         )
-        self.assertIn("line.toLowerCase().includes(needle)", apply_source)
+        self.assertIn("viewer.lastLines[index].toLowerCase().includes(needle)", apply_source)
 
         target_render = re.search(r"function renderTargetJobLogsInto\(job, root\) \{.*?\n    \}", self.source, re.S)
         self.assertIsNotNone(target_render)
@@ -3513,14 +3514,22 @@ class PortainerStyleLogViewerUiStateTests(unittest.TestCase):
         self.assertIsNotNone(accordion_render)
         self.assertIn("renderJobLogLinesInto(container", accordion_render.group(0))
 
-    def test_timestamp_display_control_is_real_or_honestly_disabled(self):
+    def test_timestamp_display_control_uses_only_aligned_source_metadata(self):
         viewer_block_start = self.source.index("const JOB_LOG_VIEWER_DEFAULT_LINES = 1000;")
         viewer_block_end = self.source.index("function getTargetLogHost()")
         viewer_block = self.source[viewer_block_start:viewer_block_end]
-        # No fabricated per-line timestamps: the log payload carries plain strings without timestamps.
         self.assertNotIn("new Date", viewer_block)
+        self.assertIn("viewer.showTimestamps", viewer_block)
+        self.assertIn("viewer.lastTimestamps", viewer_block)
+        self.assertIn("job.log_timestamps", self.source)
         toolbar_source = self._toolbar_markup_source()
         self.assertIn("data-log-timestamps aria-pressed=\"false\" disabled title=\"Sin marcas de tiempo en el origen de logs\"", toolbar_source)
+        target_render = re.search(r"function renderTargetJobLogsInto\(job, root\) \{.*?\n    \}", self.source, re.S)
+        accordion_render = re.search(r"function renderJobLogsInto\(job, container\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(target_render)
+        self.assertIsNotNone(accordion_render)
+        self.assertIn("job.log_timestamps", target_render.group(0))
+        self.assertIn("job.log_timestamps", accordion_render.group(0))
 
     def test_copy_and_download_operate_on_lines_displayed_and_css_supports_controls(self):
         copy = re.search(r"function copyJobLogLines\(viewer, feedbackButton\) \{.*?\n    \}", self.source, re.S)
@@ -3536,6 +3545,7 @@ class PortainerStyleLogViewerUiStateTests(unittest.TestCase):
 
         for marker in (
             ".log-toolbar { display: flex; align-items: center;",
+            ".log-timestamp { color: #94a3b8;",
             ".log-wrap-disabled .log-line",
             ".log-wrapper-disabled",  # intentionally absent: guards against typos below
         ):
@@ -3570,7 +3580,7 @@ class StubElement {
   addEventListener(type, handler) { (this.listeners[type] = this.listeners[type] || []).push(handler); }
   setAttribute(name, value) { this.attrs.set(name, String(value)); }
   fire(type) { (this.listeners[type] || []).slice().forEach(handler => handler()); }
-  click() { this.fire("click"); }
+  click() { if (!this.disabled) this.fire("click"); }
   closest(selector) { return selector === ".log-panel" ? this.panel : null; }
   querySelector(selector) { return selector.startsWith("[data-log-") ? (this.controls[selector] || null) : null; }
 }
@@ -3581,6 +3591,7 @@ function buildPanelLogControls() {
   const controls = {};
   for (const name of ["search", "line-count", "wrap", "timestamps", "copy", "download", "pause"]) {
     const element = new StubElement();
+    if (name === "timestamps") element.disabled = true;
     controls[`[data-log-${name}]`] = element;
     element.toolbar = toolbar;
   }
@@ -3591,7 +3602,7 @@ function buildPanelLogControls() {
   return { container, panel, toolbar, controls };
 }
 const failures = [];
-const classify = line => `<div class="log-line info">${escapeHtml(line)}</div>`;
+const classify = (line, timestampMarkup = "") => `<div class="log-line info">${timestampMarkup}${escapeHtml(line)}</div>`;
 
 // A) Latest 1,000 lines by default and auto-follow at the bottom.
 {
@@ -3663,19 +3674,42 @@ const classify = line => `<div class="log-line info">${escapeHtml(line)}</div>`;
   let copied = null;
   Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: text => { copied = text; return { then: callback => callback() }; } } }, configurable: true });
   const copiedButton = controls["[data-log-copy]"];
-  renderJobLogLinesInto(container, ["a", "b"], "job-c", classify);
+  const sourceTime = "2024-05-05T10:00:00.123456789Z";
+  renderJobLogLinesInto(container, ["a", "b"], "job-c", classify, [sourceTime, null]);
+  const timestampButton = controls["[data-log-timestamps]"];
+  if (timestampButton.disabled) failures.push("timestamp toggle stayed disabled despite genuine source metadata");
+  timestampButton.click();
+  if (timestampButton.attrs.get("aria-pressed") !== "true") failures.push("timestamp toggle did not update aria-pressed");
+  if (!container.innerHTML.includes(`<span class="log-timestamp">${sourceTime}</span> a`)) failures.push("source time was not rendered beside its aligned line");
+  if (container.innerHTML.includes(`${sourceTime}</span> b`)) failures.push("source time was attached to the wrong line");
+  if ((container.innerHTML.match(/class="log-timestamp"/g) || []).length !== 1) failures.push("missing source timestamps were rendered as if present");
+  const nextTime = "2024-05-05T10:00:01Z";
+  renderJobLogLinesInto(container, ["a", "b", "c"], "job-c", classify, [sourceTime, null, nextTime]);
+  if (!container.innerHTML.includes(`<span class="log-timestamp">${nextTime}</span> c`)) failures.push("live update did not render the new aligned source time");
+  if ((container.innerHTML.match(/class="log-timestamp"/g) || []).length !== 2) failures.push("live update rendered a timestamp for a line without one");
   copyJobLogLines(jobLogViewers.get(container), copiedButton);
-  if (copied !== "a\nb") failures.push(`copy did not take the displayed lines: ${copied}`);
+  if (copied !== "a\nb\nc") failures.push(`copy did not preserve plain source lines: ${copied}`);
   if (copiedButton.textContent !== "Copiado") failures.push("copy feedback missing");
 
   let downloadedName = null;
   let downloadedHref = null;
+  let downloadedText = null;
+  globalThis.Blob = class { constructor(parts) { downloadedText = parts.join(""); } };
   const link = { set href(value) { downloadedHref = value; }, download: null, click() { downloadedName = this.download; } };
   globalThis.document = { createElement: () => link };
   globalThis.URL = { createObjectURL: () => "blob:test", revokeObjectURL: () => {} };
   downloadJobLogLines(jobLogViewers.get(container));
   if (downloadedName !== "job-log-job-c.log") failures.push(`download name wrong: ${downloadedName}`);
   if (downloadedHref !== "blob:test") failures.push("download blob href missing");
+  if (downloadedText !== "a\nb\nc\n") failures.push(`download changed the plain source lines: ${downloadedText}`);
+}
+
+// G) Legacy logs remain untimestamped and cannot enable the timestamp control.
+{
+  const { container, controls } = buildPanelLogControls();
+  renderJobLogLinesInto(container, ["plain legacy line"], "job-legacy", classify);
+  if (!controls["[data-log-timestamps]"].disabled) failures.push("timestamp toggle enabled without source metadata");
+  if (container.innerHTML.includes("log-timestamp")) failures.push("legacy line gained a fabricated timestamp");
 }
 
 if (failures.length) throw new Error(failures.join("; "));

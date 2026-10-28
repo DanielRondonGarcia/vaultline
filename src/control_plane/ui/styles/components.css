@@ -1041,6 +1041,7 @@ details.form-section[open] > .form-body { border-top: 1px solid var(--border); p
   line-height: 1.6;
 }
 .log-line { padding: 2px 0; white-space: pre-wrap; word-break: break-word; }
+.log-timestamp { color: #94a3b8; margin-right: .6em; }
 .log-line.info { color: #93c5fd; }
 .log-line.warning { color: #fbbf24; }
 .log-line.error { color: #f87171; }

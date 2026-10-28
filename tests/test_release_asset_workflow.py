@@ -267,10 +267,9 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertIn("git tag -a \"${VERSION}\"", self.workflow)
         self.assertIn("git push origin \"${VERSION}\"", self.workflow)
 
-    def test_existing_image_tags_native_amd64_platform_and_worker_options_are_preserved(self):
+    def test_existing_image_tags_multiarch_platform_and_worker_options_are_preserved(self):
         image_job = self.image_build_job()
-        self.assertEqual(image_job.count("--platform linux/amd64"), 3)
-        self.assertNotIn("linux/arm64", image_job)
+        self.assertEqual(image_job.count("--platform linux/amd64,linux/arm64"), 3)
         self.assertIn("ubuntu-24.04-arm", self.workflow)
         for target in ("backup-runtime", "control-plane", "worker"):
             self.assertIn(f"--target {target}", image_job)
@@ -281,19 +280,21 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertIn("type=raw,value=latest", self.workflow)
         self.assertIn("INSTALL_DOCKER_CLI=true", self.workflow)
 
-    def test_release_images_use_standard_docker_cli_without_buildx_or_gha_cache(self):
+    def test_release_images_use_mirrored_buildx_without_gha_cache(self):
         image_job = self.image_build_job()
-        for forbidden in (
-            "docker/setup-buildx-action@v3",
-            "docker/build-push-action@v6",
-            "docker buildx",
-            "buildx-stable-1",
-            "docker/setup-qemu-action@v3",
-            "type=gha",
-        ):
-            self.assertNotIn(forbidden, image_job)
-        self.assertEqual(image_job.count("docker build"), 3)
-        self.assertEqual(image_job.count('docker push "$tag"'), 3)
+        qemu = image_job.index("docker/setup-qemu-action@v3")
+        buildx = image_job.index("docker/setup-buildx-action@v3")
+        login = image_job.index("docker/login-action@v3")
+        self.assertLess(qemu, buildx)
+        self.assertLess(buildx, login)
+        self.assertIn("platforms: arm64", image_job)
+        self.assertIn("driver-opts: image=public.ecr.aws/vend/moby/buildkit:buildx-stable-1", image_job)
+        self.assertEqual(image_job.count("docker buildx build"), 3)
+        self.assertEqual(image_job.count("--push"), 3)
+        self.assertNotIn('docker push "$tag"', image_job)
+        self.assertNotIn("type=gha", image_job)
+        self.assertNotIn("cache-from:", image_job)
+        self.assertNotIn("cache-to:", image_job)
 
     def test_release_image_builds_use_mirror_pinned_python_base_image(self):
         self.assertRegex(
@@ -321,10 +322,11 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
                 self.assertIn(f"IMAGE_TAGS: ${{{{ steps.{metadata_id}.outputs.tags }}}}", step)
                 self.assertIn(f"IMAGE_LABELS: ${{{{ steps.{metadata_id}.outputs.labels }}}}", step)
                 self.assertIn(f"--target {target}", step)
-                self.assertIn("--platform linux/amd64", step)
+                self.assertIn("--platform linux/amd64,linux/arm64", step)
+                self.assertIn("docker buildx build", step)
+                self.assertIn("--push", step)
                 self.assertIn('docker_args+=(--label "$label")', step)
                 self.assertIn('docker_args+=(--tag "$tag")', step)
-                self.assertIn('docker push "$tag"', step)
                 self.assertIn(
                     "PYTHON_BASE_IMAGE=mirror.gcr.io/library/python@sha256:0a310eeecf4e1f5a0743f9a6520c90c88d089c903ca5fd283f501e3a805f5f89",
                     step,

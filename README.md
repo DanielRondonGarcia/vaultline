@@ -380,7 +380,7 @@ El workflow **Create Release** en GitHub Actions maneja el tagging y publicació
    - Crea y push el Git tag
    - Genera el changelog desde el tag anterior
    - Crea el GitHub Release
-   - Construye imágenes Docker `linux/amd64`, paquetes Debian `amd64`/`arm64` e instaladores Windows `amd64`.
+   - Construye imágenes Docker multi-arch (`linux/amd64` y `linux/arm64`), paquetes Debian `amd64`/`arm64` e instaladores Windows `amd64`.
    - En un release estable, publica a GHCR con tags `latest`, `{version}`, `{major}.{minor}`, `{major}`.
    - En un prerelease, publica solo el tag exacto `{version}` para las tres imágenes; no mueve `latest`, los canales mayor/menor ni el release estable más reciente de GitHub. Para probarlo, fija la misma versión en CP, worker y runtime.
 

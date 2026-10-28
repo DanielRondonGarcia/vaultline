@@ -1,0 +1,25 @@
+# Docker Multi-Architecture Release Images
+Scope: Restore dual-platform GHCR manifests for the backup runtime, Control Plane, and Worker images.
+Status: Implementation is authorized; image publication, release dispatch, and push are not authorized by this request.
+
+## Specs
+
+### S1 — Both Docker platforms
+User request, verbatim: “si, necesito ambas, porfa ajustalo”. In context, “ambas” refers to the previously proposed `linux/amd64` and `linux/arm64` platforms for the GHCR images required by the deployment: `ghcr.io/danielrondongarcia/vaultline`, `ghcr.io/danielrondongarcia/vaultline-control-plane`, and `ghcr.io/danielrondongarcia/vaultline-worker`.
+
+### S2 — ARM64 pull failure example
+Screenshot message, verbatim: “The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested”. Publish matching multi-platform manifests so Docker can select either architecture for each image while preserving the existing release tags and labels.
+
+## Tasks
+- T1 [done] | S1-S2 | Parent inline, test-first | Add regression coverage, then restore release Buildx/QEMU builds and pushes for all three image targets on `linux/amd64` and `linux/arm64`; preserve existing image names, tag policy, labels, Python base digest, and publish-job dependency gates | commit: pending; GREEN evidence in L6
+- T2 [in_progress] | S1-S2 | Parent inline | Correct architecture documentation, run focused tests and independent high-risk verification, commit the feature slice, and record that no image push or release was authorized | commit: pending
+
+## Log
+- L1: si, necesito ambas, porfa ajustalo
+- L2: The current `image-build` job uses `docker build --platform linux/amd64` for the backup runtime, Control Plane, and Worker. `README.md` promises both architectures, while its release instructions incorrectly say Docker images are amd64-only. `deploy/worker/README.md` also documents multi-architecture runtime/worker images. A prior validated release workflow used QEMU, Buildx with the ECR Public BuildKit mirror, and `docker/build-push-action@v6` to build and push all three platforms; current image publishing is not authorized.
+- L3: Engram task mirror creation failed with `unable to open database file (14)`; local ODD feature document and visible todo are authoritative until the memory service is available.
+- L4: TDD RED: `PYTHONDONTWRITEBYTECODE=1 python -m unittest tests.test_release_asset_workflow tests.test_worker_runtime_integration` ran 28 tests and failed as expected (5 failures, 1 error). The current workflow has no QEMU/Buildx setup or dual-platform action inputs; the legacy workflow tests still see amd64-only Docker builds and target syntax. No workflow implementation changed before this RED observation.
+- L5: Implementation choice: use `docker buildx build --platform linux/amd64,linux/arm64 --push` in the existing validated shell steps, retaining their non-empty tag guard and dynamic tag/label arguments. Add QEMU and Buildx setup with the previously validated ECR Public BuildKit mirror; do not enable GitHub Actions cache. This minimizes workflow churn while preserving both platform manifests.
+- L6: Implemented dual-platform Buildx/QEMU builds and pushes for all three GHCR image targets, preserving metadata tags, labels, APP_VERSION, the pinned GCR Python base digest, worker Docker CLI build arg, and release gates. Updated structural tests and corrected the README release-instructions architecture claim. GREEN: `PYTHONDONTWRITEBYTECODE=1 python -m unittest tests.test_release_asset_workflow tests.test_worker_runtime_integration` — 28 tests passed; `git diff --check` passed. Engram `mem_save` remains unavailable (`unable to open database file (14)`). No workflow dispatch, image publication, push, or release was performed; remote manifest proof therefore remains pending explicit publication authorization.
+- L7: Independent `gentle-ai-verify` verdict: S1 MET and S2 MET to the extent a commit can prove; confirmed all three image targets, both platforms, tag/label policy, pinned base, worker Docker CLI argument, empty-tag guards, and `publish-release` gate. Remote OCI manifests remain unverified because no publication was authorized. Verifier identified a stale amd64-only CLI comment; corrected to describe dual-platform Buildx push and disabled GHA cache. `gentle_review assess` returned high risk and `nativeRisk: unassessable` because the feature document is untracked; RDD is off, so no native review was started.
+- L8: Delivery slice boundary before commit: the Buildx/QEMU workflow setup and three dual-platform pushes, focused regression updates in `tests/test_release_asset_workflow.py` and `tests/test_worker_runtime_integration.py`, corrected README architecture claim, and this task record only. Existing unrelated `.atl/`, other ODD task documents, and tracked `__pycache__` changes remain excluded. No push, workflow dispatch, or image publication.

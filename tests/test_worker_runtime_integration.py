@@ -143,8 +143,7 @@ class KubernetesDependencyAndReleaseTests(unittest.TestCase):
         image_job = workflow.split("  image-build:", 1)[1].split("  publish-release:", 1)[0]
         native_linux_job = workflow.split("  native-linux:", 1)[1].split("  native-windows:", 1)[0]
 
-        self.assertEqual(image_job.count("--platform linux/amd64"), 3)
-        self.assertNotIn("linux/arm64", image_job)
+        self.assertEqual(image_job.count("--platform linux/amd64,linux/arm64"), 3)
         self.assertIn("--target backup-runtime", image_job)
         self.assertIn("--target control-plane", image_job)
         self.assertIn("--target worker", image_job)

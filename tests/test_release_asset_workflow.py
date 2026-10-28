@@ -191,6 +191,28 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertNotIn("WORKER_ENROLLMENT_TOKEN", smoke)
         self.assertNotIn("WORKER_SECRET", smoke)
 
+    def test_windows_msi_smoke_major_upgrade_accepts_only_zero_and_reboot_required_exit_codes(self):
+        # The updater (src/worker_agent/update.py) defines 0 and 3010 as install
+        # success; 3010 means a Windows restart is required. The release smoke
+        # must accept that same pair for the major upgrade and keep failing on
+        # every other nonzero msiexec exit code.
+        job = self.windows_job()
+        smoke = re.search(r"(?ms)- name: Smoke MSI.*?(?=^      - name: |\Z)", job)
+        self.assertIsNotNone(smoke, "an MSI smoke step is required")
+        smoke = smoke.group(0)
+        upgrade_check = re.search(
+            r"(?ms)\$upgrade = Start-Process msiexec.*?(?=\s*if \(-not \(Test-Path \$InstalledExe\)\))",
+            smoke,
+        )
+        self.assertIsNotNone(upgrade_check, "major-upgrade exit-code handling must precede the launcher assertions")
+        block = upgrade_check.group(0)
+        self.assertIn("$upgrade.ExitCode -ne 0", block)
+        self.assertRegex(block, r"\$upgrade\.ExitCode -ne 0 -and \$upgrade\.ExitCode -ne 3010")
+        self.assertIn('throw "major-upgrade msiexec /i exited with $($upgrade.ExitCode)"', block)
+        self.assertRegex(block, r"\$upgrade\.ExitCode -eq 3010\) \{ Write-Host ")
+        self.assertIn("a Windows restart is required", block)
+        self.assertNotRegex(block, r"-or \$upgrade\.ExitCode")
+
     def test_windows_artifact_uploads_exe_and_msi_together(self):
         job = self.windows_job()
         upload = re.search(r"(?ms)- name: Upload Windows .*?path: \|\n((?:            .*\n)+)", job)

@@ -325,7 +325,10 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $LowerRuntimeVersion -notmatch [regex]::Escape($LowerVersion.ToString())) { throw "lower MSI installed wrong runtime version: $LowerRuntimeVersion" }
           $LauncherHashBeforeUpgrade = (Get-FileHash -LiteralPath $InstalledExe -Algorithm SHA256).Hash
           $upgrade = Start-Process msiexec -ArgumentList '/i',"`"$Msi`"",'/qn','/norestart','/l*v','msi-upgrade.log' -Wait -PassThru
-          if ($upgrade.ExitCode -ne 0) { Show-LogTail 'msi-upgrade.log'; throw "major-upgrade msiexec /i exited with $($upgrade.ExitCode)" }
+          # 3010 is Windows Installer's success-with-reboot code, the same
+          # success pair the updater accepts in src/worker_agent/update.py.
+          if ($upgrade.ExitCode -ne 0 -and $upgrade.ExitCode -ne 3010) { Show-LogTail 'msi-upgrade.log'; throw "major-upgrade msiexec /i exited with $($upgrade.ExitCode)" }
+          if ($upgrade.ExitCode -eq 3010) { Write-Host "major upgrade completed with exit code 3010; a Windows restart is required" }
           if (-not (Test-Path $InstalledExe)) { Show-LogTail 'msi-upgrade.log'; throw "stable launcher missing at $InstalledExe" }
           if (-not (Test-Path $InstalledRuntime)) { Show-LogTail 'msi-upgrade.log'; throw "replaceable runtime missing at $InstalledRuntime" }
           $LauncherHashAfterUpgrade = (Get-FileHash -LiteralPath $InstalledExe -Algorithm SHA256).Hash

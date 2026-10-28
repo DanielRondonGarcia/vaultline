@@ -5940,6 +5940,7 @@ docker compose up -d
             </div>
             <button type="button" class="btn ghost xs" id="${closeId}" data-target-log-close aria-label="Cerrar logs de ${escapeHtml(targetLabel)}">Cerrar</button>
           </div>
+          ${logViewerToolbarMarkup()}
           <div class="log-container" id="${containerId}" data-target-log-container><div class="log-line info">Cargando logs...</div></div>
         </div>
       `;
@@ -5989,15 +5990,155 @@ docker compose up -d
         container.innerHTML = `<div class="log-line info">${terminal ? "Sin logs disponibles para esta ejecucion." : "Esperando logs del worker..."}</div>`;
         return;
       }
-      container.innerHTML = `${lines.map(line => {
+      renderJobLogLinesInto(container, lines, job.id, line => {
         const lower = line.toLowerCase();
         let cls = "info";
         if (lower.includes("error") || lower.includes("err:") || lower.includes("failed") || lower.includes("traceback") || lower.includes("exception")) cls = "error";
         else if (lower.includes("warn") || lower.includes("warning")) cls = "warning";
         else if (lower.includes("info") || lower.includes("status") || lower.includes("starting") || lower.includes("success") || lower.includes("snapshot") || lower.includes("backup")) cls = "info";
         return `<div class="log-line ${cls}">${escapeHtml(line)}</div>`;
-      }).join("")}`;
-      container.scrollTop = container.scrollHeight;
+      });
+    }
+
+    /* Shared Portainer-style job log viewer: used by both log panels. */
+    const JOB_LOG_VIEWER_DEFAULT_LINES = 1000;
+    const JOB_LOG_SCROLL_BOTTOM_EPSILON = 32;
+    const jobLogViewers = new WeakMap();
+
+    function logViewerToolbarMarkup() {
+      return `
+          <div class="log-toolbar" data-log-toolbar>
+            <input type="search" class="log-search-input" data-log-search placeholder="Buscar en logs" aria-label="Buscar en logs">
+            <select class="log-line-count" data-log-line-count aria-label="Lineas visibles">
+              <option value="100">100 lineas</option>
+              <option value="250">250 lineas</option>
+              <option value="500">500 lineas</option>
+              <option value="1000" selected>1000 lineas</option>
+            </select>
+            <button type="button" class="btn ghost xs" data-log-wrap aria-pressed="true" title="Alternar ajuste de lineas">Salto de linea</button>
+            <button type="button" class="btn ghost xs" data-log-timestamps aria-pressed="false" disabled title="Sin marcas de tiempo en el origen de logs">Marcas de tiempo</button>
+            <button type="button" class="btn ghost xs" data-log-copy title="Copiar lineas visibles">Copiar</button>
+            <button type="button" class="btn ghost xs" data-log-download title="Descargar lineas visibles">Descargar</button>
+            <button type="button" class="btn ghost xs" data-log-pause aria-pressed="false" title="Pausar o reanudar la actualizacion en vivo">Pausar</button>
+          </div>
+      `;
+    }
+
+    function jobLogViewerOf(container) {
+      if (!container) return null;
+      let viewer = jobLogViewers.get(container);
+      if (!viewer) {
+        viewer = {
+          paused: false,
+          wrapLines: true,
+          visibleLines: JOB_LOG_VIEWER_DEFAULT_LINES,
+          search: "",
+          jobId: null,
+          lastLines: [],
+          renderedLines: [],
+          classifyLine: line => `<div class="log-line info">${escapeHtml(line)}</div>`,
+        };
+        jobLogViewers.set(container, viewer);
+        bindJobLogViewerControls(container, viewer);
+      }
+      return viewer;
+    }
+
+    function bindJobLogViewerControls(container, viewer) {
+      const panel = container.closest ? container.closest(".log-panel") : null;
+      const toolbar = panel && panel.querySelector ? panel.querySelector("[data-log-toolbar]") : null;
+      if (!toolbar) return;
+      const control = name => toolbar.querySelector(`[data-log-${name}]`);
+      const searchInput = control("search");
+      if (searchInput) searchInput.addEventListener("input", () => { viewer.search = searchInput.value; applyJobLogViewerState(container, viewer); });
+      const lineCount = control("line-count");
+      if (lineCount) lineCount.addEventListener("change", () => {
+        const parsed = parseInt(lineCount.value, 10);
+        viewer.visibleLines = Number.isFinite(parsed) && parsed > 0 ? parsed : JOB_LOG_VIEWER_DEFAULT_LINES;
+        applyJobLogViewerState(container, viewer);
+      });
+      const wrapButton = control("wrap");
+      if (wrapButton) wrapButton.addEventListener("click", () => {
+        viewer.wrapLines = !viewer.wrapLines;
+        wrapButton.setAttribute("aria-pressed", viewer.wrapLines ? "true" : "false");
+        applyJobLogViewerState(container, viewer);
+      });
+      const copyButton = control("copy");
+      if (copyButton) copyButton.addEventListener("click", () => copyJobLogLines(viewer, copyButton));
+      const downloadButton = control("download");
+      if (downloadButton) downloadButton.addEventListener("click", () => downloadJobLogLines(viewer));
+      const pauseButton = control("pause");
+      if (pauseButton) pauseButton.addEventListener("click", () => {
+        viewer.paused = !viewer.paused;
+        pauseButton.textContent = viewer.paused ? "Reanudar" : "Pausar";
+        pauseButton.setAttribute("aria-pressed", viewer.paused ? "true" : "false");
+        if (!viewer.paused) applyJobLogViewerState(container, viewer);
+      });
+    }
+
+    function renderJobLogLinesInto(container, lines, jobId, classifyLine) {
+      if (!container) return;
+      const viewer = jobLogViewerOf(container);
+      if (!viewer) return;
+      if (typeof jobId === "string" && jobId) viewer.jobId = jobId;
+      if (typeof classifyLine === "function") viewer.classifyLine = classifyLine;
+      viewer.lastLines = Array.isArray(lines) ? lines : [];
+      if (viewer.paused) return;
+      applyJobLogViewerState(container, viewer);
+    }
+
+    function applyJobLogViewerState(container, viewer) {
+      const total = viewer.lastLines.length;
+      const visible = total > viewer.visibleLines ? viewer.lastLines.slice(total - viewer.visibleLines) : viewer.lastLines.slice();
+      const needle = viewer.search.trim().toLowerCase();
+      const matched = needle ? visible.filter(line => line.toLowerCase().includes(needle)) : null;
+      const displayed = matched || visible;
+      viewer.renderedLines = displayed;
+      const filterNote = needle
+        ? `<div class="log-line info log-filter-note">Filtro "${escapeHtml(viewer.search)}": ${displayed.length} de ${visible.length} lineas coinciden</div>`
+        : "";
+      const emptyMessage = displayed.length
+        ? ""
+        : `<div class="log-line info">${needle ? "Ninguna linea coincide con el filtro." : "Sin lineas dentro del limite seleccionado."}</div>`;
+      const atBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - JOB_LOG_SCROLL_BOTTOM_EPSILON;
+      container.innerHTML = emptyMessage || `${filterNote}${displayed.map(line => viewer.classifyLine(line)).join("")}`;
+      if (container.classList && typeof container.classList.toggle === "function") {
+        container.classList.toggle("log-wrap-disabled", !viewer.wrapLines);
+      }
+      if (atBottom) container.scrollTop = container.scrollHeight;
+    }
+
+    function copyJobLogLines(viewer, feedbackButton) {
+      if (!viewer || !viewer.renderedLines.length) return;
+      const text = viewer.renderedLines.join("\n");
+      const done = () => {
+        if (!feedbackButton) return;
+        const original = feedbackButton.textContent;
+        feedbackButton.textContent = "Copiado";
+        setTimeout(() => { feedbackButton.textContent = original; }, 1500);
+      };
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        navigator.clipboard.writeText(text).then(done, () => {});
+        return;
+      }
+      const scratch = document.createElement("textarea");
+      scratch.value = text;
+      document.body.appendChild(scratch);
+      scratch.select();
+      document.execCommand("copy");
+      scratch.remove();
+      done();
+    }
+
+    function downloadJobLogLines(viewer) {
+      if (!viewer || !viewer.renderedLines.length) return;
+      const blob = new Blob([viewer.renderedLines.join("\n") + "\n"], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `job-log-${viewer.jobId || "ejecucion"}.log`;
+      link.click();
+      URL.revokeObjectURL(url);
     }
 
     function getTargetLogHost() {
@@ -6911,6 +7052,7 @@ docker compose up -d
             </div>
             <button type="button" class="btn ghost xs" id="logAccordionClose" aria-label="Cerrar logs de ${escapeHtml(targetLabel)}">Cerrar</button>
           </div>
+          ${logViewerToolbarMarkup()}
           <div class="log-container" id="logContainer"><div class="log-line info">Cargando logs...</div></div>
         </div>
       `;
@@ -7022,13 +7164,12 @@ docker compose up -d
         container.innerHTML = `<div class="log-line info">Sin logs disponibles</div>`;
         return;
       }
-      container.innerHTML = `${lines.map(l => {
+      renderJobLogLinesInto(container, lines, job.id, l => {
         const escaped = escapeHtml(l);
         if (/ERROR|FAILED|CRITICAL/i.test(l)) return `<div class="log-line error">${escaped}</div>`;
         if (/WARN/i.test(l)) return `<div class="log-line warn">${escaped}</div>`;
         return `<div class="log-line info">${escaped}</div>`;
-      }).join("")}`;
-      container.scrollTop = container.scrollHeight;
+      });
     }
 
     function renderJobTableBodyPreservingAccordion(tbody, markup) {

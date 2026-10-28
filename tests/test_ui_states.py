@@ -3428,5 +3428,269 @@ process.stdout.write("sidebar Settings placement passed");
         self.assertRegex(self.app_css, r"\.sidebar \.footer\s*\{\s*margin-top:\s*auto;")
 
 
+class PortainerStyleLogViewerUiStateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UI_PATH.read_text(encoding="utf-8")
+        cls.css = UI_CSS_PATH.read_text(encoding="utf-8")
+
+    def _toolbar_markup_source(self):
+        toolbar = re.search(r"function logViewerToolbarMarkup\(\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(toolbar)
+        return toolbar.group(0)
+
+    def _target_panel_markup_source(self):
+        panel = re.search(r"function targetLogPanelMarkup\(jobId, targetId\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(panel)
+        return panel.group(0)
+
+    def _accordion_markup_source(self):
+        accordion = re.search(
+            r"function toggleJobLogAccordion\(jobId, content\) \{.*?\n    \}\n\n    function closeJobLogAccordion",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(accordion)
+        return accordion.group(0)
+
+    def test_both_log_panels_expose_portainer_style_toolbar(self):
+        toolbar_source = self._toolbar_markup_source()
+        for marker in (
+            '<div class="log-toolbar" data-log-toolbar>',
+            'data-log-search placeholder="Buscar en logs"',
+            'aria-label="Buscar en logs"',
+            'data-log-line-count aria-label="Lineas visibles"',
+            '<option value="100">',
+            '<option value="500">',
+            '<option value="1000" selected>',
+            'data-log-wrap aria-pressed="true"',
+            'data-log-timestamps aria-pressed="false" disabled title="Sin marcas de tiempo en el origen de logs"',
+            'data-log-copy title="Copiar lineas visibles"',
+            'data-log-download title="Descargar lineas visibles"',
+            'data-log-pause aria-pressed="false" title="Pausar o reanudar la actualizacion en vivo"',
+            ">Pausar</button>",
+        ):
+            self.assertIn(marker, toolbar_source)
+        self.assertIn("${logViewerToolbarMarkup()}", self._target_panel_markup_source())
+        self.assertIn("${logViewerToolbarMarkup()}", self._accordion_markup_source())
+
+    def test_log_viewer_defaults_to_latest_1000_lines_and_server_bound_is_reused(self):
+        self.assertIn("const JOB_LOG_VIEWER_DEFAULT_LINES = 1000;", self.source)
+        # The client must not exceed the existing server-side bound (control_plane_service MAX_JOB_LOG_LINES).
+        self.assertNotRegex(self.source, r"MAX_JOB_LOG[A-Z_]*\s*=\s*")
+
+    def test_log_viewer_renderers_preserve_scroll_and_bounding(self):
+        for marker in (
+            "const JOB_LOG_VIEWER_DEFAULT_LINES = 1000;",
+            "const JOB_LOG_SCROLL_BOTTOM_EPSILON = 32;",
+            "function renderJobLogLinesInto(container, lines, jobId, classifyLine) {",
+            "viewer.lastLines.slice(total - viewer.visibleLines)",
+            "if (viewer.paused) return;",
+        ):
+            self.assertIn(marker, self.source)
+
+        apply = re.search(r"function applyJobLogViewerState\(container, viewer\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(apply)
+        apply_source = apply.group(0)
+        self.assertIn(
+            "const atBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - JOB_LOG_SCROLL_BOTTOM_EPSILON;",
+            apply_source,
+        )
+        scroll_to_bottom = "if (atBottom) container.scrollTop = container.scrollHeight;"
+        self.assertIn(scroll_to_bottom, apply_source)
+        # The auto-scroll must be conditional: only follow when the user was already at the bottom.
+        self.assertLess(
+            apply_source.index("const atBottom ="),
+            apply_source.index(scroll_to_bottom),
+        )
+        self.assertIn("line.toLowerCase().includes(needle)", apply_source)
+
+        target_render = re.search(r"function renderTargetJobLogsInto\(job, root\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(target_render)
+        self.assertIn("renderJobLogLinesInto(container", target_render.group(0))
+
+        accordion_render = re.search(r"function renderJobLogsInto\(job, container\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(accordion_render)
+        self.assertIn("renderJobLogLinesInto(container", accordion_render.group(0))
+
+    def test_timestamp_display_control_is_real_or_honestly_disabled(self):
+        viewer_block_start = self.source.index("const JOB_LOG_VIEWER_DEFAULT_LINES = 1000;")
+        viewer_block_end = self.source.index("function getTargetLogHost()")
+        viewer_block = self.source[viewer_block_start:viewer_block_end]
+        # No fabricated per-line timestamps: the log payload carries plain strings without timestamps.
+        self.assertNotIn("new Date", viewer_block)
+        toolbar_source = self._toolbar_markup_source()
+        self.assertIn("data-log-timestamps aria-pressed=\"false\" disabled title=\"Sin marcas de tiempo en el origen de logs\"", toolbar_source)
+
+    def test_copy_and_download_operate_on_lines_displayed_and_css_supports_controls(self):
+        copy = re.search(r"function copyJobLogLines\(viewer, feedbackButton\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(copy)
+        copy_source = copy.group(0)
+        for marker in ("viewer.renderedLines.join(\"\\n\")", "navigator.clipboard", "Copiado"):
+            self.assertIn(marker, copy_source)
+
+        download = re.search(r"function downloadJobLogLines\(viewer\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(download)
+        for marker in ("viewer.renderedLines.join(\"\\n\")", "link.download", "createObjectURL"):
+            self.assertIn(marker, download.group(0))
+
+        for marker in (
+            ".log-toolbar { display: flex; align-items: center;",
+            ".log-wrap-disabled .log-line",
+            ".log-wrapper-disabled",  # intentionally absent: guards against typos below
+        ):
+            if marker == ".log-wrapper-disabled":
+                continue
+            self.assertIn(marker, self.css)
+
+    def test_log_viewer_behavior_bounded_search_pause_copy_download(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        start = self.source.index("const JOB_LOG_VIEWER_DEFAULT_LINES = 1000;")
+        end = self.source.index("function getTargetLogHost()")
+        block = self.source[start:end]
+        script = r'''
+const escapeHtml = value => String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+class StubClassList {
+  constructor() { this.items = new Set(); }
+  toggle(name, force) { const active = force === undefined ? !this.items.has(name) : Boolean(force); if (active) this.items.add(name); else this.items.delete(name); return active; }
+  contains(name) { return this.items.has(name); }
+}
+class StubElement {
+  constructor(clientHeight) {
+    this.scrollTop = 0; this.scrollHeight = 0; this.clientHeight = clientHeight || 300;
+    this._innerHTML = ""; this.textContent = ""; this.value = ""; this.disabled = false;
+    this.classList = new StubClassList();
+    this.listeners = {};
+    this.attrs = new Map();
+    this.controls = {};
+  }
+  get innerHTML() { return this._innerHTML; }
+  set innerHTML(value) { this._innerHTML = value; this.scrollHeight = (value.match(/class="log-line/g) || []).length; }
+  addEventListener(type, handler) { (this.listeners[type] = this.listeners[type] || []).push(handler); }
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+  fire(type) { (this.listeners[type] || []).slice().forEach(handler => handler()); }
+  click() { this.fire("click"); }
+  closest(selector) { return selector === ".log-panel" ? this.panel : null; }
+  querySelector(selector) { return selector.startsWith("[data-log-") ? (this.controls[selector] || null) : null; }
+}
+function buildPanelLogControls() {
+  const container = new StubElement();
+  const panel = new StubElement();
+  const toolbar = new StubElement();
+  const controls = {};
+  for (const name of ["search", "line-count", "wrap", "timestamps", "copy", "download", "pause"]) {
+    const element = new StubElement();
+    controls[`[data-log-${name}]`] = element;
+    element.toolbar = toolbar;
+  }
+  toolbar.controls = controls;
+  panel.controls = { "[data-log-toolbar]": toolbar };
+  panel.toolbar = toolbar;
+  container.panel = panel;
+  return { container, panel, toolbar, controls };
+}
+const failures = [];
+const classify = line => `<div class="log-line info">${escapeHtml(line)}</div>`;
+
+// A) Latest 1,000 lines by default and auto-follow at the bottom.
+{
+  const { container } = buildPanelLogControls();
+  const lines = Array.from({ length: 1500 }, (_, index) => `linea-${index + 1}`);
+  // Emulate a user already looking at the bottom of the freshly opened panel.
+  container.scrollTop = 700;
+  container.scrollHeight = 1000;
+  renderJobLogLinesInto(container, lines, "job-abc", classify);
+  const rendered = container.innerHTML.match(/class="log-line/g) || [];
+  if (rendered.length !== 1000) failures.push(`expected exactly 1000 rendered lines, got ${rendered.length}`);
+  if (!container.innerHTML.includes(">linea-1500<")) failures.push("latest line missing");
+  if (container.innerHTML.includes(">linea-500<")) failures.push("line beyond the default limit leaked");
+  if (container.scrollTop !== 1000) failures.push(`at-bottom render did not follow to bottom, scrollTop=${container.scrollTop}`);
+
+  // B) Scrolled up: live refresh preserves the user position and does not jump to bottom.
+  container.scrollTop = 0;
+  container.scrollHeight = 1200;
+  renderJobLogLinesInto(container, lines, "job-abc", classify);
+  if (container.scrollTop !== 0) failures.push(`auto-scroll forced the bottom while user scrolled up, scrollTop=${container.scrollTop}`);
+  const mid = container;
+  mid.scrollTop = 300;
+  mid.scrollHeight = 1200;
+  renderJobLogLinesInto(mid, lines, "job-abc", classify);
+  if (mid.scrollTop !== 300) failures.push(`partial scroll position was not preserved, scrollTop=${mid.scrollTop}`);
+}
+
+// C) Search filters the bounded display.
+{
+  const { container, panel, toolbar, controls } = buildPanelLogControls();
+  const lines = ["ok uno", "ERROR dos", "ok tres", "error cuatro"];
+  renderJobLogLinesInto(container, lines, "job-x", classify);
+  controls["[data-log-search]"].value = "error";
+  controls["[data-log-search]"].fire("input");
+  if ((container.innerHTML.match(/<div class="log-line info">/g) || []).length !== 2) {
+    failures.push(`search did not filter to 2 matching lines: ${container.innerHTML}`);
+  }
+  if (!container.innerHTML.includes("Filtro") || !container.innerHTML.includes("2 de 4 lineas")) {
+    failures.push(`filter note missing: ${container.innerHTML}`);
+  }
+}
+
+// D) Pause/resume: live updates are skipped while paused, resume re-renders on demand.
+{
+  const { container, panel, toolbar, controls } = buildPanelLogControls();
+  renderJobLogLinesInto(container, ["primera"], "job-p", classify);
+  controls["[data-log-pause]"].click();
+  if (controls["[data-log-pause]"].textContent !== "Reanudar") failures.push("pause button did not switch to Reanudar");
+  const frozen = container.innerHTML;
+  renderJobLogLinesInto(container, ["primera", "segunda"], "job-p", classify);
+  if (container.innerHTML !== frozen) failures.push("live update replaced content while paused");
+  controls["[data-log-pause]"].click();
+  if (controls["[data-log-pause]"].textContent !== "Pausar") failures.push("resume button did not switch back");
+  if (!container.innerHTML.includes(">segunda<")) failures.push("resume did not render the buffered live lines");
+}
+
+// E) Wrap toggle flips the display class.
+{
+  const { container, panel, toolbar, controls } = buildPanelLogControls();
+  renderJobLogLinesInto(container, ["a"], "job-w", classify);
+  controls["[data-log-wrap]"].click();
+  if (!container.classList.contains("log-wrap-disabled")) failures.push("wrap toggle did not disable wrapping");
+  if (controls["[data-log-wrap]"].attrs.get("aria-pressed") !== "false") failures.push("wrap toggle did not update aria-pressed");
+}
+
+// F) Copy and download act on the lines currently displayed.
+{
+  const { container, panel, toolbar, controls } = buildPanelLogControls();
+  let copied = null;
+  Object.defineProperty(globalThis, "navigator", { value: { clipboard: { writeText: text => { copied = text; return { then: callback => callback() }; } } }, configurable: true });
+  const copiedButton = controls["[data-log-copy]"];
+  renderJobLogLinesInto(container, ["a", "b"], "job-c", classify);
+  copyJobLogLines(jobLogViewers.get(container), copiedButton);
+  if (copied !== "a\nb") failures.push(`copy did not take the displayed lines: ${copied}`);
+  if (copiedButton.textContent !== "Copiado") failures.push("copy feedback missing");
+
+  let downloadedName = null;
+  let downloadedHref = null;
+  const link = { set href(value) { downloadedHref = value; }, download: null, click() { downloadedName = this.download; } };
+  globalThis.document = { createElement: () => link };
+  globalThis.URL = { createObjectURL: () => "blob:test", revokeObjectURL: () => {} };
+  downloadJobLogLines(jobLogViewers.get(container));
+  if (downloadedName !== "job-log-job-c.log") failures.push(`download name wrong: ${downloadedName}`);
+  if (downloadedHref !== "blob:test") failures.push("download blob href missing");
+}
+
+if (failures.length) throw new Error(failures.join("; "));
+process.stdout.write("portainer style log viewer behavior passed");
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", block + script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "portainer style log viewer behavior passed")
+
+
 if __name__ == "__main__":
     unittest.main()

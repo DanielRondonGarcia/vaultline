@@ -188,6 +188,7 @@ class JobRecord:
     attempt_count: int = 0
     result_summary: Optional[Dict[str, Any]] = None
     log_lines: List[str] = field(default_factory=list)
+    log_timestamps: Optional[List[Optional[str]]] = None
     submitted_at: datetime = field(default_factory=utcnow)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None

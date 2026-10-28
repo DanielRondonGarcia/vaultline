@@ -1957,5 +1957,167 @@ class WorkerRestartRecoveryTests(unittest.TestCase):
             self.assertFalse(os.path.exists(service.terminal_report_journal.path))
 
 
+class DockerLogTimestampCaptureTests(unittest.TestCase):
+    """S2/T2: Docker streaming lines expose real source timestamps as parallel
+    metadata; prefixes are stripped from the text contract and never fabricated."""
+
+    @staticmethod
+    def streaming_container(chunks):
+        container = Mock()
+        container.wait.return_value = {"StatusCode": 0}
+        container.logs.return_value = iter(chunks)
+        return container
+
+    @staticmethod
+    def runtime(container):
+        runtime = DockerRuntimeAdapter.__new__(DockerRuntimeAdapter)
+        runtime.client = Mock()
+        runtime.client.containers.run.return_value = container
+        runtime.timeout_seconds = 30.0
+        runtime.no_lock = False
+        runtime.cache_dir = None
+        return runtime
+
+    def test_docker_streaming_captures_real_source_timestamps_and_strips_the_prefix(self):
+        container = self.streaming_container([
+            b"2024-05-05T10:00:00.123456789Z starting backup\n",
+            b"2024-05-05T10:00:0",
+            b"1.000000000Z finished\n",
+        ])
+        runtime = self.runtime(container)
+
+        result = runtime.run_runtime_job("runtime", {"command": "/root/backup.sh"})
+
+        self.assertTrue(result["success"], result)
+        stream_call = container.logs.call_args
+        self.assertTrue(stream_call.kwargs["timestamps"])
+        self.assertTrue(stream_call.kwargs["stream"])
+        self.assertEqual(result["logs"], "starting backup\nfinished\n")
+        self.assertEqual(
+            result["log_timestamps"],
+            ["2024-05-05T10:00:00.123456789Z", "2024-05-05T10:00:01.000000000Z"],
+        )
+
+    def test_non_streamed_output_never_carries_fabricated_timestamps(self):
+        container = Mock()
+        container.wait.return_value = {"StatusCode": 0}
+        container.logs.side_effect = [RuntimeError("stream refused"), b"plain output\n"]
+        runtime = self.runtime(container)
+
+        result = runtime.run_runtime_job("runtime", {"command": "/root/backup.sh"})
+
+        self.assertTrue(result["success"], result)
+        fallback_call = container.logs.call_args_list[-1]
+        self.assertIn("timestamps", fallback_call.kwargs)
+        self.assertFalse(fallback_call.kwargs["timestamps"])
+        self.assertNotIn("log_timestamps", result)
+        self.assertEqual(result["logs"], "plain output\n")
+
+    def test_captured_timestamps_survive_redaction_and_never_leak_secrets(self):
+        secret = "restic-password-value"
+        container = self.streaming_container(
+            [f"2024-05-05T10:00:00Z token={secret}\n".encode("utf-8")]
+        )
+        runtime = self.runtime(container)
+
+        result = runtime.run_runtime_job(
+            "runtime",
+            {"command": "/root/backup.sh", "environment": {"RESTIC_PASSWORD": secret}},
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertNotIn(secret, repr(result))
+        self.assertEqual(result["logs"], "token=<redacted>\n")
+        self.assertEqual(result["log_timestamps"], ["2024-05-05T10:00:00Z"])
+
+    def test_timestamp_capture_keeps_restic_json_parsing_working(self):
+        container = self.streaming_container(
+            [b'2024-05-05T10:00:00Z [{"id": "abcdef1234567890", "short_id": "abcdef1234567890"}]\n']
+        )
+        runtime = self.runtime(container)
+
+        result = runtime.list_restic_snapshots("runtime", {"command": "restic snapshots --json"})
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(
+            result["snapshots"],
+            [{"id": "abcdef1234567890", "short_id": "abcdef1234567890"}],
+        )
+
+    def test_docker_streaming_emits_line_aligned_callback_metadata(self):
+        container = self.streaming_container([
+            b"2024-05-05T10:00:00.123456789Z starting backup\n",
+            b"2024-05-05T10:00:0",
+            b"1.000000000Z finished\n",
+        ])
+        runtime = self.runtime(container)
+        collected = []
+
+        def collect(text, timestamps=None):
+            collected.append((text, timestamps))
+
+        result = runtime.run_runtime_job(
+            "runtime", {"command": "/root/backup.sh"}, output_callback=collect
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(
+            [(text, stamps) for text, stamps in collected if text.strip()],
+            [
+                ("starting backup\n", ["2024-05-05T10:00:00.123456789Z"]),
+                ("finished\n", ["2024-05-05T10:00:01.000000000Z"]),
+            ],
+        )
+
+    def test_timestamp_capture_preserves_stream_chunk_emission_granularity(self):
+        first_ts = "2024-05-05T10:00:00Z"
+        second_ts = "2024-05-05T10:00:01Z"
+        container = self.streaming_container([
+            f"{first_ts} first line\n".encode(),
+            f"{second_ts} partial ".encode(),
+            b"continuation\n",
+        ])
+        runtime = self.runtime(container)
+        collected = []
+
+        def collect(text, timestamps=None):
+            collected.append((text, timestamps))
+
+        result = runtime.run_runtime_job(
+            "runtime", {"command": "/root/backup.sh"}, output_callback=collect
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["logs"], "first line\npartial continuation\n")
+        self.assertEqual(result["log_timestamps"], [first_ts, second_ts])
+        self.assertEqual(
+            [text for text, _ in collected if text],
+            ["first line\n", "partial ", "continuation\n"],
+        )
+        self.assertEqual(collected[1][1], [second_ts])
+
+    def test_multiline_secret_is_redacted_atomically_and_timestamps_are_withheld(self):
+        secret = "line-one\nline-two\nline-three"
+        container = self.streaming_container([
+            b"2024-05-05T10:00:00Z line-one\n",
+            b"line-two\n",
+            b"line-three next\n",
+        ])
+        runtime = self.runtime(container)
+
+        result = runtime.run_runtime_job(
+            "runtime",
+            {
+                "command": "/root/backup.sh",
+                "environment": {"MULTILINE_SECRET": secret},
+            },
+        )
+
+        self.assertTrue(result["success"], result)
+        self.assertNotIn("line-one", repr(result))
+        self.assertEqual(result["logs"], "<redacted> next\n")
+        self.assertNotIn("log_timestamps", result)
+
+
 if __name__ == "__main__":
     unittest.main()

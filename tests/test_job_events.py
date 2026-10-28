@@ -103,6 +103,8 @@ class JobEventServiceTests(unittest.TestCase):
         self.assertGreaterEqual(claim_event["updated_at"], submitted_updated_at)
         self.assert_safe_view(claim_event)
 
+        source_time = "2024-05-05T10:00:00Z"
+        terminal_time = "2024-05-05T10:00:01Z"
         updated = service.update_job_progress(
             "worker-a",
             job.id,
@@ -110,10 +112,12 @@ class JobEventServiceTests(unittest.TestCase):
             progress={"phase": "backup", "percent_done": 25},
             log_lines=["safe progress"],
             lease_token=claimed.lease_token,
+            log_timestamps=[source_time],
         )
         progress_event = subscription.get(timeout=1)
         self.assertEqual(progress_event["progress"]["percent_done"], 25)
         self.assertEqual(progress_event["log_lines"][-1], "safe progress")
+        self.assertEqual(progress_event["log_timestamps"], [source_time])
         self.assertGreaterEqual(progress_event["updated_at"], claimed.updated_at)
         self.assertEqual(progress_event["updated_at"], updated.updated_at)
         self.assert_safe_view(progress_event)
@@ -125,9 +129,11 @@ class JobEventServiceTests(unittest.TestCase):
             result_summary={"error": "password=private-password", "token": "private-token"},
             log_lines=["private-password", "terminal failure"],
             lease_token=claimed.lease_token,
+            log_timestamps=[None, terminal_time],
         )
         terminal_event = subscription.get(timeout=1)
         self.assertEqual(terminal_event["status"], JobStatus.FAILED)
+        self.assertEqual(terminal_event["log_timestamps"], [source_time, None, terminal_time])
         self.assertIsNotNone(terminal_event["finished_at"])
         self.assert_safe_view(terminal_event)
 

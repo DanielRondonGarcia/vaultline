@@ -396,6 +396,7 @@ class SQLiteRepositoryBase:
                 "snapshot_explorer_listing_max_output_bytes",
                 "INTEGER NOT NULL DEFAULT 4194304",
             )
+            self._ensure_column(connection, "jobs", "log_timestamps_json", "TEXT")
             self._ensure_column(connection, "targets", "cron_expression", "TEXT")
             self._ensure_column(connection, "targets", "live_access_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "targets", "path_storage", "TEXT")
@@ -765,8 +766,9 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 INSERT OR REPLACE INTO jobs (
                     id, worker_id, command, payload_json, requested_by, target_id, trigger, status,
                     owner_worker_id, lease_token, lease_issued_at, lease_expires_at, attempt_count,
-                    result_summary_json, log_lines_json, submitted_at, started_at, finished_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    result_summary_json, log_lines_json, log_timestamps_json,
+                    submitted_at, started_at, finished_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -784,6 +786,9 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     job.attempt_count,
                     json.dumps(job.result_summary) if job.result_summary is not None else None,
                     json.dumps(job.log_lines),
+                    json.dumps(job.log_timestamps)
+                    if isinstance(job.log_timestamps, list) and len(job.log_timestamps) == len(job.log_lines)
+                    else None,
                     job.submitted_at.isoformat(),
                     job.started_at.isoformat() if job.started_at else None,
                     job.finished_at.isoformat() if job.finished_at else None,
@@ -1001,7 +1006,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
         rows = connection.execute(
             """
             SELECT id, worker_id, command, target_id, owner_worker_id,
-                   result_summary_json, log_lines_json, lease_issued_at,
+                   result_summary_json, log_lines_json, log_timestamps_json, lease_issued_at,
                    lease_expires_at, updated_at
             FROM jobs
             WHERE status = ? AND lease_expires_at IS NOT NULL
@@ -1036,8 +1041,12 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             result_summary.pop("lease_context", None)
             log_lines = _json_load(row["log_lines_json"], [])
             log_lines = list(log_lines) if isinstance(log_lines, list) else []
+            log_timestamps = _json_load(row["log_timestamps_json"], None)
+            if not isinstance(log_timestamps, list) or len(log_timestamps) != len(log_lines):
+                log_timestamps = [None] * len(log_lines)
             if interruption_log not in log_lines:
                 log_lines.append(interruption_log)
+                log_timestamps.append(None)
             # Keep owner_worker_id and lease_token: they are the proof a late
             # terminal report from the owning worker must present to replace
             # this synthetic failure with the real result.
@@ -1045,7 +1054,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 """
                 UPDATE jobs
                 SET status = ?, lease_issued_at = NULL, lease_expires_at = NULL,
-                    result_summary_json = ?, log_lines_json = ?,
+                    result_summary_json = ?, log_lines_json = ?, log_timestamps_json = ?,
                     finished_at = NULL, updated_at = ?
                 WHERE id = ? AND status = ?
                 """,
@@ -1053,6 +1062,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     JobStatus.IN_PROGRESS,
                     json.dumps(result_summary),
                     json.dumps(log_lines),
+                    json.dumps(log_timestamps) if any(log_timestamps) else None,
                     now.isoformat(),
                     row["id"],
                     JobStatus.IN_PROGRESS,
@@ -1159,6 +1169,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
         progress: Dict[str, Any],
         log_lines: List[str],
         result_summary: Optional[Dict[str, Any]] = None,
+        log_timestamps: Optional[List[Optional[str]]] = None,
     ) -> Optional[JobRecord]:
         with self._lock:
             connection = self._connect()
@@ -1209,19 +1220,34 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 current_summary["lease_context"] = context
                 current_logs = _json_load(row["log_lines_json"], [])
                 current_logs = list(current_logs) if isinstance(current_logs, list) else []
-                current_logs = (current_logs + list(log_lines or []))[-self.MAX_LOG_LINES :]
+                current_timestamps = _json_load(row["log_timestamps_json"], None)
+                if not isinstance(current_timestamps, list) or len(current_timestamps) != len(current_logs):
+                    current_timestamps = [None] * len(current_logs)
+                incoming_lines = list(log_lines or [])
+                incoming_timestamps = (
+                    list(log_timestamps)
+                    if isinstance(log_timestamps, list) and len(log_timestamps) == len(incoming_lines)
+                    else [None] * len(incoming_lines)
+                )
+                combined_logs = current_logs + incoming_lines
+                combined_timestamps = current_timestamps + incoming_timestamps
+                offset = max(0, len(combined_logs) - self.MAX_LOG_LINES)
+                current_logs = combined_logs[offset:]
+                current_timestamps = combined_timestamps[offset:]
                 while current_logs and sum(len(line) for line in current_logs if isinstance(line, str)) > self.MAX_LOG_CHARS:
                     current_logs.pop(0)
+                    current_timestamps.pop(0)
                 updated = connection.execute(
                     """
                     UPDATE jobs
-                    SET result_summary_json = ?, log_lines_json = ?, updated_at = ?
+                    SET result_summary_json = ?, log_lines_json = ?, log_timestamps_json = ?, updated_at = ?
                     WHERE id = ? AND status = ? AND owner_worker_id = ?
                       AND lease_token = ?
                     """,
                     (
                         json.dumps(current_summary),
                         json.dumps(current_logs),
+                        json.dumps(current_timestamps) if any(current_timestamps) else None,
                         now.isoformat(),
                         job_id,
                         JobStatus.IN_PROGRESS,
@@ -1362,6 +1388,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             attempt_count=row["attempt_count"] or 0,
             result_summary=_json_load(row["result_summary_json"], None),
             log_lines=_json_load(row["log_lines_json"], []),
+            log_timestamps=_json_load(row["log_timestamps_json"], None),
             submitted_at=_dt(row["submitted_at"]) or datetime.utcnow(),
             started_at=_dt(row["started_at"]),
             finished_at=_dt(row["finished_at"]),

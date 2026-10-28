@@ -1457,6 +1457,7 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     log_lines=body.get("log_lines"),
                     lease_token=body.get("lease_token"),
                     lease_context=body.get("lease_context"),
+                    log_timestamps=body.get("log_timestamps"),
                 )
                 return self._write_json(200, self._control_plane_service().public_job_view(job))
 
@@ -1476,6 +1477,7 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     log_lines=body.get("log_lines"),
                     lease_token=body.get("lease_token"),
                     lease_context=body.get("lease_context"),
+                    log_timestamps=body.get("log_timestamps"),
                 )
                 return self._write_json(200, _to_jsonable(job))
 

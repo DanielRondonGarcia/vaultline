@@ -289,6 +289,7 @@ class JobRepository(ABC):
         progress: Dict[str, Any],
         log_lines: List[str],
         result_summary: Optional[Dict[str, Any]] = None,
+        log_timestamps: Optional[List[Optional[str]]] = None,
     ) -> Optional[JobRecord]:
         raise NotImplementedError
 

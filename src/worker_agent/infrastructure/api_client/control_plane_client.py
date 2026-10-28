@@ -4,7 +4,7 @@ import ssl
 import secrets
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib import request
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -205,6 +205,7 @@ class ControlPlaneClient:
         log_lines: List[str],
         lease_token: str | None = None,
         lease_context: Dict[str, Any] | None = None,
+        log_timestamps: List[Optional[str]] | None = None,
     ) -> Dict[str, Any]:
         payload = {
             "status": status,
@@ -214,6 +215,8 @@ class ControlPlaneClient:
         }
         if isinstance(lease_context, dict):
             payload["lease_context"] = lease_context
+        if log_timestamps is not None:
+            payload["log_timestamps"] = list(log_timestamps)
         return self._post(f"/api/v1/workers/{worker_id}/jobs/{job_id}/status", payload)
 
     def update_job_progress(
@@ -225,6 +228,7 @@ class ControlPlaneClient:
         log_lines: List[str],
         lease_token: str | None = None,
         lease_context: Dict[str, Any] | None = None,
+        log_timestamps: List[Optional[str]] | None = None,
     ) -> Dict[str, Any]:
         payload = {
             "sequence": sequence,
@@ -234,6 +238,8 @@ class ControlPlaneClient:
         }
         if isinstance(lease_context, dict):
             payload["lease_context"] = lease_context
+        if log_timestamps is not None:
+            payload["log_timestamps"] = list(log_timestamps)
         return self._post(f"/api/v1/workers/{worker_id}/jobs/{job_id}/progress", payload)
 
     def renew_job_lease(self, worker_id: str, job_id: str, lease_token: str) -> Dict[str, Any]:

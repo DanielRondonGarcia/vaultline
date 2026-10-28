@@ -34,4 +34,6 @@ Scope: Preserve source-mode and non-rclone behavior; release evidence is recorde
 - L18: At this point, the fix remained local and uncommitted; no follow-up package or release had been built or published.
 - L19: User selected “Autorizar un release de seguimiento”, accepting publication based on the passing local tests despite the unavailable independent verifier.
 - L20: Delivery boundary: the follow-up source/test slice and task evidence were committed as `aa487d8`; only the Restic helper, its regression, and this task record were included. Unrelated dirty paths remain excluded.
-- L21: Release follow-up: push the authorized feature branch and dispatch a stable patch workflow; release tag and asset evidence remain pending.
+- L21: Release follow-up: feature branch was pushed at `b778e10`; stable patch workflow run `40605570057` was dispatched from that commit.
+- L22: Run `40605570057` failed in `image-build` while pushing the backup runtime image to GHCR (`unknown blob`). Windows and both native Linux jobs succeeded; `publish-release` was skipped.
+- L23: Post-failure check found no GitHub release or tag `3.15.17`, and `docker manifest inspect ghcr.io/danielrondongarcia/vaultline:3.15.17` returned `manifest unknown`. The image push may have partially updated mutable tags; the authorized full workflow will be re-dispatched once.

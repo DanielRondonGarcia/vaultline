@@ -31,6 +31,6 @@ VSVersionInfo(
         )
       ]
     ),
-    VarFileInfo([Struct(u'VarFileInfo', [Translation(0x0409, 0x04B0)])])
+    VarFileInfo([Translation(0x0409, 0x04B0)])
   ]
 )

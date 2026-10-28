@@ -18,6 +18,13 @@ The user then selected the exact scope expansion: `Add end-to-end timestamps` (o
 
 Acceptance checks: both existing job-log panels expose working search, timestamp display control, adjustable visible line count, display/wrap control, and copy/download actions alongside a live-refresh pause/resume control. Capture real per-line source timestamps through the worker-to-Control-Plane log flow and display them when enabled; do not synthesize timestamps. Assumption to validate: preserve the existing string-log contract and add timestamp metadata compatibly unless the data-flow map demonstrates a safer design. The server already caps each response at 1,000 lines; do not add a redundant backend cap unless evidence shows the existing one is ineffective.
 
+### S3 — Integrate and publish a stable release
+> `dale, entonces integra y genera release`
+> `master`
+> `Estable`
+
+Acceptance checks: integrate the current stable release line and the completed log-viewer feature into `master`, validate the integrated branch, publish the next stable patch release using the documented Create Release workflow, and verify the release assets and multi-architecture image manifests. The latest stable release discovered is `3.15.20`; the expected next patch is `3.15.21`.
+
 ## Tasks
 
 - T1 | S1-S2 | delegated to `gentle-ai-worker` | done: base UI controls and tests; source timestamps integrate in T4 | commit: `5a50c13`
@@ -25,6 +32,9 @@ Acceptance checks: both existing job-log panels expose working search, timestamp
 - T3 | S2 | inline | done: persist aligned optional timestamps through SQLite/in-memory repositories, APIs, job views, and SSE; verifier and compatibility checks passed | commit: `c79b5ed`
 - T4 | S1-S2 | inline | done: enabled source timestamp rendering in both panels; copy/download preserve plain log text | commit: `59b2461`
 - T5 | S1-S2 | inline | done: integrated worker, Control Plane, SQLite, UI, and legacy-compatibility checks passed; feature closed locally | verification-only; no separate source commit
+- T6 | S3 | inline | in progress: integrate `fix/restic-option-csv` and this feature into `master`; resolve conflicts and validate the merged branch | commit: TBD
+- T7 | S3 | inline | pending: dispatch the stable patch release (`patch`, `prerelease=false`) from `master` after T6 passes | workflow run: TBD
+- T8 | S3 | inline | pending: verify release assets/checksums and all three GHCR image manifests; close out without further delivery actions | evidence: TBD
 
 ## Log
 
@@ -51,3 +61,7 @@ Acceptance checks: both existing job-log panels expose working search, timestamp
 - L21 — T4 test-first evidence: new UI assertions were RED (2 failures) because the toggle remained disabled and neither renderer received timestamps. The shared renderer now keeps timestamp metadata aligned through tail selection and search; the toggle enables only when a genuine timestamp is available, renders the raw source value safely beside its line, and stays disabled for legacy logs. Both panels pass `job.log_timestamps`. Copy and download remain unchanged plain-text `log_lines`, including during live updates. Focused tests passed (4), then the full `tests/test_ui_states.py` suite passed (112). Integrated worker/Control Plane/UI verification remains T5; no push or PR.
 - L22 — T4 UI slice committed locally as `59b2461` (`feat(ui): display source timestamps in job logs`), 100 insertions and 25 deletions across UI, CSS, tests, and feature record. The UI suite passed 112. This is the next separate feature-branch chain slice after T3 `c79b5ed`; generated caches are excluded. No push or PR. T5 is a verification-only closeout.
 - L23 — T5 integrated command `python -m pytest tests/test_worker_log_timestamps_journal.py tests/test_worker_async_recovery.py tests/test_worker_runtime_integration.py tests/test_backup_observability.py tests/test_control_plane_log_timestamps.py tests/test_control_plane_dispatch.py tests/test_control_plane_async_recovery.py tests/test_job_events.py tests/test_sqlite_runtime.py tests/test_ui_states.py -q` passed: 313 passed, 128 subtests, 0 skipped; only pre-existing `datetime.utcnow()` deprecation warnings. This jointly verifies worker/journal propagation, Control Plane API and event views, SQLite migration/persistence, UI source-time display, unchanged plain log exports, and legacy flows. T1-T4 close locally on `feat/portainer-style-job-logs`; code commits are `5a50c13`, `504dc1f`, `c79b5ed`, and `59b2461`, plus task-document commits. Nothing pushed, no PR or merge. Engram mirroring remains unavailable. T4 `Risk: none` (only requested log panels; plain output contracts preserved). Native review continuation remains unexecuted with RDD off; generated `__pycache__` changes remain excluded.
+- L24 — User request (verbatim): `dale, entonces integra y genera release`.
+- L25 — User selected integration target (verbatim): `master`.
+- L26 — User selected release channel (verbatim): `Estable`. The current stable line is `fix/restic-option-csv` / `origin/fix/restic-option-csv`; remote latest release is `3.15.20`. T6-T8 track integration, stable patch publication, and post-release verification; no scope beyond this authorized release.
+- L27 — Engram mirror attempt for the integration/release decision failed with `unable to open database file (14)`; the local feature task document remains authoritative.

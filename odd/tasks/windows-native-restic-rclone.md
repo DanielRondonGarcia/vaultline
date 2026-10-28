@@ -10,8 +10,8 @@ Scope: Preserve source-mode and non-rclone behavior; release evidence is recorde
 - T1 | S1 | Parent inline: add regression coverage and explicitly configure the packaged rclone path for frozen rclone-backed Restic commands | status: done (4 focused tests pass) | commit: eff40e6
 - T2 | S1 | Parent + gentle-ai-verify: run focused and relevant suites; independently inspect shared Restic command behavior | status: done (213 suite tests pass; independent S1 verdict: met) | commit: eff40e6
 - T3 | S2 | Parent inline: reproduce the Windows path-with-spaces failure, add a failing regression, and quote the executable within the `rclone.program` value | status: done (214 passed, 1 skipped, 122 subtests; independent review unavailable and user accepted gap for follow-up release) | commit: `aa487d8`
-- T4 | S2 | Parent inline: publish a stable patch release and verify workflow/assets/checksums | status: in progress; source/test slice `aa487d8`; release workflow pending
-- T5 | S2 | User: install the follow-up MSI on Server 2022 and report whether backup succeeds | status: blocked pending user runtime result | commit: N/A
+- T4 | S2 | Parent inline: publish a stable patch release and verify workflow/assets/checksums | status: done; source/test slice `aa487d8`; release tag `3.15.17` (workflow `40607282181`, target `59ad32e`)
+- T5 | S2 | User: run `vaultline-worker update` from 3.15.16 to 3.15.17 on Server 2022, rerun backup, and report the result | status: blocked pending user runtime result | commit: N/A
 
 ## Log
 - L1: y tengo este bug, acabé de instalarlo en un Microsoft Windows Server 2022 Standard 10.0.20348 20348 - C:\Users\DANIEL~1.RON\AppData\Local\Temp\orca-paste-1793137812864-5ce8435b-4088-4ad1-9e1e-7c00fe077876.png y vea, falla
@@ -36,4 +36,5 @@ Scope: Preserve source-mode and non-rclone behavior; release evidence is recorde
 - L20: Delivery boundary: the follow-up source/test slice and task evidence were committed as `aa487d8`; only the Restic helper, its regression, and this task record were included. Unrelated dirty paths remain excluded.
 - L21: Release follow-up: feature branch was pushed at `b778e10`; stable patch workflow run `40605570057` was dispatched from that commit.
 - L22: Run `40605570057` failed in `image-build` while pushing the backup runtime image to GHCR (`unknown blob`). Windows and both native Linux jobs succeeded; `publish-release` was skipped.
-- L23: Post-failure check found no GitHub release or tag `3.15.17`, and `docker manifest inspect ghcr.io/danielrondongarcia/vaultline:3.15.17` returned `manifest unknown`. The image push may have partially updated mutable tags; the authorized full workflow will be re-dispatched once.
+- L23: Post-failure check found no GitHub release or tag `3.15.17`, and `docker manifest inspect ghcr.io/danielrondongarcia/vaultline:3.15.17` returned `manifest unknown`. The image push may have partially updated mutable tags; the authorized full workflow was re-dispatched once.
+- L24: Retry workflow `40607282181` from commit `59ad32ee65ca5fe07e95ad43887a8e18ac23de24` completed successfully. Stable release `3.15.17` is published; the tag peels to `59ad32e`. Five assets are present (amd64/arm64 `.deb`, Windows `.exe`/`.msi`, and `SHA256SUMS`); the manifest entries match GitHub API digests for all four binaries. The user can now update an installed 3.15.16 worker via `vaultline-worker update`; Server 2022 backup retest remains pending.

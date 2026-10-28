@@ -32,8 +32,8 @@ Acceptance checks: integrate the current stable release line and the completed l
 - T3 | S2 | inline | done: persist aligned optional timestamps through SQLite/in-memory repositories, APIs, job views, and SSE; verifier and compatibility checks passed | commit: `c79b5ed`
 - T4 | S1-S2 | inline | done: enabled source timestamp rendering in both panels; copy/download preserve plain log text | commit: `59b2461`
 - T5 | S1-S2 | inline | done: integrated worker, Control Plane, SQLite, UI, and legacy-compatibility checks passed; feature closed locally | verification-only; no separate source commit
-- T6 | S3 | inline | in progress: clean merge verified by the integrated suite and independent S3 review; merge commit created on `master`, push pending | merge commit: `855a851`
-- T7 | S3 | inline | pending: dispatch the stable patch release (`patch`, `prerelease=false`) from `master` after T6 passes | workflow run: TBD
+- T6 | S3 | inline | done: integrated feature and stable line on `master`; integrated tests and independent S3 verification passed; pushed to `origin/master` | merge commit: `855a851`; task record: `c2b0350`
+- T7 | S3 | inline | in progress: remote master and latest numeric tag preflight passed; dispatch stable patch release (`patch`, `prerelease=false`) from `master` | workflow run: pending
 - T8 | S3 | inline | pending: verify release assets/checksums and all three GHCR image manifests; close out without further delivery actions | evidence: TBD
 
 ## Log
@@ -72,3 +72,5 @@ Acceptance checks: integrate the current stable release line and the completed l
 - L32 — Independent `gentle-ai-verify` assessed T6/S3 read-only: the staged merge is a clean union of `origin/fix/restic-option-csv` and `feat/portainer-style-job-logs`, with no unmerged paths and no `__pycache__` staged; release workflow inputs are consistent with patch 3.15.21. Verdict: S3 integration slice ready to commit/push; no blockers. The verifier accepted the parent's test evidence and did not rerun tests. It could not recheck remote tags; confirm tag freshness at dispatch. S1/S2 were structurally corroborated, not behaviorally rerun.
 - L33 — `gentle_review assess` for the pending integration returned `risk: high`, item 5 (`delivery or environment`) applied, `reviewDue: true`, candidate `current-changes` unconsumed, RDD off, and `nativeReviewOutcome: unknown`. The independent-verifier plan completed in L32. Native review continuation is not executed while RDD is off.
 - L34 — The integrated feature and stable release line were committed on local `master` as merge commit `855a851` (`merge: integrate Portainer-style job logs`). The 316-test/128-subtest suite and independent S3 verification passed before commit. Push and release remain pending; generated `__pycache__` changes were not staged.
+- L35 — `git push origin master` succeeded: remote `master` advanced from `a913261` to `c2b0350`; merge commit `855a851` and task-record commit `c2b0350` are integrated. T6 is complete.
+- L36 — Immediately before release dispatch, `git ls-remote` confirmed remote `master` at `c2b0350` and latest workflow-eligible numeric tag `3.15.20`; the authorized stable `patch` dispatch is expected to produce `3.15.21`. T7 is in progress; no workflow run has started yet.

@@ -1,6 +1,6 @@
 # Docker Multi-Architecture Release Images
 Scope: Restore dual-platform GHCR manifests for the backup runtime, Control Plane, and Worker images.
-Status: Implementation is authorized; image publication, release dispatch, and push are not authorized by this request.
+Status: Implementation and stable release publication are authorized by the user; no merge is authorized.
 
 ## Specs
 
@@ -10,9 +10,13 @@ User request, verbatim: “si, necesito ambas, porfa ajustalo”. In context, �
 ### S2 — ARM64 pull failure example
 Screenshot message, verbatim: “The requested image's platform (linux/amd64) does not match the detected host platform (linux/arm64/v8) and no specific platform was requested”. Publish matching multi-platform manifests so Docker can select either architecture for each image while preserving the existing release tags and labels.
 
+### S3 — Publish a test release
+User request, verbatim: “vale, entonces genera la nueva version para que soporte arm para ir a probarlo, genera la release”. This authorizes pushing the feature branch and dispatching the stable patch release workflow so the updated images can be tested; verify the published release and all three remote multi-platform manifests.
+
 ## Tasks
 - T1 [done] | S1-S2 | Parent inline, test-first | Add regression coverage, then restore release Buildx/QEMU builds and pushes for all three image targets on `linux/amd64` and `linux/arm64`; preserve existing image names, tag policy, labels, Python base digest, and publish-job dependency gates | commit: `d5ff8ac`
-- T2 [done] | S1-S2 | Parent inline | Correct architecture documentation, run focused tests and independent high-risk verification, commit the feature slice, and record that no image push or release was authorized | commit: `d5ff8ac`; 28 focused tests passed, independent S1/S2 met to commit-level proof
+- T2 [done] | S1-S2 | Parent inline | Correct architecture documentation, run focused tests and independent high-risk verification, commit the feature slice, and record that no image push or release was authorized at that time | commit: `d5ff8ac`; 28 focused tests passed, independent S1/S2 met to commit-level proof
+- T3 [in_progress] | S3 | Parent inline | Push the feature branch, dispatch a stable patch release, wait for all jobs, and verify release assets plus amd64/arm64 manifests for all three GHCR images | commits: `d5ff8ac`, `4a22f07`; release evidence pending
 
 ## Log
 - L1: si, necesito ambas, porfa ajustalo
@@ -24,3 +28,6 @@ Screenshot message, verbatim: “The requested image's platform (linux/amd64) do
 - L7: Independent `gentle-ai-verify` verdict: S1 MET and S2 MET to the extent a commit can prove; confirmed all three image targets, both platforms, tag/label policy, pinned base, worker Docker CLI argument, empty-tag guards, and `publish-release` gate. Remote OCI manifests remain unverified because no publication was authorized. Verifier identified a stale amd64-only CLI comment; corrected to describe dual-platform Buildx push and disabled GHA cache. `gentle_review assess` returned high risk and `nativeRisk: unassessable` because the feature document is untracked; RDD is off, so no native review was started.
 - L8: Delivery slice boundary before commit: the Buildx/QEMU workflow setup and three dual-platform pushes, focused regression updates in `tests/test_release_asset_workflow.py` and `tests/test_worker_runtime_integration.py`, corrected README architecture claim, and this task record only. Existing unrelated `.atl/`, other ODD task documents, and tracked `__pycache__` changes remain excluded. No push, workflow dispatch, or image publication.
 - L9: Feature commit `d5ff8ac` (`feat(release): publish GHCR images for amd64 and arm64`) contains the workflow, tests, README correction, and feature record. Focused tests passed (28); workflow YAML parsed; scoped `git diff --check` passed; independent verifier marked S1/S2 met to commit-level proof. `gentle_review assess` was high risk but native assessment unassessable due the then-untracked feature document; RDD is off, so no native review was started. No push or release dispatch; GHCR tags remain unchanged and remote manifests are not yet verified. Closing slice boundary before commit: this task document's commit evidence and final status only, with no product-source edits.
+- L10: User authorization, verbatim: “vale, entonces genera la nueva version para que soporte arm para ir a probarlo, genera la release”. This authorizes pushing the prepared feature commits and dispatching the stable patch release to publish the multi-architecture images for testing.
+- L11: Preflight: latest stable release is `v3.15.18`; remote tag `3.15.19` is absent; `feat/jobs-target-worker-search` is exactly two commits ahead of `origin` with no divergence; no active release workflow exists; the feature source/test/docs paths have no uncommitted changes. Existing unrelated `.atl/`, other task documents, and `__pycache__` modifications remain excluded.
+- L12: Delivery boundary before the authorization-record commit: task document only, recording S3, T3, preflight, and the user's release authorization. No product source changes. Push and stable release dispatch are authorized by L10.

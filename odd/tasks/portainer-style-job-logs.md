@@ -65,3 +65,4 @@ Acceptance checks: integrate the current stable release line and the completed l
 - L25 — User selected integration target (verbatim): `master`.
 - L26 — User selected release channel (verbatim): `Estable`. The current stable line is `fix/restic-option-csv` / `origin/fix/restic-option-csv`; remote latest release is `3.15.20`. T6-T8 track integration, stable patch publication, and post-release verification; no scope beyond this authorized release.
 - L27 — Engram mirror attempt for the integration/release decision failed with `unable to open database file (14)`; the local feature task document remains authoritative.
+- L28 — Commit hook reported 1,982 authored lines across the existing eight commits since `origin/master` and requested a documented slice boundary before further commits. The chain remains four separate behavior slices (`5a50c13`, `504dc1f`, `c79b5ed`, `59b2461`); S3 is integration/release delivery, not a new source-code slice or squash.

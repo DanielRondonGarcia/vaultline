@@ -1,3 +1,4 @@
+import csv
 import os
 import sys
 import tempfile
@@ -149,7 +150,8 @@ class NativeToolExecutableTests(unittest.TestCase):
         rclone_program = str(rclone.resolve())
         if "\\" in rclone_program or any(character.isspace() for character in rclone_program):
             rclone_program = f'"{rclone_program}"'
-        self.assertEqual(prepared, [RESTIC, "-o", f"rclone.program={rclone_program}", "init"])
+        parsed_option = next(csv.reader([prepared[2]]))[0]
+        self.assertEqual(parsed_option, f"rclone.program={rclone_program}")
         self.assertEqual(command, [RESTIC, "init"])
 
     def test_frozen_rclone_program_quotes_windows_path_with_spaces(self):
@@ -165,8 +167,10 @@ class NativeToolExecutableTests(unittest.TestCase):
 
         self.assertEqual(
             prepared,
-            [RESTIC, "-o", f'rclone.program="{rclone_path}"', "init"],
+            [RESTIC, "-o", f'"rclone.program=""{rclone_path}"""', "init"],
         )
+        parsed_option = next(csv.reader([prepared[2]]))[0]
+        self.assertEqual(parsed_option, f'rclone.program="{rclone_path}"')
 
     def test_restic_command_without_frozen_rclone_repository_is_unchanged(self):
         from src import restic_executable

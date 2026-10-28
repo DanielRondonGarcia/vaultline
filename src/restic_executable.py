@@ -1,5 +1,7 @@
 """Resolve Restic without allowing host PATH to override frozen distributions."""
 
+import csv
+import io
 import os
 from pathlib import Path
 import sys
@@ -14,6 +16,13 @@ def resolve_restic_executable() -> str:
 
 
 RESTIC_PROGRESS_FPS_DEFAULT = "1"
+
+
+def _encode_restic_option(value: str) -> str:
+    """Encode one key=value option as the CSV field expected by Restic's -o parser."""
+    output = io.StringIO()
+    csv.writer(output, lineterminator="").writerow([value])
+    return output.getvalue()
 
 
 def restic_command_with_backend_options(command: list[str], environment: dict[str, str]) -> list[str]:
@@ -34,7 +43,8 @@ def restic_command_with_backend_options(command: list[str], environment: dict[st
     if "\\" in rclone_program or any(character.isspace() for character in rclone_program):
         # Restic shell-splits rclone.program itself; quote Windows separators and spaces.
         rclone_program = f'"{rclone_program}"'
-    return [prepared[0], "-o", f"rclone.program={rclone_program}", *prepared[1:]]
+    option = _encode_restic_option(f"rclone.program={rclone_program}")
+    return [prepared[0], "-o", option, *prepared[1:]]
 
 
 def restic_subprocess_environment(environment: dict[str, str]) -> dict[str, str]:

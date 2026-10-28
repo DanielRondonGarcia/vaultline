@@ -301,8 +301,15 @@ class InMemoryJobRepository(JobRepository):
                 job.lease_expires_at = None
                 job.result_summary = result_summary
                 job.log_lines = list(job.log_lines or [])
+                current_timestamps = (
+                    list(job.log_timestamps)
+                    if isinstance(job.log_timestamps, list) and len(job.log_timestamps) == len(job.log_lines)
+                    else [None] * len(job.log_lines)
+                )
                 if interruption_log not in job.log_lines:
                     job.log_lines.append(interruption_log)
+                    current_timestamps.append(None)
+                job.log_timestamps = current_timestamps if any(current_timestamps) else None
                 job.finished_at = None
                 job.updated_at = now
                 reconciled += 1
@@ -356,6 +363,7 @@ class InMemoryJobRepository(JobRepository):
         progress: Dict[str, Any],
         log_lines: List[str],
         result_summary: Optional[Dict[str, Any]] = None,
+        log_timestamps: Optional[List[Optional[str]]] = None,
     ) -> Optional[JobRecord]:
         with self._lock:
             now = utcnow()
@@ -389,9 +397,27 @@ class InMemoryJobRepository(JobRepository):
             context["last_progress_sequence"] = sequence
             current_summary["lease_context"] = context
             job.result_summary = current_summary
-            job.log_lines = (list(job.log_lines or []) + list(log_lines or []))[-self.MAX_LOG_LINES :]
+            current_lines = list(job.log_lines or [])
+            current_timestamps = (
+                list(job.log_timestamps)
+                if isinstance(job.log_timestamps, list) and len(job.log_timestamps) == len(current_lines)
+                else [None] * len(current_lines)
+            )
+            incoming_lines = list(log_lines or [])
+            incoming_timestamps = (
+                list(log_timestamps)
+                if isinstance(log_timestamps, list) and len(log_timestamps) == len(incoming_lines)
+                else [None] * len(incoming_lines)
+            )
+            combined_lines = current_lines + incoming_lines
+            combined_timestamps = current_timestamps + incoming_timestamps
+            offset = max(0, len(combined_lines) - self.MAX_LOG_LINES)
+            job.log_lines = combined_lines[offset:]
+            combined_timestamps = combined_timestamps[offset:]
             while job.log_lines and sum(len(line) for line in job.log_lines if isinstance(line, str)) > self.MAX_LOG_CHARS:
                 job.log_lines.pop(0)
+                combined_timestamps.pop(0)
+            job.log_timestamps = combined_timestamps if any(combined_timestamps) else None
             job.updated_at = now
             return job
 

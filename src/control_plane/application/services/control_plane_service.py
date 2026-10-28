@@ -120,6 +120,10 @@ class ControlPlaneService:
     MAX_PROGRESS_LOG_CHARS = 64 * 1024
     MAX_JOB_LOG_LINES = 1000
     MAX_JOB_LOG_CHARS = 512 * 1024
+    MAX_LOG_TIMESTAMP_CHARS = 64
+    LOG_TIMESTAMP_PATTERN = re.compile(
+        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$"
+    )
     MAX_REPOSITORY_DISPLAY_LENGTH = 256
     MAX_PATH_STORAGE_LENGTH = 4096
     MAX_FILESYSTEM_PATHS = 256
@@ -2113,6 +2117,35 @@ class ControlPlaneService:
             lines.append(line)
         return sequence, normalized, lines
 
+    @classmethod
+    def _validate_log_timestamps(
+        cls,
+        log_lines: Any,
+        log_timestamps: Any,
+    ) -> Optional[List[Optional[str]]]:
+        if log_timestamps is None:
+            return None
+        if (
+            not isinstance(log_lines, list)
+            or not isinstance(log_timestamps, list)
+            or len(log_timestamps) != len(log_lines)
+        ):
+            raise ValueError("log_timestamps must align with log_lines")
+        normalized: List[Optional[str]] = []
+        for timestamp in log_timestamps:
+            if timestamp is None:
+                normalized.append(None)
+            elif (
+                not isinstance(timestamp, str)
+                or not timestamp
+                or len(timestamp) > cls.MAX_LOG_TIMESTAMP_CHARS
+                or not cls.LOG_TIMESTAMP_PATTERN.fullmatch(timestamp)
+            ):
+                raise ValueError("log_timestamps contain an invalid timestamp")
+            else:
+                normalized.append(timestamp)
+        return normalized
+
     def _normalize_runtime_volumes(self, volumes: Dict[str, Dict[str, Any]], target: BackupTargetRecord) -> Dict[str, Dict[str, Any]]:
         normalized: Dict[str, Dict[str, Any]] = {}
         for source, spec in (volumes or {}).items():
@@ -4027,10 +4060,18 @@ class ControlPlaneService:
         )
         return text
 
-    def _bounded_job_log_lines(self, job: JobRecord, log_lines: Any = None) -> List[str]:
+    def _bounded_job_log_entries(
+        self,
+        job: JobRecord,
+        log_lines: Any = None,
+        log_timestamps: Any = None,
+    ) -> tuple[List[str], List[Optional[str]]]:
         source = job.log_lines if log_lines is None else log_lines
         if not isinstance(source, list):
-            return []
+            return [], []
+        timestamp_source = job.log_timestamps if log_timestamps is None and log_lines is None else log_timestamps
+        if not isinstance(timestamp_source, list) or len(timestamp_source) != len(source):
+            timestamp_source = [None] * len(source)
         secrets = self._job_sensitive_values(job)
         context = self._job_storage_context(job)
         context_line = None
@@ -4038,18 +4079,31 @@ class ControlPlaneService:
             profile = context.get("storage_profile_name") or context.get("storage_profile_id") or "sin perfil"
             backend = context.get("backend_type") or context.get("repository_kind") or "unknown"
             context_line = f"Storage profile: {profile}; backend: {backend}; repository: {context['repository_display']}"
-        lines = []
-        for line in source:
+        lines: List[str] = []
+        timestamps: List[Optional[str]] = []
+        for line, timestamp in zip(source, timestamp_source):
             if not isinstance(line, str):
                 continue
             if context_line and line.startswith("Storage profile:"):
                 lines.append(context_line)
             else:
                 lines.append(self._redact_job_text(line, secrets)[:16 * 1024])
+            timestamps.append(
+                timestamp
+                if isinstance(timestamp, str)
+                and len(timestamp) <= self.MAX_LOG_TIMESTAMP_CHARS
+                and self.LOG_TIMESTAMP_PATTERN.fullmatch(timestamp)
+                else None
+            )
         lines = lines[-self.MAX_JOB_LOG_LINES :]
+        timestamps = timestamps[-self.MAX_JOB_LOG_LINES :]
         while lines and sum(len(line) for line in lines) > self.MAX_JOB_LOG_CHARS:
             lines.pop(0)
-        return lines
+            timestamps.pop(0)
+        return lines, timestamps
+
+    def _bounded_job_log_lines(self, job: JobRecord, log_lines: Any = None) -> List[str]:
+        return self._bounded_job_log_entries(job, log_lines)[0]
 
     def _safe_public_value(self, value: Any, job: JobRecord, depth: int = 0) -> Any:
         if depth > 4:
@@ -4309,7 +4363,8 @@ class ControlPlaneService:
         context = summary.get("storage_context") or self._job_storage_context(job)
         progress = summary.get("progress")
         diagnostics = summary.get("lease_diagnostics")
-        return {
+        log_lines, log_timestamps = self._bounded_job_log_entries(job)
+        view = {
             "id": job.id,
             "worker_id": job.worker_id,
             "command": job.command,
@@ -4322,12 +4377,15 @@ class ControlPlaneService:
             "diagnostics": diagnostics if isinstance(diagnostics, dict) else None,
             "storage_context": context,
             "progress": progress if isinstance(progress, dict) else None,
-            "log_lines": self._bounded_job_log_lines(job),
+            "log_lines": log_lines,
             "submitted_at": job.submitted_at,
             "started_at": job.started_at,
             "finished_at": job.finished_at,
             "updated_at": job.updated_at,
         }
+        if any(log_timestamps):
+            view["log_timestamps"] = log_timestamps
+        return view
 
     def _publish_job_event(self, job: JobRecord) -> None:
         try:
@@ -4418,6 +4476,7 @@ class ControlPlaneService:
         log_lines: Any = None,
         lease_token: Optional[str] = None,
         lease_context: Optional[Dict[str, Any]] = None,
+        log_timestamps: Any = None,
     ) -> JobRecord:
         self._require_worker(worker_id)
         job = self._require_job(job_id, reconcile=False)
@@ -4428,6 +4487,7 @@ class ControlPlaneService:
         normalized_sequence, normalized_progress, normalized_lines = self._validate_progress_payload(
             sequence, progress, [] if log_lines is None else log_lines
         )
+        normalized_timestamps = self._validate_log_timestamps(normalized_lines, log_timestamps)
         if isinstance(normalized_progress.get("percent_done"), (int, float)) and normalized_progress["percent_done"] >= 100:
             normalized_progress["percent_done"] = 99.9
         if JobStatus.normalize(job.status) != JobStatus.IN_PROGRESS:
@@ -4458,6 +4518,7 @@ class ControlPlaneService:
                 progress=normalized_progress,
                 log_lines=normalized_lines,
                 result_summary=result_summary or None,
+                log_timestamps=normalized_timestamps,
             )
             if updated is None:
                 raise ValueError(f"job '{job_id}' progress lease is invalid or stale")
@@ -4476,7 +4537,20 @@ class ControlPlaneService:
         merged_summary["progress"] = normalized_progress
         merged_summary["progress_sequence"] = normalized_sequence
         job.result_summary = merged_summary
-        job.log_lines = self._bounded_job_log_lines(job, list(job.log_lines or []) + normalized_lines)
+        current_lines = list(job.log_lines or [])
+        current_timestamps = (
+            list(job.log_timestamps)
+            if isinstance(job.log_timestamps, list) and len(job.log_timestamps) == len(current_lines)
+            else [None] * len(current_lines)
+        )
+        incoming_timestamps = normalized_timestamps or [None] * len(normalized_lines)
+        bounded_lines, bounded_timestamps = self._bounded_job_log_entries(
+            job,
+            current_lines + normalized_lines,
+            current_timestamps + incoming_timestamps,
+        )
+        job.log_lines = bounded_lines
+        job.log_timestamps = bounded_timestamps if any(bounded_timestamps) else None
         job.updated_at = utcnow()
         saved_job = self.job_repository.save(job)
         self._publish_job_event(saved_job)
@@ -4491,6 +4565,7 @@ class ControlPlaneService:
         log_lines: Optional[List[str]] = None,
         lease_token: Optional[str] = None,
         lease_context: Optional[Dict[str, Any]] = None,
+        log_timestamps: Any = None,
     ) -> JobRecord:
         self._require_worker(worker_id)
         job = self._require_job(job_id, reconcile=False)
@@ -4510,8 +4585,14 @@ class ControlPlaneService:
         )
         if not isinstance(lease_token, str) or not hmac.compare_digest(job.lease_token or "", lease_token):
             raise ValueError(f"job '{job_id}' lease token is invalid or stale")
+        incoming_log_lines = list(log_lines or []) if isinstance(log_lines, (list, tuple)) else []
+        normalized_timestamps = self._validate_log_timestamps(incoming_log_lines, log_timestamps)
+        incoming_timestamps = normalized_timestamps or [None] * len(incoming_log_lines)
+        digest_values = [JobStatus.normalize(status), result_summary, log_lines]
+        if normalized_timestamps and any(normalized_timestamps):
+            digest_values.append(normalized_timestamps)
         report_digest = hashlib.sha256(json.dumps(
-            [JobStatus.normalize(status), result_summary, log_lines],
+            digest_values,
             sort_keys=True, separators=(",", ":"), ensure_ascii=True,
         ).encode()).hexdigest()
         if job.status != JobStatus.IN_PROGRESS and not late_after_lease_expiry:
@@ -4528,9 +4609,10 @@ class ControlPlaneService:
                 worker_id,
                 status,
             )
-            log_lines = list(log_lines or []) + [
+            incoming_log_lines.append(
                 "Late terminal report accepted after lease expiry; the worker_lease_expired diagnostic was superseded."
-            ]
+            )
+            incoming_timestamps.append(None)
         job.status = status
         job.updated_at = utcnow()
         incoming_lease_context = lease_context
@@ -4557,10 +4639,19 @@ class ControlPlaneService:
         completed = dict(job.result_summary) if isinstance(job.result_summary, dict) else {}
         completed["_terminal_report_digest"] = report_digest
         job.result_summary = completed
-        if log_lines:
-            job.log_lines = self._bounded_job_log_lines(job, list(job.log_lines or []) + list(log_lines))
-        else:
-            job.log_lines = self._bounded_job_log_lines(job)
+        current_lines = list(job.log_lines or [])
+        current_timestamps = (
+            list(job.log_timestamps)
+            if isinstance(job.log_timestamps, list) and len(job.log_timestamps) == len(current_lines)
+            else [None] * len(current_lines)
+        )
+        bounded_lines, bounded_timestamps = self._bounded_job_log_entries(
+            job,
+            current_lines + incoming_log_lines,
+            current_timestamps + incoming_timestamps,
+        )
+        job.log_lines = bounded_lines
+        job.log_timestamps = bounded_timestamps if any(bounded_timestamps) else None
         if status in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELED):
             job.finished_at = utcnow()
             completed_summary = result_summary or job.result_summary or {}

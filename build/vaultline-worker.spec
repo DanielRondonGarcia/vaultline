@@ -81,7 +81,10 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='vaultline-worker-runtime',
+# Windows installs the launcher as the stable service host and this payload as a
+# replaceable vaultline-worker-runtime.exe; on non-Windows platforms the single
+# worker executable keeps its historical name.
+    name='vaultline-worker-runtime' if sys.platform == 'win32' else 'vaultline-worker',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

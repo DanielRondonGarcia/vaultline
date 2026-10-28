@@ -114,6 +114,10 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertNotIn("python-version:", self.windows_job())
         self.assertIn("vaultline-worker_${{ needs.prepare.outputs.new_version }}_windows-amd64.exe", self.workflow)
         self.assertRegex(self.workflow, r"vaultline-worker(?:\.exe)? --help")
+        # The launcher must carry the fixed FileVersion that MSI upgrade rules use
+        # to keep it across major upgrades; CI proves the embedded version resource.
+        self.assertIn("VersionInfo.FileVersion", self.workflow)
+        self.assertIn("expected fixed 4.0.0.0", self.workflow)
         self.assertIn("actions/upload-artifact@v4", self.workflow)
 
     def windows_job(self) -> str:

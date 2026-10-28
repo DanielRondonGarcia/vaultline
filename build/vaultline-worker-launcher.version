@@ -1,0 +1,36 @@
+# PyInstaller version info for the stable Windows launcher.
+# FileVersion stays 4.0.0.0 across releases so MSI file-versioning rules never
+# replace the launcher during a major upgrade; the replaceable runtime carries
+# the actual release version.
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(4, 0, 0, 0),
+    prodvers=(4, 0, 0, 0),
+    mask=0x3F,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          u'040904B0',
+          [
+            StringStruct(u'CompanyName', u'Vaultline'),
+            StringStruct(u'FileDescription', u'Vaultline Worker stable launcher'),
+            StringStruct(u'FileVersion', u'4.0.0.0'),
+            StringStruct(u'InternalName', u'vaultline-worker'),
+            StringStruct(u'LegalCopyright', u'Vaultline'),
+            StringStruct(u'OriginalFilename', u'vaultline-worker.exe'),
+            StringStruct(u'ProductName', u'Vaultline Worker'),
+            StringStruct(u'ProductVersion', u'4.0.0.0')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([Struct(u'VarFileInfo', [Translation(0x0409, 0x04B0)])])
+  ]
+)

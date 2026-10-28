@@ -262,6 +262,9 @@ jobs:
         run: |
           & dist\vaultline-worker.exe --help
           if ($LASTEXITCODE -ne 0) { throw "stable vaultline-worker.exe --help exited with $LASTEXITCODE" }
+          $LauncherFileVersion = (Get-Item dist\vaultline-worker.exe).VersionInfo.FileVersion
+          if ($LauncherFileVersion -ne '4.0.0.0') { throw "launcher FileVersion is $LauncherFileVersion, expected fixed 4.0.0.0" }
+          Write-Host "launcher FileVersion: $LauncherFileVersion"
           & dist\vaultline-worker-runtime.exe --help
           if ($LASTEXITCODE -ne 0) { throw "vaultline-worker-runtime.exe --help exited with $LASTEXITCODE" }
 

@@ -4,6 +4,9 @@
 from pathlib import Path
 
 ROOT = Path(SPECPATH).resolve().parent
+LAUNCHER_VERSION = ROOT / "build/vaultline-worker-launcher.version"
+if not LAUNCHER_VERSION.is_file():
+    raise SystemExit(f"the launcher version file is missing: {LAUNCHER_VERSION}")
 
 a = Analysis(
     [str(ROOT / "src/worker_agent/launcher.py")],
@@ -26,6 +29,7 @@ exe = EXE(
     a.datas,
     [],
     name="vaultline-worker",
+    version=str(LAUNCHER_VERSION),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

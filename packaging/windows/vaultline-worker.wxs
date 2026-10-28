@@ -73,8 +73,9 @@
       Language="1033">
 
     <!-- Install the new product before removing the old one. The stable launcher
-         component uses the same path/keypath so Windows Installer keeps its client
-         reference through upgrade; its fixed file version prevents replacement. -->
+         component's keypath is the only component in WorkerExecutable, so Windows Installer keeps its
+         client reference through upgrade; its fixed FileVersion (4.0.0.0, embedded in the launcher
+         exe by build/vaultline-worker-launcher.version) prevents replacement. -->
     <MajorUpgrade Schedule="afterInstallExecute" DowngradeErrorMessage="A newer version of Vaultline Worker is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
@@ -93,7 +94,7 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Vaultline">
         <Component Id="WorkerExecutable" Guid="*">
-          <File Id="LauncherExe" Source="$(var.LauncherExe)" Name="vaultline-worker.exe" Version="4.0.0.0" KeyPath="yes" />
+          <File Id="LauncherExe" Source="$(var.LauncherExe)" Name="vaultline-worker.exe" KeyPath="yes" />
           <ServiceInstall
               Id="VaultlineWorkerService"
               Name="VaultlineWorker"

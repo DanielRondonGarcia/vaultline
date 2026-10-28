@@ -68,7 +68,9 @@ class WorkerMsiPackageTests(unittest.TestCase):
         self.assertEqual(set(files), {"LauncherExe", "WorkerExe", "ResticExe", "RcloneExe", "ResticLicenseFile", "RcloneLicenseFile"})
         self.assertEqual(files["LauncherExe"].get("Source"), "$(var.LauncherExe)")
         self.assertEqual(files["LauncherExe"].get("Name"), "vaultline-worker.exe")
-        self.assertEqual(files["LauncherExe"].get("Version"), "4.0.0.0")
+        # WiX v4 rejects a Version attribute on File (WIX0004); the fixed launcher
+        # FileVersion is embedded in the exe via build/vaultline-worker-launcher.version.
+        self.assertIsNone(files["LauncherExe"].get("Version"), "File must not declare a Version attribute in WiX v4")
         self.assertEqual(files["WorkerExe"].get("Source"), "$(var.WorkerExe)")
         self.assertEqual(files["WorkerExe"].get("Name"), "vaultline-worker-runtime.exe")
         self.assertIn("WorkerExe", self.source)

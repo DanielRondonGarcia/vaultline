@@ -75,9 +75,19 @@ class WorkerPackagingTests(unittest.TestCase):
         self.assertIn("src/worker_agent/launcher.py", launcher_spec.replace("\\\\", "/"))
         self.assertIn('name="vaultline-worker"', launcher_spec)
         self.assertIn("name='vaultline-worker-runtime'", runtime_spec)
+        # Linux has no launcher split: the Windows-only platform guard decides whether
+        # the one-file build is the replaceable runtime payload or the legacy single exe.
+        self.assertIn("name='vaultline-worker-runtime' if sys.platform == 'win32' else 'vaultline-worker'", runtime_spec)
+        self.assertIn('name="vaultline-worker"', launcher_spec)
+        self.assertIn("version=str(LAUNCHER_VERSION)", launcher_spec)
         self.assertIn('Name="vaultline-worker.exe"', wix_source)
         self.assertIn('Name="vaultline-worker-runtime.exe"', wix_source)
-        self.assertIn('Version="4.0.0.0"', wix_source)
+        # WiX v4 rejects File/@Version (WIX0004); the launcher pin lives in the
+        # version file embedded by the launcher spec, not in the WiX source.
+        self.assertIn("build/vaultline-worker-launcher.version", launcher_spec)
+        version_pin = Path("build/vaultline-worker-launcher.version").read_text(encoding="utf-8")
+        self.assertIn("filevers=(4, 0, 0, 0)", version_pin)
+        self.assertNotIn('Version="4.0.0.0"', wix_source)
         self.assertIn('ServiceInstall', wix_source)
         self.assertIn('Arguments="service run"', wix_source)
         self.assertIn('Schedule="afterInstallExecute"', wix_source)

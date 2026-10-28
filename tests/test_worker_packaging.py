@@ -48,7 +48,7 @@ class WorkerPackagingTests(unittest.TestCase):
         self.assertTrue(spec_path.exists(), "vaultline-worker PyInstaller spec is required")
         spec = spec_path.read_text(encoding="utf-8")
 
-        self.assertIn("name='vaultline-worker'", spec)
+        self.assertIn("name='vaultline-worker-runtime'", spec)
         self.assertIn("console=True", spec)
         self.assertIn("src/worker_agent/cli.py", spec.replace("\\\\", "/"))
         self.assertIn("src.app.main", spec)
@@ -64,6 +64,23 @@ class WorkerPackagingTests(unittest.TestCase):
         self.assertIn("restic-v0.19.1-LICENSE", spec)
         self.assertIn("rclone-v1.75.2-COPYING", spec)
         self.assertNotIn("tar.exe", spec.lower())
+
+    def test_stable_launcher_and_replaceable_runtime_have_separate_msi_roles(self):
+        launcher_spec_path = Path("build/vaultline-worker-launcher.spec")
+        runtime_spec = Path("build/vaultline-worker.spec").read_text(encoding="utf-8")
+        wix_source = Path("packaging/windows/vaultline-worker.wxs").read_text(encoding="utf-8")
+
+        self.assertTrue(launcher_spec_path.is_file(), "stable launcher PyInstaller spec is required")
+        launcher_spec = launcher_spec_path.read_text(encoding="utf-8")
+        self.assertIn("src/worker_agent/launcher.py", launcher_spec.replace("\\\\", "/"))
+        self.assertIn('name="vaultline-worker"', launcher_spec)
+        self.assertIn("name='vaultline-worker-runtime'", runtime_spec)
+        self.assertIn('Name="vaultline-worker.exe"', wix_source)
+        self.assertIn('Name="vaultline-worker-runtime.exe"', wix_source)
+        self.assertIn('Version="4.0.0.0"', wix_source)
+        self.assertIn('ServiceInstall', wix_source)
+        self.assertIn('Arguments="service run"', wix_source)
+        self.assertIn('Schedule="afterInstallExecute"', wix_source)
 
     def test_pinned_restic_archives_use_the_supplied_sha256_digests(self):
         self.assertEqual(download_pinned_restic.RELEASE_TAG, "v0.19.1")

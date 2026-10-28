@@ -4,11 +4,13 @@
 
   Install -> enroll flow (Tailscale-style):
     1. `msiexec /i vaultline-worker_<version>_windows-amd64.msi` installs
-       vaultline-worker.exe, restic.exe and rclone.exe under
+       the stable vaultline-worker.exe launcher, its replaceable
+       vaultline-worker-runtime.exe payload, restic.exe and rclone.exe under
        "Program Files\Vaultline", adds that folder to the system PATH,
        registers the Windows service "VaultlineWorker"
-       (LocalSystem, auto-start, command line `vaultline-worker.exe service run`)
-       and starts it. The service idles, logging "Waiting for enrollment" to
+       (LocalSystem, auto-start, command line `vaultline-worker.exe service run`); the stable launcher
+       delegates service execution to the replaceable runtime payload and
+       starts it. The service idles, logging "Waiting for enrollment" to
        %ProgramData%\Vaultline\worker\logs\worker.log, until it is enrolled.
     2. An administrator runs the enroll subcommand (see the service Description
        below for the exact command line), which writes the enrollment state
@@ -32,15 +34,19 @@
 
   Build (CI; the Util extension must be added first with
   `wix extension add -g WixToolset.Util.wixext/<wix version>`):
-    wix build -arch x64 -ext WixToolset.Util.wixext -d Version=<semver> -d WorkerExe=dist\vaultline-worker.exe \
+    wix build -arch x64 -ext WixToolset.Util.wixext -d Version=<semver> -d LauncherExe=dist\vaultline-worker.exe \
+      -d WorkerExe=dist\vaultline-worker-runtime.exe \
       -d ResticExe=dist\restic.exe -d RcloneExe=dist\rclone.exe \
       -o dist\release\vaultline-worker_<semver>_windows-amd64.msi packaging\windows\vaultline-worker.wxs
 -->
 <?ifndef Version ?>
   <?error Version must be defined: wix build -d Version=<semver> ?>
 <?endif?>
+<?ifndef LauncherExe ?>
+  <?define LauncherExe = "dist\vaultline-worker.exe" ?>
+<?endif?>
 <?ifndef WorkerExe ?>
-  <?define WorkerExe = "dist\vaultline-worker.exe" ?>
+  <?define WorkerExe = "dist\vaultline-worker-runtime.exe" ?>
 <?endif?>
 <?ifndef ResticExe ?>
   <?define ResticExe = "dist\restic.exe" ?>
@@ -66,13 +72,15 @@
       Compressed="yes"
       Language="1033">
 
-    <!-- Remove the old product during execute so its ServiceControl stop/remove
-         runs before the shared install path is replaced by the new executable. -->
-    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer version of Vaultline Worker is already installed." />
+    <!-- Install the new product before removing the old one. The stable launcher
+         component uses the same path/keypath so Windows Installer keeps its client
+         reference through upgrade; its fixed file version prevents replacement. -->
+    <MajorUpgrade Schedule="afterInstallExecute" DowngradeErrorMessage="A newer version of Vaultline Worker is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Feature Id="WorkerFeature" Title="Vaultline Worker" Level="1">
       <ComponentRef Id="WorkerExecutable" />
+      <ComponentRef Id="WorkerRuntimeExecutable" />
       <ComponentRef Id="ResticExecutable" />
       <ComponentRef Id="RcloneExecutable" />
       <ComponentRef Id="ResticLicense" />
@@ -84,8 +92,8 @@
     <!-- Program Files\Vaultline: binary, service registration, PATH entry. -->
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Vaultline">
-        <Component Id="WorkerExecutable">
-          <File Id="WorkerExe" Source="$(var.WorkerExe)" Name="vaultline-worker.exe" KeyPath="yes" />
+        <Component Id="WorkerExecutable" Guid="*">
+          <File Id="LauncherExe" Source="$(var.LauncherExe)" Name="vaultline-worker.exe" Version="4.0.0.0" KeyPath="yes" />
           <ServiceInstall
               Id="VaultlineWorkerService"
               Name="VaultlineWorker"
@@ -120,6 +128,9 @@
               Action="set"
               Part="last"
               System="yes" />
+        </Component>
+        <Component Id="WorkerRuntimeExecutable" Guid="E1916EAB-2E55-4B3F-8CCB-35D48D44A871">
+          <File Id="WorkerExe" Source="$(var.WorkerExe)" Name="vaultline-worker-runtime.exe" KeyPath="yes" />
         </Component>
         <Component Id="ResticExecutable" Guid="E09E9E7E-7E50-453C-A266-57F47EC1B833">
           <File Id="ResticExe" Source="$(var.ResticExe)" Name="restic.exe" KeyPath="yes" />

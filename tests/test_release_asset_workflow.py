@@ -73,9 +73,17 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertLess(linux_job.index("scripts/set_worker_build_version.py"), linux_job.index("python -m PyInstaller"))
         self.assertRegex(self.workflow, r"dist/vaultline-worker --help")
 
-    def test_version_stamp_precedes_windows_pyinstaller_and_defaults_to_dev(self):
+    def test_version_stamps_bracket_lower_and_current_runtime_builds(self):
         job = self.windows_job()
-        self.assertLess(job.index("scripts/set_worker_build_version.py"), job.index("python -m PyInstaller"))
+        launcher_build = job.index("PyInstaller build/vaultline-worker-launcher.spec")
+        lower_stamp = job.index("scripts/set_worker_build_version.py $LowerVersion")
+        lower_runtime_build = job.index("PyInstaller build/vaultline-worker.spec")
+        current_stamp = job.index('scripts/set_worker_build_version.py "${{ needs.prepare.outputs.new_version }}"')
+        current_runtime_build = job.rindex("PyInstaller build/vaultline-worker.spec")
+        self.assertLess(launcher_build, lower_stamp)
+        self.assertLess(lower_stamp, lower_runtime_build)
+        self.assertLess(lower_runtime_build, current_stamp)
+        self.assertLess(current_stamp, current_runtime_build)
         self.assertIn("scripts/download_pinned_restic.py --platform windows --arch amd64", job)
         self.assertIn("scripts/download_pinned_rclone.py --platform windows --arch amd64", job)
         self.assertIn("$env:VAULTLINE_RESTIC_BINARY", job)
@@ -118,7 +126,8 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertRegex(job, r"dotnet tool install --global wix --version 5\.\d+\.\d+")
         self.assertRegex(job, r"wix build -arch x64 .*packaging[\\/]windows[\\/]vaultline-worker\.wxs")
         self.assertRegex(job, r"wix build .*-d Version=\$Version")
-        self.assertRegex(job, r"wix build .*-d WorkerExe=dist[\\/]vaultline-worker\.exe")
+        self.assertIn("-d LauncherExe=dist\\vaultline-worker.exe", job)
+        self.assertRegex(job, r"wix build .*?-d WorkerExe=dist[\\/](?:lower[\\/])?vaultline-worker-runtime\.exe")
         self.assertIn('vaultline-worker_${Version}_windows-amd64.msi', job)
         # Both MSI builds (release and lower-version upgrade smoke) install the
         # verified Restic and rclone beside the worker from the staged dist copies.
@@ -141,9 +150,8 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertLess(job.index("wix extension add -g WixToolset.Util.wixext"), job.index("wix build"))
         self.assertIn("vaultline-worker_${{ needs.prepare.outputs.new_version }}_windows-amd64.msi", job)
         self.assertIn("vaultline-worker_${{ needs.prepare.outputs.new_version }}_windows-amd64.exe", job)
-        # The exe is moved to its release name before the msi is built, so the
-        # msi build must consume the portable exe from its staged location.
-        self.assertLess(job.index("wix build"), job.index("Move-Item -Path dist\\vaultline-worker.exe"))
+        # The versioned portable artifact is the standalone runtime, not the MSI-only stable launcher.
+        self.assertLess(job.index("wix build"), job.index("Move-Item -Path dist\\vaultline-worker-runtime.exe"))
 
     def test_windows_msi_smoke_upgrades_lower_version_checks_service_and_uninstalls(self):
         job = self.windows_job()
@@ -161,6 +169,10 @@ class ReleaseAssetWorkflowTests(unittest.TestCase):
         self.assertIn("VaultlineWorker", smoke)
         self.assertIn("'Running'", smoke)
         self.assertIn("C:\\Program Files\\Vaultline\\vaultline-worker.exe", smoke)
+        self.assertIn("C:\\Program Files\\Vaultline\\vaultline-worker-runtime.exe", smoke)
+        self.assertIn("$LauncherHashBeforeUpgrade", smoke)
+        self.assertIn("$LauncherHashAfterUpgrade", smoke)
+        self.assertIn("wrong runtime version", smoke)
         self.assertIn("C:\\Program Files\\Vaultline\\restic.exe", smoke)
         self.assertIn("C:\\Program Files\\Vaultline\\rclone.exe", smoke)
         self.assertIn("installed tool missing at $tool", smoke)

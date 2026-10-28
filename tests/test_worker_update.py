@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import os
 import subprocess
@@ -10,7 +9,7 @@ from unittest.mock import patch
 
 from src.worker_agent.update import (
     UpdateError,
-    build_msi_handoff_script,
+    stop_worker_service,
     download_verified_installer,
     is_newer_version,
     launch_msi_update,
@@ -126,15 +125,16 @@ class WorkerUpdateParsingTests(unittest.TestCase):
             __import__("src.worker_agent.update", fromlist=["sys"]).sys, "frozen", True, create=True
         ), patch("src.worker_agent.update._is_msi_installation", return_value=True), patch(
             "src.worker_agent.update._is_user_admin", return_value=True
-        ), patch("src.worker_agent.update.BUILD_VERSION", "3.15.15"), patch(
-            "src.worker_agent.update.fetch_latest_release", return_value=release
-        ), patch(
+        ), patch("src.worker_agent.update.fetch_latest_release", return_value=release), patch(
             "src.worker_agent.update.download_verified_installer",
             return_value=(Path("C:/Temp/worker.msi"), Path("C:/Temp/msi-update.log")),
-        ) as download, patch("src.worker_agent.update.launch_msi_update") as launch:
-            message = run_worker_update()
+        ) as download, patch("src.worker_agent.update.launch_msi_update", return_value=0) as launch:
+            message = run_worker_update(current_version="3.15.15")
 
-        self.assertEqual(message, "Update to 3.15.16 started; MSI log: C:\\Temp\\msi-update.log")
+        self.assertEqual(
+            message,
+            "Vaultline Worker update to 3.15.16 completed successfully. MSI log: C:\\Temp\\msi-update.log",
+        )
         download.assert_called_once_with(release)
         launch.assert_called_once_with(Path("C:/Temp/worker.msi"), Path("C:/Temp/msi-update.log"))
 
@@ -144,12 +144,10 @@ class WorkerUpdateParsingTests(unittest.TestCase):
             __import__("src.worker_agent.update", fromlist=["sys"]).sys, "frozen", True, create=True
         ), patch("src.worker_agent.update._is_msi_installation", return_value=True), patch(
             "src.worker_agent.update._is_user_admin", return_value=True
-        ), patch("src.worker_agent.update.BUILD_VERSION", "3.15.16"), patch(
-            "src.worker_agent.update.fetch_latest_release", return_value=release
-        ), patch("src.worker_agent.update.download_verified_installer") as download, patch(
-            "src.worker_agent.update.launch_msi_update"
-        ) as launch:
-            message = run_worker_update()
+        ), patch("src.worker_agent.update.fetch_latest_release", return_value=release), patch(
+            "src.worker_agent.update.download_verified_installer"
+        ) as download, patch("src.worker_agent.update.launch_msi_update") as launch:
+            message = run_worker_update(current_version="3.15.16")
 
         self.assertEqual(message, "Vaultline Worker is already up to date (3.15.16).")
         download.assert_not_called()
@@ -162,7 +160,7 @@ class WorkerUpdateParsingTests(unittest.TestCase):
             "src.worker_agent.update._is_user_admin", return_value=False
         ), patch("src.worker_agent.update.fetch_latest_release") as fetch:
             with self.assertRaisesRegex(UpdateError, "Administrator"):
-                run_worker_update()
+                run_worker_update(current_version="3.15.15")
 
         fetch.assert_not_called()
 
@@ -172,14 +170,12 @@ class WorkerUpdateParsingTests(unittest.TestCase):
             sys, "frozen", True, create=True
         ), patch("src.worker_agent.update._is_msi_installation", return_value=True), patch(
             "src.worker_agent.update._is_user_admin", return_value=True
-        ), patch("src.worker_agent.update.BUILD_VERSION", "3.15.15"), patch(
-            "src.worker_agent.update.fetch_latest_release", return_value=release
-        ), patch(
+        ), patch("src.worker_agent.update.fetch_latest_release", return_value=release), patch(
             "src.worker_agent.update.download_verified_installer",
             side_effect=UpdateError("SHA256 checksum mismatch"),
         ), patch("src.worker_agent.update.launch_msi_update") as launch:
             with self.assertRaisesRegex(UpdateError, "checksum mismatch"):
-                run_worker_update()
+                run_worker_update(current_version="3.15.15")
 
         launch.assert_not_called()
 
@@ -188,40 +184,56 @@ class WorkerUpdateParsingTests(unittest.TestCase):
             "src.worker_agent.update.fetch_latest_release"
         ) as fetch:
             with self.assertRaisesRegex(UpdateError, "only for the Windows MSI"):
-                run_worker_update()
+                run_worker_update(current_version="3.15.15")
 
         fetch.assert_not_called()
 
-    def test_msi_handoff_waits_for_cli_exit_and_quotes_paths(self):
-        script = build_msi_handoff_script(
-            1234,
-            r"C:\Users\O'Neil\AppData\Local\Temp\vaultline-worker_3.15.16.msi",
-            r"C:\Users\O'Neil\AppData\Local\Temp\vaultline-update.log",
-        )
+    def test_service_stop_waits_for_the_service_to_be_stopped(self):
+        with patch.dict(os.environ, {"SystemRoot": "C:/Windows"}), patch.object(
+            Path, "is_file", return_value=True
+        ), patch(
+            "src.worker_agent.update.subprocess.run",
+            return_value=subprocess.CompletedProcess([], 0),
+        ) as run:
+            stop_worker_service()
 
-        self.assertLess(script.index("Wait-Process"), script.index("msiexec.exe"))
-        self.assertIn("O''Neil", script)
-        self.assertIn("/passive", script)
-        self.assertIn("/norestart", script)
+        command = run.call_args.args[0]
+        self.assertIn("-Command", command)
+        script = command[-1]
+        self.assertIn("Stop-Service -Name 'VaultlineWorker'", script)
+        self.assertIn("WaitForStatus", script)
+        self.assertNotIn("Wait-Process", script)
 
-    def test_launcher_uses_detached_powershell_with_encoded_handoff(self):
+    def test_msi_update_runs_foreground_and_streams_log_until_completion(self):
+        class FakeProcess:
+            returncode = 0
+
+            def __init__(self):
+                self.polls = iter([None, 0])
+
+            def poll(self):
+                return next(self.polls)
+
         installer = Path("C:/Temp/worker.msi")
         log = Path("C:/Temp/update.log")
         with patch.dict(os.environ, {"SystemRoot": "C:/Windows"}), patch.object(
             Path, "is_file", return_value=True
-        ), patch.object(subprocess, "DETACHED_PROCESS", 0x00000008, create=True), patch.object(
-            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200, create=True
-        ), patch("src.worker_agent.update.subprocess.Popen") as popen:
-            launch_msi_update(installer, log)
+        ), patch("src.worker_agent.update.stop_worker_service") as stop, patch(
+            "src.worker_agent.update.subprocess.Popen", return_value=FakeProcess()
+        ) as popen, patch("src.worker_agent.update._stream_msi_log", side_effect=[4, 8]) as stream, patch(
+            "src.worker_agent.update.time.sleep"
+        ), patch("builtins.print"):
+            result = launch_msi_update(installer, log)
 
+        self.assertEqual(result, 0)
+        stop.assert_called_once_with()
         args, kwargs = popen.call_args
-        expected_powershell = str(Path("C:/Windows") / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
-        self.assertEqual(args[0][0], expected_powershell)
-        script = base64.b64decode(args[0][-1]).decode("utf-16le")
-        self.assertLess(script.index("Wait-Process"), script.index("msiexec.exe"))
-        self.assertEqual(kwargs["creationflags"], 0x208)
-        self.assertIs(kwargs["stdout"], subprocess.DEVNULL)
-        self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+        self.assertEqual(args[0][0], str(Path("C:/Windows") / "System32" / "msiexec.exe"))
+        self.assertIn("/i", args[0])
+        self.assertIn("/qn", args[0])
+        self.assertIn("/L*V", args[0])
+        self.assertNotIn("creationflags", kwargs)
+        self.assertEqual(stream.call_count, 2)
 
 
 if __name__ == "__main__":

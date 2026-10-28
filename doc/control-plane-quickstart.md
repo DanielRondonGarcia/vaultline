@@ -229,7 +229,7 @@ Los binarios y el MSI no están firmados: Windows SmartScreen puede advertirlo. 
 Actualizar y desinstalar:
 
 - **Actualizar en Linux**: instala el `.deb` nuevo con el gestor de paquetes; el `postinst` reinicia la unidad si estaba activa.
-- **Actualizar en Windows**: desde una PowerShell elevada, ejecuta `vaultline-worker update`. El comando obtiene el último release estable de GitHub, verifica el MSI contra `SHA256SUMS` del mismo release y delega la instalación al MSI, que detiene y vuelve a arrancar el servicio. Solo admite la instalación MSI predeterminada en `C:\Program Files\Vaultline`, no el `.exe` portable. El primer MSI que incluya `update` debe instalarse manualmente. El estado y la credencial se conservan; no hace falta re-enrolar.
+- **Actualizar en Windows**: desde una PowerShell elevada, ejecuta `vaultline-worker update`. El lanzador estable obtiene el último release estable de GitHub y verifica el MSI contra `SHA256SUMS` del mismo release; después detiene y espera a `VaultlineWorker`, ejecuta Windows Installer en primer plano y transmite el log MSI a la misma consola hasta terminar. El MSI vuelve a iniciar el servicio durante la instalación. Solo admite la instalación MSI predeterminada en `C:\Program Files\Vaultline`, no el `.exe` portable. El primer MSI que incluya el lanzador estable debe instalarse manualmente desde PowerShell elevada; las actualizaciones posteriores son inline. El estado y la credencial se conservan; no hace falta re-enrolar.
 - **Confianza del paquete**: los paquetes no están firmados. `SHA256SUMS` detecta corrupción, pero no autentica un release o una cuenta de publicación comprometidos.
 - **Desinstalar**: `sudo apt remove vaultline-worker` detiene y deshabilita la unidad; el MSI (Panel de control o `msiexec /x`) elimina el servicio y el ejecutable. Ninguno borra el directorio de estado, así que una reinstalación posterior arranca ya enrolada. Bórralo a mano si quieres retirar la credencial del host y revoca el worker en la UI.
 
@@ -378,7 +378,7 @@ pueda leerlos. Para variables no secretas (`WORKER_NAME`,
 entorno siempre gana sobre `worker.json`. Reinicia el servicio después de
 cambiarlas: `vaultline-worker service stop` y `vaultline-worker service start`.
 
-Actualizar: desde una PowerShell elevada, ejecuta `vaultline-worker update`; el comando verifica el MSI de la última release estable y el instalador conserva el estado y la credencial. Desinstalar: `msiexec /x vaultline-worker_<version>_windows-amd64.msi /qn`
+Actualizar: desde una PowerShell elevada, ejecuta `vaultline-worker update`; el lanzador estable verifica el MSI, detiene y espera al servicio, ejecuta la instalación en primer plano y transmite el log MSI a la consola hasta que finaliza. La instalación conserva el estado y la credencial. Desinstalar: `msiexec /x vaultline-worker_<version>_windows-amd64.msi /qn`
 (o Panel de control) elimina el servicio y el ejecutable, pero conserva
 `C:\ProgramData\Vaultline\worker`.
 

@@ -224,10 +224,15 @@ jobs:
           if (-not ($ResolvedPython -like (Join-Path $env:RUNNER_TEMP "*"))) { throw "python resolved to $ResolvedPython outside the pinned RUNNER_TEMP install" }
           Write-Host "Pinned CPython $Pinned is on PATH at $ResolvedPython"
 
-      - name: Build onefile worker
+      - name: Build stable launcher and versioned worker runtimes
         shell: pwsh
         run: |
-          python scripts/set_worker_build_version.py "${{ needs.prepare.outputs.new_version }}"
+          $ErrorActionPreference = 'Stop'
+          $Version = [version]"${{ needs.prepare.outputs.new_version }}"
+          if ($Version.Build -gt 0) { $LowerVersion = "$($Version.Major).$($Version.Minor).$($Version.Build - 1)" }
+          elseif ($Version.Minor -gt 0) { $LowerVersion = "$($Version.Major).$($Version.Minor - 1).999" }
+          elseif ($Version.Major -gt 0) { $LowerVersion = "$($Version.Major - 1).999.999" }
+          else { throw "Cannot derive a lower MSI version from $Version" }
           python -m pip install -r requirements-build.txt
           python scripts/check_python_runtime.py
           if ($LASTEXITCODE -ne 0) { throw "pinned runtime/startup check exited with $LASTEXITCODE" }
@@ -239,8 +244,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "pinned rclone download failed with $LASTEXITCODE" }
           $env:VAULTLINE_RESTIC_BINARY = Join-Path $ResticOutput "restic.exe"
           $env:VAULTLINE_RCLONE_BINARY = Join-Path $RcloneOutput "rclone.exe"
+          python -m PyInstaller build/vaultline-worker-launcher.spec --distpath dist --workpath build/pyinstaller-launcher-windows-amd64 --noconfirm
+          if ($LASTEXITCODE -ne 0) { throw "stable launcher build exited with $LASTEXITCODE" }
+          python scripts/set_worker_build_version.py $LowerVersion
+          python -m PyInstaller build/vaultline-worker.spec --distpath dist\lower --workpath build/pyinstaller-worker-lower-windows-amd64 --noconfirm
+          if ($LASTEXITCODE -ne 0) { throw "lower-version runtime build exited with $LASTEXITCODE" }
+          python scripts/set_worker_build_version.py "${{ needs.prepare.outputs.new_version }}"
           python -m PyInstaller build/vaultline-worker.spec --distpath dist --workpath build/pyinstaller-windows-amd64 --noconfirm
-          if ($LASTEXITCODE -ne 0) { throw "PyInstaller build exited with $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "current-version runtime build exited with $LASTEXITCODE" }
           Copy-Item -LiteralPath $env:VAULTLINE_RESTIC_BINARY -Destination dist\restic.exe
           Copy-Item -LiteralPath $env:VAULTLINE_RCLONE_BINARY -Destination dist\rclone.exe
           Remove-Item -LiteralPath $ResticOutput -Recurse -Force
@@ -250,7 +261,9 @@ jobs:
         shell: pwsh
         run: |
           & dist\vaultline-worker.exe --help
-          if ($LASTEXITCODE -ne 0) { throw "vaultline-worker.exe --help exited with $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "stable vaultline-worker.exe --help exited with $LASTEXITCODE" }
+          & dist\vaultline-worker-runtime.exe --help
+          if ($LASTEXITCODE -ne 0) { throw "vaultline-worker-runtime.exe --help exited with $LASTEXITCODE" }
 
       - name: Install WiX Toolset
         shell: pwsh
@@ -266,7 +279,7 @@ jobs:
         run: |
           $Version = "${{ needs.prepare.outputs.new_version }}"
           New-Item -ItemType Directory -Force -Path dist\release | Out-Null
-          wix build -arch x64 -ext WixToolset.Util.wixext -d Version=$Version -d WorkerExe=dist\vaultline-worker.exe -d ResticExe=dist\restic.exe -d RcloneExe=dist\rclone.exe -o "dist\release\vaultline-worker_${Version}_windows-amd64.msi" packaging\windows\vaultline-worker.wxs
+          wix build -arch x64 -ext WixToolset.Util.wixext -d Version=$Version -d LauncherExe=dist\vaultline-worker.exe -d WorkerExe=dist\vaultline-worker-runtime.exe -d ResticExe=dist\restic.exe -d RcloneExe=dist\rclone.exe -o "dist\release\vaultline-worker_${Version}_windows-amd64.msi" packaging\windows\vaultline-worker.wxs
           if ($LASTEXITCODE -ne 0) { throw "wix build exited with $LASTEXITCODE" }
           if (-not (Test-Path "dist\release\vaultline-worker_${Version}_windows-amd64.msi")) { throw "missing Windows MSI asset" }
 
@@ -278,7 +291,7 @@ jobs:
           elseif ($Version.Minor -gt 0) { $LowerVersion = "$($Version.Major).$($Version.Minor - 1).999" }
           elseif ($Version.Major -gt 0) { $LowerVersion = "$($Version.Major - 1).999.999" }
           else { throw "Cannot derive a lower MSI version from $Version" }
-          wix build -arch x64 -ext WixToolset.Util.wixext -d Version=$LowerVersion -d WorkerExe=dist\vaultline-worker.exe -d ResticExe=dist\restic.exe -d RcloneExe=dist\rclone.exe -o "dist\release\vaultline-worker_${LowerVersion}_windows-amd64.msi" packaging\windows\vaultline-worker.wxs
+          wix build -arch x64 -ext WixToolset.Util.wixext -d Version=$LowerVersion -d LauncherExe=dist\vaultline-worker.exe -d WorkerExe=dist\lower\vaultline-worker-runtime.exe -d ResticExe=dist\restic.exe -d RcloneExe=dist\rclone.exe -o "dist\release\vaultline-worker_${LowerVersion}_windows-amd64.msi" packaging\windows\vaultline-worker.wxs
           if ($LASTEXITCODE -ne 0) { throw "lower-version wix build exited with $LASTEXITCODE" }
 
       - name: Smoke MSI install, service and uninstall
@@ -293,6 +306,7 @@ jobs:
           else { $LowerVersion = [version]"$($LowerVersion.Major - 1).999.999" }
           $LowerMsi = (Resolve-Path "dist\release\vaultline-worker_${LowerVersion}_windows-amd64.msi").Path
           $InstalledExe = "C:\Program Files\Vaultline\vaultline-worker.exe"
+          $InstalledRuntime = "C:\Program Files\Vaultline\vaultline-worker-runtime.exe"
           $InstalledTools = @("C:\Program Files\Vaultline\restic.exe", "C:\Program Files\Vaultline\rclone.exe")
           $WorkerLog = "C:\ProgramData\Vaultline\worker\logs\worker.log"
 
@@ -303,9 +317,18 @@ jobs:
           # Install an older product first, then exercise the actual major-upgrade path.
           $installOld = Start-Process msiexec -ArgumentList '/i',"`"$LowerMsi`"",'/qn','/norestart','/l*v','msi-install-old.log' -Wait -PassThru
           if ($installOld.ExitCode -ne 0) { Show-LogTail 'msi-install-old.log'; throw "lower-version msiexec /i exited with $($installOld.ExitCode)" }
+          if (-not (Test-Path $InstalledRuntime)) { throw "lower-version runtime missing at $InstalledRuntime" }
+          $LowerRuntimeVersion = & $InstalledRuntime --version
+          if ($LASTEXITCODE -ne 0 -or $LowerRuntimeVersion -notmatch [regex]::Escape($LowerVersion.ToString())) { throw "lower MSI installed wrong runtime version: $LowerRuntimeVersion" }
+          $LauncherHashBeforeUpgrade = (Get-FileHash -LiteralPath $InstalledExe -Algorithm SHA256).Hash
           $upgrade = Start-Process msiexec -ArgumentList '/i',"`"$Msi`"",'/qn','/norestart','/l*v','msi-upgrade.log' -Wait -PassThru
           if ($upgrade.ExitCode -ne 0) { Show-LogTail 'msi-upgrade.log'; throw "major-upgrade msiexec /i exited with $($upgrade.ExitCode)" }
-          if (-not (Test-Path $InstalledExe)) { Show-LogTail 'msi-upgrade.log'; throw "installed executable missing at $InstalledExe" }
+          if (-not (Test-Path $InstalledExe)) { Show-LogTail 'msi-upgrade.log'; throw "stable launcher missing at $InstalledExe" }
+          if (-not (Test-Path $InstalledRuntime)) { Show-LogTail 'msi-upgrade.log'; throw "replaceable runtime missing at $InstalledRuntime" }
+          $LauncherHashAfterUpgrade = (Get-FileHash -LiteralPath $InstalledExe -Algorithm SHA256).Hash
+          if ($LauncherHashAfterUpgrade -ne $LauncherHashBeforeUpgrade) { throw "stable launcher changed during major upgrade" }
+          $RuntimeVersion = & $InstalledRuntime --version
+          if ($LASTEXITCODE -ne 0 -or $RuntimeVersion -notmatch [regex]::Escape($Version)) { throw "major upgrade installed wrong runtime version: $RuntimeVersion" }
           foreach ($tool in $InstalledTools) { if (-not (Test-Path $tool)) { Show-LogTail 'msi-upgrade.log'; throw "installed tool missing at $tool" } }
 
           # The service must reach Running on its own (auto-start, LocalSystem).
@@ -338,7 +361,8 @@ jobs:
           $uninstall = Start-Process msiexec -ArgumentList '/x',"`"$Msi`"",'/qn','/norestart','/l*v','msi-uninstall.log' -Wait -PassThru
           if ($uninstall.ExitCode -ne 0) { Show-LogTail 'msi-uninstall.log'; throw "msiexec /x exited with $($uninstall.ExitCode)" }
           if ($null -ne (Get-Service VaultlineWorker -ErrorAction SilentlyContinue)) { throw "service VaultlineWorker still registered after uninstall" }
-          if (Test-Path $InstalledExe) { throw "installed executable still present after uninstall" }
+          if (Test-Path $InstalledExe) { throw "stable launcher still present after uninstall" }
+          if (Test-Path $InstalledRuntime) { throw "worker runtime still present after uninstall" }
           foreach ($tool in $InstalledTools) { if (Test-Path $tool) { throw "installed tool still present after uninstall: $tool" } }
           if (-not (Test-Path "C:\ProgramData\Vaultline\worker")) { throw "state directory must survive uninstall" }
           Write-Host "MSI smoke passed: lower-version install, major upgrade, running service, idle log, uninstall"
@@ -347,7 +371,7 @@ jobs:
         shell: pwsh
         run: |
           $Version = "${{ needs.prepare.outputs.new_version }}"
-          Move-Item -Path dist\vaultline-worker.exe -Destination "dist\release\vaultline-worker_${Version}_windows-amd64.exe"
+          Move-Item -Path dist\vaultline-worker-runtime.exe -Destination "dist\release\vaultline-worker_${Version}_windows-amd64.exe"
           if (-not (Test-Path "dist\release\vaultline-worker_${Version}_windows-amd64.exe")) { throw "missing Windows release asset" }
 
       - name: Upload Windows executable and installer

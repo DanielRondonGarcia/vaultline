@@ -81,7 +81,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='vaultline-worker',
+    name='vaultline-worker-runtime',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

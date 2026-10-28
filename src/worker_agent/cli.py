@@ -70,7 +70,7 @@ def _configuration_presence() -> dict[str, bool]:
 
 def _update(_args: argparse.Namespace) -> int:
     try:
-        message = run_worker_update()
+        message = run_worker_update(current_version=BUILD_VERSION)
     except UpdateError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

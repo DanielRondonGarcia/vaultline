@@ -50,7 +50,7 @@ class WorkerMsiPackageTests(unittest.TestCase):
         upgrades = list(self.find_all("MajorUpgrade"))
         self.assertEqual(len(upgrades), 1)
         self.assertTrue(upgrades[0].get("DowngradeErrorMessage"))
-        self.assertEqual(upgrades[0].get("Schedule"), "afterInstallInitialize")
+        self.assertEqual(upgrades[0].get("Schedule"), "afterInstallExecute")
 
         media = list(self.find_all("MediaTemplate"))
         self.assertEqual(len(media), 1)
@@ -65,8 +65,12 @@ class WorkerMsiPackageTests(unittest.TestCase):
         self.assertEqual(install_dir.get("Name"), "Vaultline")
 
         files = {node.get("Id"): node for node in self.find_all("File")}
-        self.assertEqual(set(files), {"WorkerExe", "ResticExe", "RcloneExe", "ResticLicenseFile", "RcloneLicenseFile"})
+        self.assertEqual(set(files), {"LauncherExe", "WorkerExe", "ResticExe", "RcloneExe", "ResticLicenseFile", "RcloneLicenseFile"})
+        self.assertEqual(files["LauncherExe"].get("Source"), "$(var.LauncherExe)")
+        self.assertEqual(files["LauncherExe"].get("Name"), "vaultline-worker.exe")
+        self.assertEqual(files["LauncherExe"].get("Version"), "4.0.0.0")
         self.assertEqual(files["WorkerExe"].get("Source"), "$(var.WorkerExe)")
+        self.assertEqual(files["WorkerExe"].get("Name"), "vaultline-worker-runtime.exe")
         self.assertIn("WorkerExe", self.source)
         self.assertRegex(self.source, r"\?define WorkerExe\s*=")
         self.assertEqual(files["ResticLicenseFile"].get("Source"), "$(var.ResticLicense)")
@@ -83,7 +87,18 @@ class WorkerMsiPackageTests(unittest.TestCase):
         standard_dirs = {node.get("Id"): node for node in self.find_all("StandardDirectory")}
         install_dir = standard_dirs["ProgramFiles64Folder"].find(_tag("Directory"))
         components = {node.get("Id"): node for node in install_dir.findall(_tag("Component"))}
-        self.assertEqual(set(components), {"WorkerExecutable", "ResticExecutable", "RcloneExecutable"})
+        self.assertEqual(
+            set(components),
+            {"WorkerExecutable", "WorkerRuntimeExecutable", "ResticExecutable", "RcloneExecutable"},
+        )
+        launcher = components["WorkerExecutable"]
+        self.assertEqual(launcher.get("Guid"), "*")
+        self.assertEqual(launcher.find(_tag("File")).get("Name"), "vaultline-worker.exe")
+        self.assertIsNotNone(launcher.find(_tag("ServiceInstall")))
+        runtime = components["WorkerRuntimeExecutable"]
+        self.assertRegex(runtime.get("Guid", ""), GUID_RE)
+        self.assertEqual(runtime.find(_tag("File")).get("Name"), "vaultline-worker-runtime.exe")
+        self.assertIsNone(runtime.find(_tag("ServiceInstall")))
 
         expected = {
             "ResticExecutable": ("ResticExe", "restic.exe", "$(var.ResticExe)"),
@@ -216,7 +231,7 @@ class WorkerMsiPackageTests(unittest.TestCase):
         lowered = self.source.lower()
         for forbidden in ("token", "secret", "credential", "password", "worker.env", "worker.json"):
             self.assertNotIn(forbidden, lowered)
-        self.assertEqual(len(list(self.find_all("File"))), 5)
+        self.assertEqual(len(list(self.find_all("File"))), 6)
         self.assertEqual(len(list(self.find_all("IniFile"))), 0)
         self.assertEqual(len(list(self.find_all("RegistryValue"))), 0)
 

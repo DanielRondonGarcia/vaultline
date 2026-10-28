@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -11,13 +11,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
-
-from src.worker_agent._build_info import VERSION as BUILD_VERSION
-
 
 REPOSITORY = "DanielRondonGarcia/vaultline"
 LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
@@ -243,54 +241,80 @@ def download_verified_installer(release: ReleaseInfo) -> tuple[Path, Path]:
     return installer_path, log_path
 
 
-def _powershell_literal(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
-def build_msi_handoff_script(parent_pid: int, installer_path: str, log_path: str) -> str:
-    """Build a PowerShell helper that waits until this CLI exits before starting MSI."""
-    installer = _powershell_literal(installer_path)
-    log = _powershell_literal(log_path)
-    return (
-        "$ErrorActionPreference = 'Stop'\n"
-        f"$parentPid = {int(parent_pid)}\n"
-        f"$installer = {installer}\n"
-        f"$log = {log}\n"
-        "try {\n"
-        "  Wait-Process -Id $parentPid -ErrorAction SilentlyContinue\n"
-        "  $msiexec = Join-Path $env:SystemRoot 'System32\\msiexec.exe'\n"
-        "  & $msiexec /i $installer /passive /norestart /L*v $log\n"
-        "  $result = $LASTEXITCODE\n"
-        "  if ($result -eq 0) { Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue }\n"
-        "  exit $result\n"
-        "} catch {\n"
-        "  $_ | Out-File -FilePath $log -Append -Encoding utf8\n"
-        "  exit 1\n"
-        "}\n"
-    )
-
-
-def launch_msi_update(installer_path: Path, log_path: Path) -> None:
+def stop_worker_service() -> None:
+    """Stop and wait for the installed service before MSI replaces its runtime."""
     system_root = os.environ.get("SystemRoot")
     if not system_root:
         raise UpdateError("Windows SystemRoot is not available")
     powershell = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
     if not powershell.is_file():
-        raise UpdateError("Windows PowerShell could not be found to start the MSI update")
-    script = build_msi_handoff_script(os.getpid(), str(installer_path), str(log_path))
-    encoded_script = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    creation_flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        raise UpdateError("Windows PowerShell could not be found to stop the worker service")
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "$service = Get-Service -Name 'VaultlineWorker' -ErrorAction SilentlyContinue; "
+        "if ($service -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) { "
+        "if ($service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::StopPending) { "
+        "Stop-Service -Name 'VaultlineWorker' -Force -ErrorAction Stop }; "
+        "$service.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, "
+        "[TimeSpan]::FromSeconds(60)) }; "
+        "Write-Output 'VaultlineWorker service is stopped.'"
+    )
     try:
-        subprocess.Popen(
-            [str(powershell), "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded_script],
+        completed = subprocess.run(
+            [str(powershell), "-NoProfile", "-NonInteractive", "-Command", script],
+            check=False,
+        )
+    except OSError as exc:
+        raise UpdateError(f"could not stop the VaultlineWorker service: {exc}") from exc
+    if completed.returncode != 0:
+        raise UpdateError(f"could not stop the VaultlineWorker service (PowerShell exit {completed.returncode})")
+
+
+def _stream_msi_log(log_path: Path, offset: int) -> int:
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as log:
+            log.seek(offset)
+            for line in log:
+                print(line, end="", flush=True)
+            return log.tell()
+    except FileNotFoundError:
+        return offset
+    except OSError as exc:
+        print(f"warning: could not read the live MSI log: {exc}", file=sys.stderr, flush=True)
+        return offset
+
+
+def launch_msi_update(installer_path: Path, log_path: Path) -> int:
+    """Run MSI in the foreground and stream its verbose log to the invoking console."""
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        raise UpdateError("Windows SystemRoot is not available")
+    msiexec = Path(system_root) / "System32" / "msiexec.exe"
+    if not msiexec.is_file():
+        raise UpdateError("Windows Installer (msiexec.exe) could not be found")
+
+    print("Stopping VaultlineWorker service...", flush=True)
+    stop_worker_service()
+    print(f"Installing verified MSI; live installer log: {log_path}", flush=True)
+    try:
+        process = subprocess.Popen(
+            [str(msiexec), "/i", str(installer_path), "/qn", "/norestart", "/L*V", str(log_path)],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            close_fds=True,
-            creationflags=creation_flags,
         )
     except OSError as exc:
-        raise UpdateError(f"could not start the Windows MSI update helper: {exc}") from exc
+        raise UpdateError(f"could not start Windows Installer: {exc}; MSI log: {log_path}") from exc
+
+    offset = 0
+    while process.poll() is None:
+        offset = _stream_msi_log(log_path, offset)
+        time.sleep(0.2)
+    offset = _stream_msi_log(log_path, offset)
+    if process.returncode not in (0, 3010):
+        raise UpdateError(f"Windows Installer failed with exit code {process.returncode}; MSI log: {log_path}")
+    installer_path.unlink(missing_ok=True)
+    return process.returncode
 
 
 def _is_msi_installation() -> bool:
@@ -305,13 +329,14 @@ def _is_msi_installation() -> bool:
 
 
 def _is_user_admin() -> bool:
-    from src.worker_agent.cli import is_user_admin
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
 
-    return is_user_admin()
 
-
-def run_worker_update() -> str:
-    """Check the latest stable GitHub release and launch its verified Windows MSI."""
+def run_worker_update(current_version: str) -> str:
+    """Check the latest stable GitHub release and synchronously install its verified MSI."""
     if sys.platform != "win32":
         raise UpdateError("self-update is currently available only for the Windows MSI installation")
     if not getattr(sys, "frozen", False) or not _is_msi_installation():
@@ -320,13 +345,11 @@ def run_worker_update() -> str:
         raise UpdateError("run PowerShell as Administrator and retry 'vaultline-worker update'")
 
     release = fetch_latest_release()
-    if not is_newer_version(BUILD_VERSION, release.version):
-        return f"Vaultline Worker is already up to date ({BUILD_VERSION})."
+    if not is_newer_version(current_version, release.version):
+        return f"Vaultline Worker is already up to date ({current_version})."
 
     installer_path, log_path = download_verified_installer(release)
-    try:
-        launch_msi_update(installer_path, log_path)
-    except Exception:
-        shutil.rmtree(installer_path.parent, ignore_errors=True)
-        raise
-    return f"Update to {release.version} started; MSI log: {log_path}"
+    result = launch_msi_update(installer_path, log_path)
+    if result == 3010:
+        return f"Vaultline Worker update to {release.version} completed; a Windows restart is required. MSI log: {log_path}"
+    return f"Vaultline Worker update to {release.version} completed successfully. MSI log: {log_path}"

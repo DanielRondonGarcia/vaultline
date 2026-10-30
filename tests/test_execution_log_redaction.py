@@ -95,6 +95,38 @@ class StreamRedactorSplitContentTests(unittest.TestCase):
                     self.assertEqual(pipeline.output, expected)
 
 
+class StreamRedactorWordAdjacentSchemeTests(unittest.TestCase):
+    """A scheme glued to a preceding word character (``prefixhttps://``) is
+    still a repository URL carrying its userinfo/path; skipping its redaction
+    over a word boundary is exactly the leak class this fixes."""
+
+    def test_word_adjacent_scheme_repository_urls_redact_in_one_shot(self):
+        cases = (
+            ("prefixhttps://user:pw@example.com/path", "prefix<redacted-repository>"),
+            ("logHTTPS://user:pw@example.com/path", "log<redacted-repository>"),
+            ("runs3://backup-bucket/key", "run<redacted-repository>"),
+            ("prefixrclone:remote:bucket/path", "prefix<redacted-repository>"),
+            ("prefixlocal:/repo", "prefix<redacted-repository>"),
+        )
+        for text, expected in cases:
+            with self.subTest(text=text):
+                self.assertEqual(StreamRedactor.redact_text(text, []), expected)
+
+    def test_word_adjacent_repository_url_split_at_every_chunk_boundary_stays_redacted(self):
+        cases = (
+            ("prefixhttps://user:pw@example.com/path done\n", "prefix<redacted-repository> done\n"),
+            ("prefixrclone:remote:bucket/path done\n", "prefix<redacted-repository> done\n"),
+            ("prefixlocal:/repo done\n", "prefix<redacted-repository> done\n"),
+        )
+        for line, expected in cases:
+            for index in range(len(line) + 1):
+                with self.subTest(line=line, split=index):
+                    pipeline = RedactingPipeline([])
+                    pipeline.write(line[:index])
+                    pipeline.write(line[index:])
+                    self.assertEqual(pipeline.output, expected)
+
+
 class StreamRedactorOrdinaryTextTests(unittest.TestCase):
     """Redaction changes nothing that is neither a secret nor a repository URL."""
 
@@ -146,6 +178,24 @@ class StreamRedactorOverflowFailClosedTests(unittest.TestCase):
         self.assertNotIn("credential@example.com", output)
         self.assertNotIn("t" * (limit - 8), output)
         self.assertEqual(output, " after-term\ncaptured after overflow\n")
+
+    def test_word_adjacent_overflow_fails_closed(self):
+        # A word character glued to the scheme must not disable the same
+        # fail-closed drop an unterminated scheme-adjacent token gets.
+        limit = StreamRedactor.MAX_PENDING_CHARS
+        pipeline = RedactingPipeline([])
+        self.assertEqual(pipeline.write(b"prefixhttps://" + b"t" * limit)[1], True)
+        # Suppression holds later chunks until the token's terminator arrives.
+        self.assertEqual(pipeline.write(b"credential@example.com/x"), ("", False))
+        self.assertEqual(pipeline.write(b" after-term\n"), (" after-term\n", False))
+        self.assertEqual(
+            pipeline.write(b"captured after overflow\n"),
+            ("captured after overflow\n", False),
+        )
+        output = pipeline.output
+        self.assertNotIn("credential@example.com", output)
+        self.assertNotIn("t" * limit, output)
+        self.assertEqual(output, "prefix after-term\ncaptured after overflow\n")
 
     def test_overflow_events_stay_capped_at_the_limit(self):
         limit = StreamRedactor.MAX_PENDING_CHARS

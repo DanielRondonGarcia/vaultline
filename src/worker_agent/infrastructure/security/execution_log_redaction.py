@@ -12,7 +12,10 @@ whole, tails that could still complete a secret occurrence or a URL scheme
 head are held back, and an unterminated scheme marker holds its whole URL
 head until the URL completes, the stream ends (``flush`` releases and
 redacts it) or the bounded-memory limit drops it (``feed`` reports the
-drop); later chunks stay discarded until the token terminator arrives.
+drop); later chunks stay discarded until the token terminator arrives. A
+scheme glued to a preceding word character (``prefixhttps://``) is redacted
+too: the ``://`` literal and the ``rclone:``/``local:`` tokens anchor the
+repository URL matches instead of a word-boundary claim.
 """
 
 from __future__ import annotations
@@ -52,12 +55,16 @@ class StreamRedactor:
         }
     )
     # Mirror the repository URL redaction of DockerRuntimeAdapter._redact_text.
+    # No word-boundary claim before the schemes: a scheme glued to a preceding
+    # word character (``prefixhttps://``) still carries the URL's credentials
+    # and must be redacted. The matches stay anchored by the ``://`` literal
+    # and by the scheme-specific ``rclone:``/``local:`` tokens themselves.
     _REPOSITORY_URL_PATTERNS = (
-        re.compile(r"(?i)\b(?:https?|s3|gs|az|swift)://[^\s\"'<>]+"),
-        re.compile(r"(?i)\brclone:[^\s\"'<>]+"),
-        re.compile(r"(?i)\blocal:[^\s\"'<>]+"),
+        re.compile(r"(?i)(?:https?|s3|gs|az|swift)://[^\s\"'<>]+"),
+        re.compile(r"(?i)rclone:[^\s\"'<>]+"),
+        re.compile(r"(?i)local:[^\s\"'<>]+"),
     )
-    _URL_OPEN_MARKER_PATTERN = re.compile(r"(?i)\b(?:https?|s3|gs|az|swift)://|\brclone:|\blocal:")
+    _URL_OPEN_MARKER_PATTERN = re.compile(r"(?i)(?:https?|s3|gs|az|swift)://|rclone:|local:")
     _URL_TERMINATOR_PATTERN = re.compile(r"[\s\"'<>]")
 
     _REDACTED = "<redacted>"

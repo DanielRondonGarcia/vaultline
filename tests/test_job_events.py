@@ -153,6 +153,24 @@ class JobEventServiceTests(unittest.TestCase):
         self.assertNotIn("payload", view)
         self.assertNotIn("lease-token", json.dumps(view, default=str))
 
+    def test_unknown_outcome_flip_publishes_a_safe_job_event(self):
+        broker = JobEventBroker()
+        service = self.make_service(broker)
+        job = service.dispatch_job("worker-a", "backup.run")
+        claimed = service.fetch_jobs_for_worker("worker-a")[0]
+        claimed.lease_expires_at = utcnow() - timedelta(hours=24, minutes=2)
+        service.job_repository.save(claimed)
+
+        subscription = broker.subscribe(job.id)
+        view = service.get_job_view(job.id)
+
+        self.assertEqual(view["status"], JobStatus.UNCONFIRMED)
+        event = subscription.get(timeout=1)
+        self.assertEqual(event["status"], JobStatus.UNCONFIRMED)
+        self.assertIsNone(event["finished_at"])
+        self.assert_safe_view(event)
+        subscription.close()
+
 
 class _FakeWFile:
     def __init__(self, disconnect_after=None):

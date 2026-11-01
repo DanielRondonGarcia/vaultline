@@ -30,7 +30,9 @@ from src.control_plane.application.ports.ports import (
 from src.control_plane.domain.models import (
     BackupTargetRecord,
     CacheGenerationRecord,
+    CONFIRMATION_DEADLINE_KEY,
     DashboardReadSnapshotRecord,
+    JOB_UNCONFIRMED_AFTER_SECONDS,
     IndexStatusRecord,
     InventorySnapshot,
     JobRecord,
@@ -42,6 +44,8 @@ from src.control_plane.domain.models import (
     SnapshotRecord,
     StorageProfileRecord,
     TargetStatsRecord,
+    UNCONFIRMED_OUTCOME_LOG,
+    UNCONFIRMED_OUTCOME_RECOVERY,
     WorkerEnrollmentRecord,
     WorkerRecord,
     utcnow,
@@ -165,6 +169,41 @@ def _lease_diagnostics(
         "observed": observed,
         "unknown": ["terminal_result", "root_cause"],
     }
+
+
+def _renewal_cleared_summary_keys() -> tuple:
+    """Diagnostic keys removed when the owner renews a lease after expiry."""
+    return (
+        "diagnostic_code",
+        "diagnostic_category",
+        "diagnostic_message",
+        "lease_diagnostics",
+        "recovery",
+        CONFIRMATION_DEADLINE_KEY,
+    )
+
+
+def _confirmation_deadline(summary: Any, updated_at: Optional[datetime]) -> Optional[datetime]:
+    """Deadline after which an awaiting-confirmation outcome becomes unknown.
+
+    Falls back to the diagnostic write time for jobs stored before the stored
+    deadline existed; the fallback equals the original lease expiry plus the
+    same 24-hour window, and any owner progress afterwards refreshes it.
+    """
+    raw = summary.get(CONFIRMATION_DEADLINE_KEY) if isinstance(summary, dict) else None
+    if isinstance(raw, str) and raw:
+        try:
+            deadline = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if deadline.tzinfo:
+                deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
+            return deadline
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if updated_at is None:
+        return None
+    if updated_at.tzinfo:
+        updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return updated_at + timedelta(seconds=JOB_UNCONFIRMED_AFTER_SECONDS)
 
 
 class SQLiteRepositoryBase:
@@ -997,7 +1036,14 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
         )
 
     @staticmethod
-    def _reconcile_expired_leases_locked(connection, now) -> int:
+    def _reconcile_expired_leases_locked(connection, now) -> set:
+        """Apply the awaiting-confirmation diagnostic to every expired lease.
+
+        Returns the identifiers of the jobs transitioned by this phase; the
+        caller combines them with the unknown-outcome phase so the public
+        count stays "unique jobs changed by reconcile" (never two transitions
+        for the same job in one pass).
+        """
         rows = connection.execute(
             """
             SELECT id, worker_id, command, target_id, owner_worker_id,
@@ -1009,7 +1055,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             (JobStatus.IN_PROGRESS,),
         ).fetchall()
         interruption_log = "Worker lease expired before terminal status was reported."
-        reconciled = 0
+        reconciled: set = set()
         for row in rows:
             lease_expires_at = _dt(row["lease_expires_at"])
             if lease_expires_at and lease_expires_at.tzinfo:
@@ -1022,6 +1068,9 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             result_summary["diagnostic_code"] = LEASE_DIAGNOSTIC_CODE
             result_summary["diagnostic_category"] = LEASE_DIAGNOSTIC_CATEGORY
             result_summary["diagnostic_message"] = LEASE_DIAGNOSTIC_MESSAGE
+            result_summary[CONFIRMATION_DEADLINE_KEY] = _datetime_text(
+                lease_expires_at + timedelta(seconds=JOB_UNCONFIRMED_AFTER_SECONDS)
+            )
             result_summary["lease_diagnostics"] = _lease_diagnostics(
                 job_id=row["id"],
                 worker_id=row["owner_worker_id"] or row["worker_id"],
@@ -1058,15 +1107,78 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     JobStatus.IN_PROGRESS,
                 ),
             )
-            reconciled += updated.rowcount
+            reconciled.add(row["id"])
         return reconciled
+
+    @staticmethod
+    def _record_unknown_outcome_locked(connection, now) -> set:
+        """S7: flip awaiting-confirmation jobs whose deadline passed to unknown.
+
+        No terminal result ever arrived, so the outcome is neither failed nor
+        succeeded: the outcome is unknown. Ownership and lease token stay so
+        the authenticated owner can still deliver a late terminal report; the
+        job stops counting as an active execution for new-task guards.
+
+        Returns the identifiers of the jobs transitioned by this phase.
+        """
+        unknown_log = UNCONFIRMED_OUTCOME_LOG
+        rows = connection.execute(
+            """
+            SELECT id, result_summary_json, log_lines_json, updated_at
+            FROM jobs
+            WHERE status = ?
+            """,
+            (JobStatus.IN_PROGRESS,),
+        ).fetchall()
+        recorded: set = set()
+        for row in rows:
+            try:
+                summary = _json_load(row["result_summary_json"], None)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                summary = None
+            if not isinstance(summary, dict):
+                continue  # Malformed summary: keep the job blocked (fail closed).
+            if summary.get("diagnostic_code") != LEASE_DIAGNOSTIC_CODE:
+                continue
+            deadline = _confirmation_deadline(summary, _dt(row["updated_at"]))
+            if deadline is None or deadline > now:
+                continue
+            summary["recovery"] = UNCONFIRMED_OUTCOME_RECOVERY
+            log_lines = _json_load(row["log_lines_json"], [])
+            log_lines = list(log_lines) if isinstance(log_lines, list) else []
+            if unknown_log not in log_lines:
+                log_lines.append(unknown_log)
+            updated = connection.execute(
+                """
+                UPDATE jobs
+                SET status = ?, result_summary_json = ?, log_lines_json = ?,
+                    finished_at = NULL, updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    JobStatus.UNCONFIRMED,
+                    json.dumps(summary),
+                    json.dumps(log_lines),
+                    now.isoformat(),
+                    row["id"],
+                    JobStatus.IN_PROGRESS,
+                ),
+            )
+            recorded.add(row["id"])
+        return recorded
 
     def reconcile_expired_leases(self) -> int:
         with self._lock:
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                reconciled = self._reconcile_expired_leases_locked(connection, utcnow())
+                now = utcnow()
+                expired_ids = self._reconcile_expired_leases_locked(connection, now)
+                unknown_ids = self._record_unknown_outcome_locked(connection, utcnow())
+                # Previous contract: the return counts unique reconciled jobs.
+                # A job that both expires and passes its 24-hour deadline in
+                # the same pass is still one reconciled job.
+                reconciled = len(expired_ids | unknown_ids)
                 connection.commit()
                 return reconciled
             except Exception:
@@ -1105,7 +1217,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 current_summary = _json_load(row["result_summary_json"], None)
                 current_summary = dict(current_summary) if isinstance(current_summary, dict) else {}
                 if current_summary.get("diagnostic_code") == LEASE_DIAGNOSTIC_CODE:
-                    for key in ("diagnostic_code", "diagnostic_category", "diagnostic_message", "lease_diagnostics", "recovery"):
+                    for key in _renewal_cleared_summary_keys():
                         current_summary.pop(key, None)
                 context = _lease_context_for_values(
                     job_id=row["id"],
@@ -1192,6 +1304,14 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     current_summary.update(result_summary)
                 current_summary["progress"] = dict(progress)
                 current_summary["progress_sequence"] = sequence
+                # S7 duplicate-execution guard: while the owner keeps showing
+                # liveness after lease expiry, the outcome stays awaiting
+                # confirmation instead of flipping to unknown, so new tasks
+                # remain blocked for a demonstrably still-running job.
+                if current_summary.get("diagnostic_code") == LEASE_DIAGNOSTIC_CODE:
+                    current_summary[CONFIRMATION_DEADLINE_KEY] = _datetime_text(
+                        now + timedelta(seconds=JOB_UNCONFIRMED_AFTER_SECONDS)
+                    )
                 context = _lease_context_for_values(
                     job_id=row["id"],
                     worker_id=row["owner_worker_id"] or row["worker_id"],

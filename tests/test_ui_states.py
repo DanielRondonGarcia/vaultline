@@ -1767,6 +1767,74 @@ process.stdout.write("lease error explanation passed");
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "lease error explanation passed")
 
+    def test_unknown_outcome_status_renders_neither_success_nor_failure(self):
+        badge = re.search(r"function fmtJobStatus\(status\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(badge)
+        self.assertIn("unconfirmed:", badge.group(0))
+        self.assertIn("Resultado desconocido", badge.group(0))
+        unknown_entry = re.search(r"unconfirmed:\s*\{[^}]*\}", badge.group(0))
+        self.assertIsNotNone(unknown_entry)
+        self.assertNotIn("job-success", unknown_entry.group(0))
+        self.assertNotIn("job-failed", unknown_entry.group(0))
+        self.assertIn("job-unknown", unknown_entry.group(0))
+        labels = re.search(r"function jobStatusLabel\(status\) \{.*?\n    \}", self.source, re.S)
+        self.assertIsNotNone(labels)
+        self.assertIn("unconfirmed", labels.group(0))
+
+    def test_job_lease_diagnostics_explain_24h_unknown_outcome(self):
+        renderer = re.search(r"function renderJobLeaseDiagnostics\(job\) \{.*?\n     \}", self.source, re.S)
+        self.assertIsNotNone(renderer)
+        for marker in (
+            "outcome_unknown",
+            "24 horas sin confirmación",
+            "se permiten nuevas tareas",
+        ):
+            self.assertIn(marker, renderer.group(0))
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = r'''
+const escapeHtml = value => String(value);
+const fmtDate = value => value || "No disponible";
+''' + renderer.group(0) + r'''
+const html = renderJobLeaseDiagnostics({
+  id: "job-1", target_id: "target-1", worker_id: "worker-1", command: "backup.run",
+  result_summary: {
+    diagnostic_code: "worker_lease_expired",
+    diagnostic_category: "worker_interrupted",
+    recovery: "outcome_unknown",
+  },
+  diagnostics: {
+    code: "worker_lease_expired", category: "worker_interrupted",
+    message: "Control Plane observed lease expiry; worker/runtime cause unknown.",
+    unknown: ["terminal_result", "root_cause"],
+    observed: { job_id: "job-1", target_id: "target-1", worker_id: "worker-1", command: "backup.run",
+      lease_issued_at: "2026-10-19T15:01:00Z", lease_expires_at: "2026-10-19T15:06:00Z",
+      last_repository_update_at: "2026-10-19T15:01:00Z", last_progress_at: null,
+      last_progress_sequence: 0, worker_last_seen_at: "2026-10-19T20:06:00Z",
+      worker_status: "offline", last_renewal: null },
+  },
+});
+const expected = [
+  "Resultado desconocido",
+  "24 horas sin confirmación",
+  "se permiten nuevas tareas",
+  "puede reportar el resultado real",
+];
+const missing = expected.filter(text => !html.includes(text));
+if (missing.length) throw new Error(`missing unknown-outcome explanation: ${missing.join("; ")}`);
+if (html.includes("Exitoso") || html.includes("Fallido")) throw new Error("unknown outcome claims a terminal result");
+process.stdout.write("unknown outcome explanation passed");
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "unknown outcome explanation passed")
+
     def test_retention_guide_explains_union_prune_and_updates_draft_or_selected_policy_summary(self):
         retention = re.search(r"function renderRetention\(content\) \{.*?\n    \}\n\n    function renderSecrets", self.source, re.S)
         self.assertIsNotNone(retention)

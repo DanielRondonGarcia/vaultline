@@ -8,6 +8,21 @@ def utcnow() -> datetime:
     return datetime.utcnow()
 
 
+# S7: after this much time without any confirmation from the owner (terminal
+# result, progress, or renewal) the outcome of an in-progress job is recorded
+# as unknown instead of staying blocked forever.
+JOB_UNCONFIRMED_AFTER_SECONDS = 24 * 3600
+# Result-summary key holding the ISO deadline after which the outcome becomes
+# unknown. Refreshed whenever the owner shows liveness (progress) after the
+# lease expired; cleared on renewal.
+CONFIRMATION_DEADLINE_KEY = "confirmation_deadline_at"
+UNCONFIRMED_OUTCOME_RECOVERY = "outcome_unknown"
+UNCONFIRMED_OUTCOME_LOG = (
+    "No worker confirmation within 24 hours of lease expiry; the outcome is "
+    "recorded as unknown (not failed or succeeded) and new tasks may proceed."
+)
+
+
 class WorkerStatus:
     PENDING = "pending"
     ONLINE = "online"
@@ -21,6 +36,10 @@ class JobStatus:
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELED = "canceled"
+    # S7: terminal confirmation never arrived and the outcome deadline passed.
+    # The outcome is recorded as unknown; it never becomes a synthetic
+    # failure or success, and it no longer blocks new tasks.
+    UNCONFIRMED = "unconfirmed"
 
     @classmethod
     def normalize(cls, status: str) -> str:

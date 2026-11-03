@@ -641,6 +641,7 @@ class ExecutionLogCaptureTests(unittest.TestCase):
     # counterpart of the Windows ordering and hardening-failure regressions
     # around this test).
 
+    @unittest.skipUnless(os.name == "nt", "Windows ACL hardening is Windows-only")
     def test_recipe_acl_mock_seam_remains_the_invoked_hook(self):
         recipe = self._temporary / "recipe-seam.json"
         observed = []
@@ -947,6 +948,7 @@ class DockerContainerLogSourceTests(unittest.TestCase):
         else:
             self.assertEqual(self._SDK_UNIX_PARSED_URL, docker.utils.parse_host(url))
 
+    @unittest.skipUnless(os.name == "nt", "npipe is Windows-only")
     def test_translated_url_is_accepted_by_the_real_sdk_client_builder(self):
         self._skip_without_docker_sdk()
         # Pinned API version keeps APIClient construction offline.

@@ -401,7 +401,7 @@ class BoundedTransferTimeoutTest(_RecipeRootTest):
                     "recipe_frame": frame,
                     "spawn_options": {
                         "stdin": subprocess.PIPE,
-                        "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP,
+                        "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
                     },
                 },
             )
@@ -429,7 +429,7 @@ class BoundedTransferTimeoutTest(_RecipeRootTest):
             runtime.idle_timeout_seconds = None
             frame = ("0123456789" * 100_000).encode("utf-8")
             payload = {{"timeout_seconds": 3, "job_id": "job-verify-timeout-big"}}
-            capture = {{"recipe_frame": frame, "spawn_options": {{"stdin": subprocess.PIPE, "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}}}}
+            capture = {{"recipe_frame": frame, "spawn_options": {{"stdin": subprocess.PIPE, "creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}}}}
             started = time.monotonic()
             result = runtime._run_process(
                 [sys.executable, "-c", "import time; time.sleep(60)"],

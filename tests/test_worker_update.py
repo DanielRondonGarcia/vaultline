@@ -133,7 +133,7 @@ class WorkerUpdateParsingTests(unittest.TestCase):
 
         self.assertEqual(
             message,
-            "Vaultline Worker update to 3.15.16 completed successfully. MSI log: C:\\Temp\\msi-update.log",
+            f'Vaultline Worker update to 3.15.16 completed successfully. MSI log: {Path("C:/Temp/msi-update.log")}',
         )
         download.assert_called_once_with(release)
         launch.assert_called_once_with(Path("C:/Temp/worker.msi"), Path("C:/Temp/msi-update.log"))

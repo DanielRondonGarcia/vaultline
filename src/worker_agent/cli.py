@@ -28,6 +28,10 @@ from src.worker_agent.infrastructure.api_client.control_plane_client import (
     safe_diagnostic_text,
 )
 from src.worker_agent.infrastructure.security.credential_store import WorkerCredentialStore
+from src.worker_agent.infrastructure.security.execution_log_capture import (
+    CAPTURE_CHILD_CLI_SENTINEL,
+    run_capture_child,
+)
 from src.worker_agent.update import UpdateError, run_worker_update
 from src.worker_agent.state_paths import (
     resolve_credential_file,
@@ -495,6 +499,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments and arguments[0] == CAPTURE_CHILD_CLI_SENTINEL:
+        # Non-public internal entrypoint for the detached execution log
+        # capture child (packaged workers re-invoke themselves with it;
+        # dispatched before argparse alongside ``backup-engine`` and
+        # ``__filesystem-size-worker``). The return value becomes the
+        # child process exit status; no secret value travels through this
+        # dispatch, only the redaction recipe path and the log path.
+        return run_capture_child(arguments[1:])
     if arguments == ["backup-engine"]:
         return _backup_engine(argparse.Namespace(command="backup-engine"))
     if arguments == ["__filesystem-size-worker"]:

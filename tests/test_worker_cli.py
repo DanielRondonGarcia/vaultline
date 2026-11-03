@@ -1,11 +1,18 @@
 import io
 import json
 import os
+import shutil
 import subprocess
+import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest.mock import patch
 
+from src.worker_agent.infrastructure.security.execution_log_capture import (
+    ExecutionLogCapture,
+)
 from src.worker_agent.windows_service import ServiceError
 
 
@@ -377,6 +384,129 @@ class WorkerServiceCommandWindowsTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("pywin32", stderr)
+
+
+class ExecutionLogCaptureCliEntrypointTests(unittest.TestCase):
+    """Non-public packaged-worker entrypoint for detached execution log capture.
+
+    The frozen worker cannot re-invoke a script file, so the capture child
+    re-invokes the same packaged executable with a non-public internal
+    argument dispatched by cli.main before argparse, exactly like the
+    existing __filesystem-size-worker entrypoint. Help remains public-only
+    and existing CLI behavior is unchanged.
+    """
+
+    def setUp(self):
+        self.temporary = Path(tempfile.mkdtemp(prefix="test-capture-cli-entrypoint-"))
+        self.addCleanup(shutil.rmtree, self.temporary, ignore_errors=True)
+
+    def test_capture_entrypoint_is_not_listed_in_public_help(self):
+        from src.worker_agent import cli
+
+        help_text = cli.build_parser().format_help()
+
+        self.assertNotIn(ExecutionLogCapture.CAPTURE_CHILD_CLI_SENTINEL, help_text)
+        self.assertNotIn(__class__.__name__, help_text)
+
+    def test_capture_entrypoint_runs_the_capture_child_and_preserves_exit_status(self):
+        from src.worker_agent import cli
+
+        log_path = self.temporary / "cli-dispatched.log"
+        recipe_path = self.temporary / "cli-dispatch-recipe.json"
+        ExecutionLogCapture.write_redaction_recipe(recipe_path, ["s3cret"])
+        stdin = io.TextIOWrapper(io.BytesIO(b"cli dispatch secret=s3cret\n"))
+
+        with patch("src.worker_agent.cli.sys.stdin", stdin):
+            exit_code = cli.main(
+                [
+                    ExecutionLogCapture.CAPTURE_CHILD_CLI_SENTINEL,
+                    "--capture", str(log_path),
+                    "--recipe", str(recipe_path),
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+        content = log_path.read_text(encoding="utf-8")
+        self.assertNotIn("s3cret", content)
+        self.assertIn("cli dispatch secret=<redacted>\n", content)
+        self.assertIn("[completed]", content)
+        self.assertFalse(recipe_path.exists())
+
+    def test_capture_entrypoint_propagates_recipe_failure_exit_status(self):
+        from src.worker_agent import cli
+
+        log_path = self.temporary / "cli-failure.log"
+        recipe_path = self.temporary / "cli-bad-recipe.json"
+        recipe_path.write_text("not json", encoding="utf-8")
+        stdin = io.TextIOWrapper(io.BytesIO(b"secret data s3cret\n"))
+
+        with patch("src.worker_agent.cli.sys.stdin", stdin):
+            exit_code = cli.main(
+                [
+                    ExecutionLogCapture.CAPTURE_CHILD_CLI_SENTINEL,
+                    "--capture", str(log_path),
+                    "--recipe", str(recipe_path),
+                ]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(log_path.exists())
+
+    # End-to-end through the real packaged CLI dispatch surface used by the
+    # frozen worker: re-invoking the interpreter with -m src.worker_agent.cli
+    # and the internal sentinel. No secret ever travels in argv, only paths.
+
+    def test_capture_entrypoint_as_a_subprocess_keeps_exit_status_and_redaction(self):
+        from src.worker_agent import cli
+
+        log_path = self.temporary / "subprocess-dispatched.log"
+        recipe_path = self.temporary / "subprocess-recipe.json"
+        ExecutionLogCapture.write_redaction_recipe(recipe_path, ["s3cret"])
+        command = [
+            sys.executable, "-m", "src.worker_agent.cli",
+            ExecutionLogCapture.CAPTURE_CHILD_CLI_SENTINEL,
+            "--capture", str(log_path),
+            "--recipe", str(recipe_path),
+        ]
+        self.assertNotIn("s3cret", subprocess.list2cmdline(command))
+
+        completed = subprocess.run(
+            command,
+            input=b"subprocess secret=s3cret\n",
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        content = log_path.read_text(encoding="utf-8")
+        self.assertNotIn("s3cret", content)
+        self.assertIn("subprocess secret=<redacted>\n", content)
+        self.assertIn("[completed]", content)
+        self.assertFalse(recipe_path.exists())
+
+    def test_capture_entrypoint_subprocess_reports_recipe_failure_exit_status(self):
+        from src.worker_agent import cli
+
+        log_path = self.temporary / "subprocess-failure.log"
+        recipe_path = self.temporary / "subprocess-bad-recipe.json"
+        recipe_path.write_text("not json", encoding="utf-8")
+
+        completed = subprocess.run(
+            [
+                sys.executable, "-m", "src.worker_agent.cli",
+                ExecutionLogCapture.CAPTURE_CHILD_CLI_SENTINEL,
+                "--capture", str(log_path),
+                "--recipe", str(recipe_path),
+            ],
+            input=b"secret data s3cret\n",
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertFalse(log_path.exists())
 
 
 class WorkerServiceCommandLinuxTests(unittest.TestCase):

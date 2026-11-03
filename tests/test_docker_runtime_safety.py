@@ -1,15 +1,26 @@
+import contextlib
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from src.control_plane.domain.models import JobStatus
 from src.worker_agent.application.services.worker_agent_service import WorkerAgentService
 from src.worker_agent.domain.models import WorkerAgentConfig
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
+from src.worker_agent.infrastructure.security.execution_log_capture import (
+    ExecutionLogCapture,
+    ExecutionLogCaptureUnavailable,
+)
+from src.worker_agent.infrastructure.security.execution_log_recipe_stream import (
+    encode_recipe_frame,
+)
 from src.worker_agent.infrastructure.security.job_recovery_journal import WorkerJobRecoveryJournal
 
 
@@ -1955,6 +1966,870 @@ class WorkerRestartRecoveryTests(unittest.TestCase):
 
             self.assertEqual(len(client.updates), 2)
             self.assertFalse(os.path.exists(service.terminal_report_journal.path))
+
+
+class DockerExecutionLogCaptureTests(unittest.TestCase):
+    """T2 (S1-S6, persistent-worker-execution-logs.md): the Docker runtime
+    spawns an independent, redacted, persistent per-job execution-log capture
+    child that continues when the worker dies; any capture failure continues
+    and alerts locally and through the job progress callback without failing
+    or stopping the backup."""
+
+    CONTAINER_ID = "abcdef0123456789abcdef0123456789abcdef01"
+    JOB_ID = "job-42"
+    SECRET = "hunter2"
+    WARNING_PREFIX = "[persistent-execution-log]"
+
+    class FakeCaptureProcess:
+        def __init__(self, exit_code=0, trace=None):
+            self.exit_code = exit_code
+            self.wait_timeout = None
+            self.wait_calls = 0
+            self.poll_calls = 0
+            self._trace = trace
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            self.wait_timeout = timeout
+            if self._trace is not None:
+                self._trace.append("wait")
+            return self.exit_code
+
+        def poll(self):
+            self.poll_calls += 1
+            return self.exit_code
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="docker-exec-log-capture-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        self.worker_id = "worker-a"
+        # Environment isolation: the capture root points inside the test temp
+        # directory and ambient daemon/retention/identity/state variables are
+        # cleared so every test decides its own worker-state configuration.
+        saved = {
+            name: os.environ.get(name)
+            for name in (
+                "WORKER_EXECUTION_LOG_ROOT",
+                "DOCKER_HOST",
+                "WORKER_EXECUTION_LOG_RETENTION_DAYS",
+                "WORKER_ID",
+                "WORKER_STATE_DIR",
+                "WORKER_JOB_RECOVERY_FILE",
+                "WORKER_CREDENTIAL_FILE",
+            )
+        }
+
+        def restore_env():
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        for name in saved:
+            os.environ.pop(name, None)
+        os.environ["WORKER_EXECUTION_LOG_ROOT"] = self.root
+        self.addCleanup(restore_env)
+
+    def drop_env(self, *names):
+        """Remove environment names for the remainder of this test (restored
+        afterwards, including keys changed by the test itself)."""
+        saved = {name: os.environ.get(name) for name in names}
+
+        def restore():
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
+        for name in names:
+            os.environ.pop(name, None)
+        self.addCleanup(restore)
+
+    def payload(self, **extra):
+        payload = {
+            "command": "/root/backup.sh",
+            "environment": {"RESTIC_PASSWORD": self.SECRET},
+            "_job_id": self.JOB_ID,
+        }
+        payload.update(extra)
+        return payload
+
+    def container(self, container_id=CONTAINER_ID):
+        container = Mock()
+        container.wait.return_value = {"StatusCode": 0}
+        container.logs.return_value = b"ok"
+        container.attach.return_value = b"ok"
+        container.id = container_id
+        return container
+
+    def runtime(self, container, worker_id="worker-a"):
+        runtime = DockerRuntimeAdapter.__new__(DockerRuntimeAdapter)
+        runtime.client = Mock()
+        runtime.client.containers.run.return_value = container
+        runtime.timeout_seconds = 30.0
+        runtime.no_lock = False
+        runtime.cache_dir = None
+        runtime.worker_id = worker_id
+        return runtime
+
+    def patch_capture(self, *, spawn=None, spawn_raises=None, recipe_raises=None, real_recipe=False, exit_code=0, trace=None):
+        """Isolate the capture seams: the ephemeral recipe-frame encode, the
+        detached spawn and the retention sweep never touch a real daemon or
+        write outside the test root. ``spawn`` is the process handle to
+        return; ``spawn_raises`` makes the spawn call raise. The ``spawn``
+        Mock is exposed as seams["spawn"]."""
+        seams = {"frames": [], "prunes": []}
+        process = self.FakeCaptureProcess(exit_code=exit_code, trace=trace)
+
+        def record_frame(values):
+            seams["frames"].append(tuple(values))
+            return encode_recipe_frame(values)
+
+        def record_prune(*args, **kwargs):
+            seams["prunes"].append((args, kwargs))
+            return {"deleted": 0, "failed": 0, "errors": []}
+
+        seams["process"] = process
+        recipe_patch = patch(
+            "src.worker_agent.infrastructure.adapters.docker_runtime.encode_recipe_frame",
+            side_effect=(
+                encode_recipe_frame
+                if real_recipe
+                else (record_frame if recipe_raises is None else recipe_raises)
+            ),
+        )
+        spawn_patch = patch.object(ExecutionLogCapture, "spawn_detached_docker_capture")
+        prune_patch = patch.object(ExecutionLogCapture, "prune", side_effect=record_prune)
+        recipe_patch.start()
+        spawn_patch.start()
+        prune_patch.start()
+        self.addCleanup(recipe_patch.stop)
+        self.addCleanup(spawn_patch.stop)
+        self.addCleanup(prune_patch.stop)
+        spawn_mock = ExecutionLogCapture.spawn_detached_docker_capture
+        if spawn_raises is not None:
+            spawn_mock.side_effect = spawn_raises
+            seams["process"] = None
+        else:
+            spawn_mock.return_value = process if spawn is None else spawn
+            seams["process"] = spawn_mock.return_value
+        seams["spawn"] = spawn_mock
+        return contextlib.nullcontext(seams)
+
+    def spawn_kwargs(self):
+        call = ExecutionLogCapture.spawn_detached_docker_capture.call_args
+        return call.args, call.kwargs
+
+    def managed_log_parts(self, log_path):
+        return Path(log_path).relative_to(self.root).parts
+
+    WORKER_IMAGE = "vaultline-worker:test"
+    WORKER_HOSTNAME = "workercontainerid0123456789"
+
+    def daemon_mode_env(self):
+        """Deployed compose topology: worker_state volume at /data carrying the
+        credential file, docker socket bind, HOSTNAME equal to the worker
+        container id. The explicit root override is removed so the default
+        follows the state volume (worker-path /data)."""
+        self.drop_env("WORKER_EXECUTION_LOG_ROOT")
+        os.environ["WORKER_CREDENTIAL_FILE"] = "/data/worker_credentials.json"
+        os.environ["HOSTNAME"] = self.WORKER_HOSTNAME
+        self.addCleanup(os.environ.pop, "HOSTNAME", None)
+        self.addCleanup(os.environ.pop, "WORKER_CREDENTIAL_FILE", None)
+
+    def self_container(self, *, env=None, cmd=None, mounts=None):
+        """Fake of the worker's own daemon record (read-only self-inspection
+        seam): image, python runtime layout, worker_state volume and the
+        daemon socket bind copied from the deployed compose."""
+        own = Mock()
+        own.attrs = {
+            "Config": {
+                "Image": self.WORKER_IMAGE,
+                "Env": ["PYTHONPATH=/app"] if env is None else env,
+                "Cmd": ["python", "-m", "src.worker_agent.main"] if cmd is None else cmd,
+            },
+            "Mounts": [
+                {"Type": "volume", "Name": "proj_worker_state", "Destination": "/data", "RW": True, "Mode": "z"},
+                {"Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock", "RW": True},
+            ] if mounts is None else mounts,
+        }
+        own.id = self.WORKER_HOSTNAME + "abcd"
+        own.status = "running"
+        return own
+
+    def capture_container(self, exit_code=0, trace=None):
+        fake = Mock()
+
+        def wait(timeout=None):
+            if trace is not None:
+                trace.append("capture-wait")
+            return {"StatusCode": exit_code}
+
+        def remove_mock(force=None):
+            if trace is not None:
+                trace.append("capture-removed")
+
+        fake.wait = Mock(side_effect=wait)
+        fake.remove = Mock(side_effect=remove_mock)
+        fake.id = "capturecontainerid0123456789"
+        fake.attrs = {"Config": {"Labels": {}}}
+        # Ephemeral framed-stdin handoff: attach returns a fake stream whose
+        # write (binary bytes) and close are observable.
+        fake.capture_stream = Mock()
+        fake.attach = Mock(return_value=fake.capture_stream)
+        return fake
+
+    def test_containerized_worker_uses_a_daemon_owned_capture_container(self):
+        """S5: when the worker itself is a managed container, the capture
+        child must run as its own daemon-owned container (mounted from the
+        worker's own state-volume and socket spec) so the user's reported
+        worker-container recreation cannot kill it; the in-worker detached
+        child dies with the container (reproduced with a real daemon)."""
+        self.daemon_mode_env()
+        trace = []
+        executor = self.container()
+        executor.remove.side_effect = lambda **kwargs: trace.append("executor-remove")
+        capture = self.capture_container(trace=trace)
+        with self.patch_capture(trace=trace) as seams:
+            runtime = self.runtime(executor, worker_id="worker-a")
+            runtime.client.containers.run.side_effect = [executor, capture]
+            runtime.client.containers.get = Mock(return_value=self.self_container())
+            result = runtime.run_runtime_job("runtime", self.payload())
+
+        self.assertTrue(result["success"], result)
+        # No in-worker child: the detached Popen path is not used at all.
+        seams["spawn"].assert_not_called()
+        # One read-only self-inspection through the daemon.
+        runtime.client.containers.get.assert_called_once_with(self.WORKER_HOSTNAME)
+        self.assertEqual(runtime.client.containers.run.call_count, 2)
+        _, capture_call = runtime.client.containers.run.call_args_list
+        capture_kwargs = capture_call.kwargs
+        self.assertEqual(capture_kwargs["image"], self.WORKER_IMAGE)
+        command = capture_kwargs["command"]
+        self.assertEqual(command[0], "python")
+        self.assertTrue(command[1].endswith("execution_log_capture.py"))
+        self.assertIn("--run-capture", command)
+        capture_log = Path(command[command.index("--capture") + 1])
+        self.assertEqual(capture_log.parents[1], Path("/data/execution-logs/worker-a/docker"))
+        self.assertTrue(capture_log.name.startswith(f"{self.JOB_ID}-"))
+        # Ephemeral recipe transfer: framed stdin, never a plaintext file path.
+        self.assertIn("--recipe-stream", command)
+        self.assertEqual(command[command.index("--recipe-stream") + 1], "1")
+        self.assertNotIn("--recipe", command)
+        self.assertTrue(capture_kwargs["stdin_open"])
+        self.assertEqual(command[command.index("--container") + 1], self.CONTAINER_ID)
+        self.assertEqual(command[command.index("--socket") + 1], "/var/run/docker.sock")
+        self.assertNotIn(self.SECRET, repr(command))
+        self.assertEqual(capture_kwargs["network_mode"], "none")
+        self.assertIs(capture_kwargs["remove"], False)
+        volumes = capture_kwargs["volumes"]
+        self.assertEqual(volumes["proj_worker_state"]["bind"], "/data")
+        self.assertEqual(volumes["/var/run/docker.sock"]["bind"], "/var/run/docker.sock")
+        labels = capture_kwargs["labels"]
+        self.assertEqual(labels[DockerRuntimeAdapter.RUNTIME_CAPTURE_LABEL], DockerRuntimeAdapter.RUNTIME_CAPTURE_VALUE)
+        self.assertEqual(labels[DockerRuntimeAdapter.RUNTIME_JOB_ID_LABEL], self.JOB_ID)
+        # Cleanup without data loss: drain, remove the finished capture
+        # container, then the executor stream/container.
+        self.assertEqual(trace, ["capture-wait", "capture-removed", "executor-remove"])
+        self.assertEqual(capture.wait.call_args.kwargs.get("timeout"), DockerRuntimeAdapter.EXECUTION_LOG_DRAIN_SECONDS)
+        # The bounded framed recipe was attached and written to the capture
+        # container's stdin, then closed: secrets never rest on the volume.
+        capture.attach.assert_called_once_with(socket=True, stdin=True, stream=True)
+        frame = capture.capture_stream.write.call_args.args[0]
+        self.assertIsInstance(frame, bytes)
+        self.assertIn(f'"{self.SECRET}"'.encode("utf-8"), frame)
+        capture.capture_stream.close.assert_called_once()
+
+    def test_hostname_override_worker_container_degrades_with_one_safe_actionable_warning(self):
+        """A containerized worker whose hostname cannot resolve to its container
+        id (e.g. a compose ``hostname:`` override) silently fell back to the
+        in-worker child, losing capture on worker recreation without any
+        warning: it must emit exactly one safe actionable warning locally and
+        through the job progress callback, while the job keeps succeeding."""
+        os.environ["WORKER_CREDENTIAL_FILE"] = "/data/worker_credentials.json"
+        os.environ["HOSTNAME"] = "custom-worker-hostname"
+        self.addCleanup(os.environ.pop, "HOSTNAME", None)
+        self.addCleanup(os.environ.pop, "WORKER_CREDENTIAL_FILE", None)
+        with self.patch_capture() as seams:
+            runtime = self.runtime(self.container(), worker_id="worker-a")
+            runtime.client.containers.get = Mock(side_effect=RuntimeError("No such container: custom-worker-hostname"))
+            with patch.object(DockerRuntimeAdapter, "_runs_inside_a_docker_container", return_value=True):
+                lines = []
+                with self.assertLogs("src.worker_agent.infrastructure.adapters.docker_runtime", level="WARNING") as logged:
+                    result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["logs"], "ok")
+        # Fail open: the degraded in-worker child still runs (worker-process
+        # death resistance preserved); no daemon capture container is created.
+        seams["spawn"].assert_called_once()
+        self.assertEqual(runtime.client.containers.run.call_count, 1)
+        # Exactly one safe, actionable warning reaches both lanes.
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("worker container", warnings[0])
+        self.assertIn("degrades", warnings[0])
+        self.assertIn("worker container recreation", warnings[0])
+        self.assertNotIn(self.SECRET, warnings[0])
+        joined_logs = "".join(logged.output)
+        self.assertIn("degrades", joined_logs)
+        self.assertNotIn(self.SECRET, joined_logs)
+
+    def test_genuinely_host_native_worker_is_not_warned_about_container_degradation(self):
+        """A host-native worker (deb/MSI service, no /.dockerenv) whose
+        hostname naturally does not resolve through the daemon keeps the
+        in-worker detached capture silently: no false degraded warning."""
+        with self.patch_capture() as seams:
+            runtime = self.runtime(self.container(), worker_id="worker-a")
+            runtime.client.containers.get = Mock(side_effect=RuntimeError("No such container: daniel-pc"))
+            os.environ["HOSTNAME"] = "daniel-pc"
+            self.addCleanup(os.environ.pop, "HOSTNAME", None)
+            with patch.object(DockerRuntimeAdapter, "_runs_inside_a_docker_container", return_value=False):
+                lines = []
+                result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        seams["spawn"].assert_called_once()
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(warnings, [])
+
+    def test_unresolving_hostname_inside_a_container_without_the_daemon_marker_is_silent(self):
+        """When the container-vs-host marker is absent (host-native machine
+        that merely carries such a hostname), the fallback stays silent."""
+        with self.patch_capture() as seams:
+            runtime = self.runtime(self.container(), worker_id="worker-a")
+            runtime.client.containers.get = Mock(side_effect=RuntimeError("No such container"))
+            os.environ["HOSTNAME"] = "custom-worker-hostname"
+            self.addCleanup(os.environ.pop, "HOSTNAME", None)
+            with patch.object(DockerRuntimeAdapter, "_runs_inside_a_docker_container", return_value=False):
+                lines = []
+                result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        seams["spawn"].assert_called_once()
+        self.assertEqual([line for line in lines if self.WARNING_PREFIX in line], [])
+
+    def test_non_containerized_worker_keeps_in_process_detached_capture(self):
+        """Existing process-death behavior is preserved for workers that are
+        not managed containers (host/MSI services)."""
+        with self.patch_capture() as seams:
+            runtime = self.runtime(self.container(), worker_id="worker-a")
+            runtime.client.containers.get = Mock(side_effect=RuntimeError("No such container"))
+            os.environ["HOSTNAME"] = "native-host-name"
+            self.addCleanup(os.environ.pop, "HOSTNAME", None)
+            lines = []
+            result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        seams["spawn"].assert_called_once()
+        args, kwargs = self.spawn_kwargs()
+        self.assertEqual(args[2], self.CONTAINER_ID)
+        self.assertEqual(runtime.client.containers.run.call_count, 1)
+        self.assertFalse([line for line in lines if self.WARNING_PREFIX in line])
+
+    def test_containerized_worker_without_socket_or_state_mounts_degrades_and_alerts(self):
+        variants = [
+            ("daemon socket mount",
+             [{"Type": "volume", "Name": "proj_worker_state", "Destination": "/data", "RW": True}]),
+            ("worker-state volume",
+             [{"Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock", "RW": True}]),
+            ("worker runtime layout",
+             ["PYTHONPATH_MISSING"]),
+        ]
+        for expected_fragment, special in variants:
+            with self.subTest(expected_fragment=expected_fragment):
+                self.daemon_mode_env()
+                if expected_fragment == "worker runtime layout":
+                    own = self.self_container(env=[])
+                else:
+                    own = self.self_container(mounts=special)
+                with self.patch_capture() as seams:
+                    runtime = self.runtime(self.container(), worker_id="worker-a")
+                    runtime.client.containers.get = Mock(return_value=own)
+                    lines = []
+                    result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+                self.assertTrue(result["success"], result)
+                seams["spawn"].assert_called_once()
+                warnings = [line for line in lines if self.WARNING_PREFIX in line]
+                self.assertEqual(len(warnings), 1)
+                self.assertIn(expected_fragment, warnings[0])
+                self.assertIn("degrades", warnings[0])
+                self.assertNotIn(self.SECRET, warnings[0])
+
+    def test_capture_container_creation_failure_fails_open_without_a_recipe(self):
+        self.daemon_mode_env()
+        # Real recipe framing must stay observable: the ephemeral frame never
+        # touches the test root the way the state volume does in deployment.
+        os.environ["WORKER_EXECUTION_LOG_ROOT"] = self.root
+        own = self.self_container(
+            mounts=[
+                {"Type": "volume", "Name": "proj_worker_state", "Destination": self.root, "RW": True},
+                {"Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock", "RW": True},
+            ]
+        )
+
+        def run_side_effect(image, **kwargs):
+            if kwargs.get("network_mode") == "none":
+                raise RuntimeError("capture container creation failed")
+            return self.container()
+
+        with self.patch_capture(real_recipe=True) as seams:
+            runtime = self.runtime(self.container(), worker_id="worker-a")
+            runtime.client.containers.run = Mock(side_effect=run_side_effect)
+            runtime.client.containers.get = Mock(return_value=own)
+            lines = []
+            result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["logs"], "ok")
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("capture container", warnings[0])
+        self.assertNotIn(self.SECRET, warnings[0])
+        # No secret recipe is ever left behind: ephemeral transfer writes no
+        # recipe file at all.
+        self.assertEqual([p.name for p in Path(self.root).rglob("*.recipe.json")], [])
+
+    def test_capture_container_exit_code_alerts_after_drain(self):
+        self.daemon_mode_env()
+        capture = self.capture_container(exit_code=4)
+        with self.patch_capture() as seams:
+            runtime = self.runtime(self.container(), worker_id="worker-a")
+            runtime.client.containers.run.side_effect = [self.container(), capture]
+            runtime.client.containers.get = Mock(return_value=self.self_container())
+            lines = []
+            result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("docker daemon log stream could not be opened", warnings[0])
+
+    def test_cancellation_leaves_the_daemon_capture_container_to_finish_safely(self):
+        """Existing cancellation semantics are preserved; the running capture
+        container follows the executor teardown on the daemon (interrupted
+        evidence is kept on the volume) and is left for the orphan sweep."""
+        self.daemon_mode_env()
+        container = self.container()
+        container.wait.side_effect = TimeoutError("wait timed out")
+
+        class MustNotWaitOrRemove:
+            def wait(self, timeout=None):
+                raise AssertionError("canceled jobs must not wait for the capture container")
+
+            def remove(self, force=None):
+                raise AssertionError("the running capture container must not be removed by the worker")
+
+        with self.patch_capture(spawn=MustNotWaitOrRemove()):
+            runtime = self.runtime(container, worker_id="worker-a")
+            runtime.client.containers.run.side_effect = [container, MustNotWaitOrRemove()]
+            runtime.client.containers.get = Mock(return_value=self.self_container())
+            checks = iter((False, False, True))
+            result = runtime.run_runtime_job(
+                "runtime",
+                {**self.payload(), "timeout_seconds": 2},
+                cancel_check=lambda: next(checks),
+            )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["canceled"])
+        self.assertEqual(result["status_code"], 130)
+        container.stop.assert_called_once_with(timeout=1)
+        container.remove.assert_called_once_with(force=True)
+
+    def test_orphan_sweep_removes_exited_daemon_capture_containers(self):
+        """Daemon capture containers left after a worker death are cleaned by
+        the sweep without consulting job recovery and without touching any
+        other container's volume data (logs already live in the state volume)."""
+        def capture_record(name, status):
+            fake = Mock()
+            fake.id = f"capture-{name}-0123456789"
+            fake.status = status
+            fake.labels = {
+                DockerRuntimeAdapter.RUNTIME_TEMPORARY_LABEL: "true",
+                DockerRuntimeAdapter.RUNTIME_CAPTURE_LABEL: "true",
+                DockerRuntimeAdapter.RUNTIME_JOB_ID_LABEL: "s5-job",
+            }
+            return fake
+
+        exited = capture_record("exitedcap", "exited")
+        running = capture_record("runningcap", "running")
+        recover = Mock()
+
+        runtime = self.runtime(None, worker_id="worker-a")
+        runtime.client = Mock()
+        runtime.client.containers.list.return_value = [running, exited]
+        summary = runtime.cleanup_orphaned_runtime_containers(recover_callback=recover)
+
+        exited.remove.assert_called_once_with(force=True)
+        running.remove.assert_not_called()
+        running.stop.assert_not_called()
+        recover.assert_not_called()
+        self.assertEqual(summary["removed"], 1)
+
+    def test_successful_job_spawns_independent_persistent_capture_and_drains_before_cleanup(self):
+        trace = []
+        container = self.container()
+        container.remove.side_effect = lambda **kwargs: trace.append("remove")
+        with self.patch_capture(trace=trace) as seams:
+            runtime = self.runtime(container)
+            lines = []
+            result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertIn("ok", result["logs"])
+        # One independent detached capture for this job, daemon-streaming mode.
+        seams["spawn"].assert_called_once()
+        args, kwargs = self.spawn_kwargs()
+        log_path, recipe_path, container_id = args
+        self.assertEqual(container_id, self.CONTAINER_ID)
+        self.assertIsNone(recipe_path)
+        self.assertIsNone(kwargs["socket_path"])
+        self.assertTrue(kwargs["recipe_stream"])
+        self.assertIsInstance(kwargs["stdin"], int)
+        # Correct worker/job identity inside the fixed host structure (S1, S2).
+        parts = self.managed_log_parts(log_path)
+        self.assertEqual(len(parts), 4)
+        self.assertEqual(parts[0], self.worker_id)
+        self.assertEqual(parts[1], "docker")
+        self.assertRegex(parts[2], r"^\d{8}$")
+        self.assertTrue(Path(parts[3]).name.startswith(f"{self.JOB_ID}-"))
+        self.assertEqual(Path(parts[3]).suffix, ".log")
+        # Secrets travel only inside the ephemeral framed recipe; neither
+        # argv nor the persistent volume ever carries them.
+        self.assertIn(self.SECRET, seams["frames"][0])
+        self.assertNotIn(self.SECRET, f"{args!r}{kwargs!r}")
+        self.assertEqual([p.name for p in Path(self.root).rglob("*.recipe.json")], [])
+        # S3: the retention sweep prunes exactly the root that was written to.
+        self.assertEqual(len(seams["prunes"]), 1)
+        self.assertEqual(Path(seams["prunes"][0][0][0]), Path(self.root))
+        # Existing live progress semantics are untouched.
+        self.assertIn("ok", lines)
+        self.assertFalse(any(self.WARNING_PREFIX in line for line in lines))
+        # The executor container is not destroyed before capture finishes.
+        self.assertEqual(trace, ["wait", "remove"])
+        self.assertEqual(seams["process"].wait_timeout, DockerRuntimeAdapter.EXECUTION_LOG_DRAIN_SECONDS)
+
+    def test_capture_setup_failure_keeps_the_backup_running_and_alerts_safely(self):
+        container = self.container()
+        with self.patch_capture(spawn_raises=ExecutionLogCaptureUnavailable("detached execution log capture could not start")):
+            runtime = self.runtime(container)
+            lines = []
+            with self.assertLogs("src.worker_agent.infrastructure.adapters.docker_runtime", level="WARNING") as logged:
+                result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["logs"], "ok")
+        container.remove.assert_called_once_with(force=True)
+        self.assertEqual(ExecutionLogCapture.prune.call_count, 0)
+        # Exactly one actionable, safe warning reaches the Control Plane.
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn(self.JOB_ID, warnings[0])
+        self.assertIn("detached capture process could not start", warnings[0])
+        self.assertNotIn(self.SECRET, warnings[0])
+        joined_logs = "".join(logged.output)
+        self.assertNotIn(self.SECRET, joined_logs)
+
+    def test_failed_spawn_leaves_no_recipe_file(self):
+        """A spawn failure after the frame encode leaves no secret recipe
+        behind: the ephemeral handoff never creates a one-shot file at all."""
+        container = self.container()
+        with self.patch_capture(spawn_raises=ExecutionLogCaptureUnavailable("detached execution log capture could not start"), real_recipe=True):
+            runtime = self.runtime(container)
+            lines = []
+            result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(
+            [path.name for path in Path(self.root).rglob("*.recipe.json")],
+            [],
+        )
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("detached capture process could not start", warnings[0])
+
+    def test_worker_death_before_child_consumes_secrets_leaves_no_plaintext_recipe(self):
+        """L63 (persistent-worker-execution-logs.md): a worker/child death
+        between recipe preparation and the capture child consuming it used to
+        leave the plaintext-secret recipe file on the persistent volume
+        indefinitely. Ephemeral framed-stdin transfer never writes a recipe
+        file, so even an abrupt creator death leaves nothing on disk."""
+        container = self.container()
+        # Simulated crash: the frame is really encoded, the spawned child
+        # never executes (dies before its frame read) and nothing removes it.
+        with self.patch_capture(real_recipe=True):
+            runtime = self.runtime(container)
+            first = runtime.run_runtime_job("runtime", self.payload())
+
+        self.assertTrue(first["success"], first)
+        leftovers = [path for path in Path(self.root).rglob("*.recipe.json")]
+        self.assertEqual(leftovers, [])
+
+    def test_recipe_frame_write_failure_never_blocks_capture_or_the_job(self):
+        """S4: a failed stdin-write handoff of the framed recipe is a logging
+        problem; capture still starts and the backup result is untouched."""
+        container = self.container()
+        with self.patch_capture() as seams:
+            runtime = self.runtime(container)
+            with patch("os.write", side_effect=BrokenPipeError("child died")):
+                lines = []
+                result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["logs"], "ok")
+        seams["spawn"].assert_called_once()
+        self.assertEqual([line for line in lines if self.WARNING_PREFIX in line], [])
+
+    def test_recipe_failure_skips_capture_and_alerts_without_false_failure(self):
+        container = self.container()
+        with self.patch_capture(recipe_raises=ExecutionLogCaptureUnavailable("redaction recipe frame could not be encoded")):
+            runtime = self.runtime(container)
+            lines = []
+            result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(result["logs"], "ok")
+        self.assertEqual(ExecutionLogCapture.spawn_detached_docker_capture.call_count, 0)
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("redaction recipe frame could not be encoded", warnings[0])
+
+    def test_unsupported_docker_host_skips_capture_and_alerts(self):
+        container = self.container()
+        host_patch = patch.dict(os.environ, {"DOCKER_HOST": "tcp://127.0.0.1:2375"})
+        with self.patch_capture(spawn_raises=AssertionError("unsupported daemon location must never spawn")):
+            with host_patch:
+                runtime = self.runtime(container)
+                lines = []
+                result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(ExecutionLogCapture.spawn_detached_docker_capture.call_count, 0)
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("daemon", warnings[0].lower())
+
+    def test_supported_docker_host_socket_forms_are_passed_to_the_child(self):
+        for host, expected_socket in (
+            ("unix:///var/run/docker.sock", "/var/run/docker.sock"),
+            ("npipe:////./pipe/docker_engine", "//./pipe/docker_engine"),
+        ):
+            with self.subTest(host=host):
+                with self.patch_capture():
+                    with patch.dict(os.environ, {"DOCKER_HOST": host}):
+                        runtime = self.runtime(self.container())
+                        result = runtime.run_runtime_job("runtime", self.payload())
+                self.assertTrue(result["success"], result)
+                _, kwargs = self.spawn_kwargs()
+                self.assertEqual(kwargs["socket_path"], expected_socket)
+
+    def test_unknown_worker_identity_skips_capture_and_alerts(self):
+        container = self.container()
+        with self.patch_capture(spawn_raises=AssertionError("unregistered workers must not spawn capture")):
+            runtime = self.runtime(container, worker_id=None)
+            lines = []
+            result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(ExecutionLogCapture.spawn_detached_docker_capture.call_count, 0)
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("worker identity", warnings[0])
+
+    def test_invalid_container_identity_skips_capture_and_alerts(self):
+        container = self.container("bad container id")
+        with self.patch_capture(spawn_raises=AssertionError("unusable container identities must not spawn capture")):
+            runtime = self.runtime(container)
+            lines = []
+            result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        self.assertEqual(ExecutionLogCapture.spawn_detached_docker_capture.call_count, 0)
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("container identity", warnings[0])
+
+    def test_capture_child_rejection_after_drain_alerts_the_control_plane(self):
+        container = self.container()
+        with self.patch_capture(exit_code=3):
+            runtime = self.runtime(container)
+            lines = []
+            result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+
+        self.assertTrue(result["success"], result)
+        warnings = [line for line in lines if self.WARNING_PREFIX in line]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("log file could not be created", warnings[0])
+
+    def test_still_streaming_capture_after_job_finish_keeps_partial_evidence_without_false_failure(self):
+        trace = []
+        container = self.container()
+        container.remove.side_effect = lambda **kwargs: trace.append("remove")
+
+        class StuckChild:
+            def wait(self, timeout=None):
+                raise subprocess.TimeoutExpired(cmd="capture", timeout=timeout)
+
+            def poll(self):
+                return None
+
+        with self.patch_capture(spawn=StuckChild()):
+            runtime = self.runtime(container)
+            result = runtime.run_runtime_job("runtime", self.payload())
+
+        self.assertTrue(result["success"], result)
+        self.assertIn("remove", trace)
+
+    def test_cancellation_does_not_wait_for_capture_and_keeps_prior_result(self):
+        container = self.container()
+        container.wait.side_effect = TimeoutError("wait timed out")
+        runtime = self.runtime(container)
+        checks = iter((False, False, True))
+
+        class MustNotWait:
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                raise AssertionError("canceled jobs must not wait for the capture child")
+
+        with self.patch_capture(spawn=MustNotWait()):
+            result = runtime.run_runtime_job(
+                "runtime",
+                {**self.payload(), "timeout_seconds": 2},
+                cancel_check=lambda: next(checks),
+            )
+
+        self.assertFalse(result["success"])
+        self.assertTrue(result["canceled"])
+        self.assertEqual(result["status_code"], 130)
+        container.stop.assert_called_once_with(timeout=1)
+        container.remove.assert_called_once_with(force=True)
+
+    def test_default_execution_log_root_follows_the_persistent_worker_state_volume(self):
+        """S1: deployed Docker workers mount worker_state at /data only; with
+        no explicit WORKER_EXECUTION_LOG_ROOT the fixed log structure must
+        default under the persistent worker state/recovery directory
+        (existing compose convention: WORKER_CREDENTIAL_FILE=/data/...
+        alongside worker_job_recovery.json), never the ephemeral container
+        filesystem."""
+        self.drop_env("WORKER_EXECUTION_LOG_ROOT")
+        os.environ["WORKER_CREDENTIAL_FILE"] = "/data/worker_credentials.json"
+
+        with self.patch_capture() as seams:
+            runtime = self.runtime(self.container())
+            result = runtime.run_runtime_job("runtime", self.payload())
+
+        self.assertTrue(result["success"], result)
+        seams["spawn"].assert_called_once()
+        args, kwargs = self.spawn_kwargs()
+        log_path, recipe_path, container_id = args
+        self.assertEqual(container_id, self.CONTAINER_ID)
+        self.assertIsNone(recipe_path)
+        log_root = Path(log_path).parents[3]
+        self.assertEqual(log_root.name, "execution-logs")
+        self.assertEqual(log_root.parent, Path("/data"))
+        self.assertEqual(Path(log_path).parents[2].name, self.worker_id)
+        self.assertEqual(Path(log_path).parents[1].name, "docker")
+        self.assertRegex(Path(log_path).parents[0].name, r"^\d{8}$")
+        self.assertTrue(Path(log_path).name.startswith(f"{self.JOB_ID}-"))
+        self.assertEqual(Path(log_path).suffix, ".log")
+        # The retention sweep must prune the same persistent root it wrote to.
+        self.assertEqual(len(seams["prunes"]), 1)
+        self.assertEqual(Path(seams["prunes"][0][0][0]), log_root)
+
+    def test_execution_log_root_precedence_state_recovery_then_committed_default(self):
+        cases = [
+            ({"WORKER_STATE_DIR": "/state"}, "/state/execution-logs"),
+            (
+                {"WORKER_STATE_DIR": "/state", "WORKER_CREDENTIAL_FILE": "/data/worker_credentials.json"},
+                "/state/execution-logs",
+            ),
+            (
+                {"WORKER_JOB_RECOVERY_FILE": "/recover/worker_job_recovery.json"},
+                "/recover/execution-logs",
+            ),
+            (
+                {"WORKER_JOB_RECOVERY_FILE": "/recover/worker_job_recovery.json", "WORKER_CREDENTIAL_FILE": "/data/worker_credentials.json"},
+                "/recover/execution-logs",
+            ),
+            (
+                {"WORKER_CREDENTIAL_FILE": "/data/worker_credentials.json"},
+                "/data/execution-logs",
+            ),
+            ({}, None),
+        ]
+        for environment, expected in cases:
+            with self.subTest(environment=environment, expected=expected):
+                self.drop_env("WORKER_EXECUTION_LOG_ROOT")
+                self.drop_env("WORKER_STATE_DIR", "WORKER_JOB_RECOVERY_FILE", "WORKER_CREDENTIAL_FILE")
+                os.environ.update(environment)
+                if expected is None:
+                    expected = str(ExecutionLogCapture.default_root())
+                with self.patch_capture() as seams:
+                    runtime = self.runtime(self.container())
+                    result = runtime.run_runtime_job("runtime", self.payload())
+                self.assertTrue(result["success"], result)
+                self.assertEqual(len(seams["prunes"]), 1)
+                self.assertEqual(Path(seams["prunes"][0][0][0]), Path(expected))
+
+    def test_explicit_work_execution_log_root_keeps_precedence_over_worker_state(self):
+        self.drop_env("WORKER_STATE_DIR", "WORKER_JOB_RECOVERY_FILE", "WORKER_CREDENTIAL_FILE")
+        os.environ["WORKER_STATE_DIR"] = "/state"
+        os.environ["WORKER_CREDENTIAL_FILE"] = "/data/worker_credentials.json"
+        with self.patch_capture() as seams:
+            runtime = self.runtime(self.container())
+            result = runtime.run_runtime_job("runtime", self.payload())
+        self.assertTrue(result["success"], result)
+        self.assertEqual(Path(seams["prunes"][0][0][0]), Path(self.root))
+        _, kwargs = self.spawn_kwargs()
+        self.assertIsNone(kwargs["socket_path"])
+
+    def test_same_second_capture_shifts_to_a_free_log_name_without_touching_stored_evidence(self):
+        frozen = datetime(2026, 1, 7, 12, 0, 0, tzinfo=timezone.utc)
+        calls = []
+        real_job_log_path = ExecutionLogCapture.__dict__["job_log_path"].__get__(ExecutionLogCapture)
+
+        def frozen_job_log_path(root, worker_id, runtime_kind, job_id, *, when=None):
+            calls.append((root, worker_id, runtime_kind, job_id))
+            return real_job_log_path(root, worker_id, runtime_kind, job_id, when=frozen)
+
+        container = self.container()
+        with self.patch_capture(), patch.object(ExecutionLogCapture, "job_log_path", side_effect=frozen_job_log_path):
+            prior = ExecutionLogCapture.job_log_path(str(Path(self.root)), "worker-a", "docker", self.JOB_ID, when=frozen)
+            prior.parent.mkdir(parents=True, exist_ok=True)
+            prior.write_text("prior capture evidence", encoding="utf-8")
+            calls.clear()  # Drop the test's own probe call; only the adapter's call is asserted.
+            runtime = self.runtime(container)
+            result = runtime.run_runtime_job("runtime", self.payload())
+
+        self.assertTrue(result["success"], result)
+        seams_spawn_args, kwargs = self.spawn_kwargs()
+        log_path, recipe_path, container_id = seams_spawn_args
+        self.assertEqual(calls, [(self.root, "worker-a", "docker", self.JOB_ID)])
+        # Same-second collision resolved by shifting to a free sibling name.
+        self.assertEqual(log_path, prior.with_name(f"{prior.stem}-1{prior.suffix}"))
+        self.assertIsNone(recipe_path)
+        # The stored prior capture was never opened, moved or rewritten.
+        self.assertEqual(prior.read_text(encoding="utf-8"), "prior capture evidence")
+
+    def test_job_without_capture_conditions_keeps_the_previous_result_shape(self):
+        """PRESERVE: previous behavior of run_runtime_job holds when capture
+        cannot run (no worker identity): same success shape, same cleanup."""
+        container = self.container()
+        runtime = self.runtime(container, worker_id=None)
+        lines = []
+        result = runtime.run_runtime_job("runtime", self.payload(), output_callback=lines.append)
+        self.assertTrue(result["success"])
+        self.assertEqual(result["status_code"], 0)
+        self.assertEqual(result["logs"], "ok")
+        self.assertEqual(result["stderr"], "")
+        self.assertIn("ok", lines)
+        container.remove.assert_called_once_with(force=True)
 
 
 if __name__ == "__main__":

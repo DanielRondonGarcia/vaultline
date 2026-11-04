@@ -20,3 +20,4 @@ class WorkerJobExecutionResult:
     status: str
     result_summary: Dict[str, object] = field(default_factory=dict)
     log_lines: List[str] = field(default_factory=list)
+    log_timestamps: List[Optional[str]] = field(default_factory=list)

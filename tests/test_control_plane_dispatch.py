@@ -1800,6 +1800,38 @@ class ControlPlaneRouteTests(unittest.TestCase):
         handler._write_json = Mock(return_value=None)
         return handler
 
+    def test_worker_progress_and_status_routes_forward_optional_log_timestamps(self):
+        stamp = "2024-05-05T10:00:00Z"
+        routes = (
+            (
+                "/api/v1/workers/worker-a/jobs/job-a/progress",
+                {"sequence": 1, "progress": {"phase": "backup"}, "log_lines": ["line"],
+                 "log_timestamps": [stamp], "lease_token": "lease"},
+                "update_job_progress",
+            ),
+            (
+                "/api/v1/workers/worker-a/jobs/job-a/status",
+                {"status": "succeeded", "result_summary": {}, "log_lines": ["line"],
+                 "log_timestamps": [stamp], "lease_token": "lease"},
+                "update_job_status",
+            ),
+        )
+        for path, payload, method in routes:
+            with self.subTest(path=path):
+                handler = self.make_handler(path, json.dumps(payload))
+                handler._require_worker_identity = Mock(return_value=True)
+                service = Mock()
+                response_view = {"id": "job-a", "log_lines": ["line"], "log_timestamps": [stamp]}
+                service.update_job_progress.return_value = response_view
+                service.update_job_status.return_value = object()
+                service.public_job_view.return_value = response_view
+                handler._control_plane_service = Mock(return_value=service)
+
+                handler.do_POST()
+
+                self.assertEqual(getattr(service, method).call_args.kwargs["log_timestamps"], [stamp])
+                self.assertEqual(handler._write_json.call_args.args[1]["log_timestamps"], [stamp])
+
     @staticmethod
     def make_html_handler(path):
         handler = object.__new__(ControlPlaneRequestHandler)

@@ -29,3 +29,10 @@ target.json
 
 # Local browser test artifacts
 /.playwright-mcp/
+
+# Local verification and scratch artifacts
+/tmp.*/
+/independent-probes-*/
+/p2-victim-*/
+/%TEMP
+/nul

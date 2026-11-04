@@ -596,14 +596,9 @@ class ControlPlaneService:
             return False
 
         self._reconcile_expired_jobs()
-        active_jobs = [
-            job
-            for job in self.job_repository.list()
-            if JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS)
-            and (job.worker_id == worker_id or job.owner_worker_id == worker_id)
-        ]
+        active_jobs = self.job_repository.active_for_worker(worker_id)
         if active_jobs:
-            job_ids = ", ".join(f"{job.id} ({JobStatus.normalize(job.status)})" for job in active_jobs)
+            job_ids = ", ".join(f"{job_id} ({status})" for job_id, status in active_jobs)
             raise WorkerDeletionConflict(
                 f"worker '{worker_id}' still has active or pending jobs: {job_ids}"
             )

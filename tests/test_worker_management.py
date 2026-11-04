@@ -535,6 +535,22 @@ class WorkerManagementTests(unittest.TestCase):
             self.enroll(auth)
             targets.save(BackupTargetRecord(name="target-a", worker_id="worker-a", id="target-a"))
 
+            pending = JobRecord(worker_id="worker-a", command="backup.run", id="pending-job")
+            owned = JobRecord(worker_id="worker-b", owner_worker_id="worker-a", command="backup.run", id="owned-job", status=JobStatus.IN_PROGRESS)
+            jobs.save(pending)
+            jobs.save(owned)
+            jobs.list = lambda: self.fail("worker deletion must not load the complete job history")
+            with self.assertRaises(WorkerDeletionConflict) as raised:
+                service.delete_worker("worker-a")
+            self.assertIn("pending-job (pending)", str(raised.exception))
+            self.assertIn("owned-job (in_progress)", str(raised.exception))
+            self.assertIsNotNone(workers.get("worker-a"))
+            self.assertTrue(targets.get("target-a").enabled)
+            self.assertIsNotNone(auth._get("worker-a", "1"))
+            pending.status = JobStatus.CANCELED
+            owned.status = JobStatus.SUCCEEDED
+            jobs.save(pending)
+            jobs.save(owned)
             self.assertTrue(service.delete_worker("worker-a"))
 
             preserved_target = targets.get("target-a")

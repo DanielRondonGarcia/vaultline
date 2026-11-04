@@ -221,6 +221,15 @@ class JobRepository(ABC):
     def list(self) -> List[JobRecord]:
         raise NotImplementedError
 
+    def active_for_worker(self, worker_id: str) -> List[Tuple[str, str]]:
+        """Return IDs and statuses of jobs that prevent worker deletion."""
+        return [
+            (job.id, JobStatus.normalize(job.status))
+            for job in self.list()
+            if JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS)
+            and (job.worker_id == worker_id or job.owner_worker_id == worker_id)
+        ]
+
     def list_for_unconfirmed_outcomes(self) -> List[JobRecord]:
         """Awaiting-confirmation candidates for the 24-hour outcome reconciliation.
 

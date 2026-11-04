@@ -842,6 +842,15 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             rows = connection.execute("SELECT * FROM jobs ORDER BY submitted_at DESC").fetchall()
         return [self._row_to_job(row) for row in rows]
 
+    def active_for_worker(self, worker_id: str) -> List[Tuple[str, str]]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, status FROM jobs WHERE status IN (?, ?) "
+                "AND (worker_id = ? OR owner_worker_id = ?) ORDER BY submitted_at DESC",
+                (JobStatus.PENDING, JobStatus.IN_PROGRESS, worker_id, worker_id),
+            ).fetchall()
+        return [(row["id"], row["status"]) for row in rows]
+
     def list_for_lease_context(self) -> List[JobRecord]:
         with self._connect() as connection:
             rows = connection.execute(

@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+LEASE_DIAGNOSTIC_CODE = "worker_lease_expired"
+
 from src.control_plane.domain.models import (
     BackupTargetRecord,
     CacheGenerationRecord,
@@ -218,6 +220,33 @@ class JobRepository(ABC):
     @abstractmethod
     def list(self) -> List[JobRecord]:
         raise NotImplementedError
+
+    def active_for_worker(self, worker_id: str) -> List[Tuple[str, str]]:
+        """Return IDs and statuses of jobs that prevent worker deletion."""
+        return [
+            (job.id, JobStatus.normalize(job.status))
+            for job in self.list()
+            if JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS)
+            and (job.worker_id == worker_id or job.owner_worker_id == worker_id)
+        ]
+
+    def list_for_unconfirmed_outcomes(self) -> List[JobRecord]:
+        """Awaiting-confirmation candidates for the 24-hour outcome reconciliation.
+
+        Returns only IN_PROGRESS jobs flagged with the expired-lease
+        diagnostic; the caller applies the confirmation-deadline check.
+        Concrete repositories override this with a bounded query so the
+        reconciliation never deserializes the whole jobs table.
+        """
+        candidates: List[JobRecord] = []
+        for job in self.list():
+            if JobStatus.normalize(job.status) != JobStatus.IN_PROGRESS:
+                continue
+            summary = job.result_summary if isinstance(job.result_summary, dict) else {}
+            if summary.get("diagnostic_code") != LEASE_DIAGNOSTIC_CODE:
+                continue
+            candidates.append(job)
+        return candidates
 
     def list_for_listing(
         self,

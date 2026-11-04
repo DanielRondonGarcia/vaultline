@@ -315,6 +315,7 @@
         in_progress: { cls: "job-running", icon: "↻", label: "En progreso" },
         pending: { cls: "job-pending", icon: "◔", label: "Pendiente" },
         canceled: { cls: "job-canceled", icon: "⊘", label: "Cancelado" },
+        unconfirmed: { cls: "job-unknown", icon: "?", label: "Resultado desconocido" },
       };
       const m = map[normalized] || { cls: "job-unknown", icon: "•", label: normalized || "—" };
       return `<span class="job-badge ${m.cls}"><span class="job-badge-icon">${m.icon}</span>${escapeHtml(m.label)}</span>`;
@@ -334,6 +335,7 @@
         succeeded: "Exitoso",
         failed: "Fallido",
         canceled: "Cancelado",
+        unconfirmed: "Resultado desconocido",
       }[normalizeJobStatus(status)] || String(status || "—");
     }
 
@@ -429,6 +431,7 @@
          : (summary.lease_diagnostics && typeof summary.lease_diagnostics === "object" ? summary.lease_diagnostics : null);
        const diagnosticCode = summary.diagnostic_code || (diagnostic && diagnostic.code);
        const diagnosticCategory = summary.diagnostic_category || (diagnostic && diagnostic.category);
+       const unknownOutcome = summary.recovery === "outcome_unknown";
        if (!diagnostic || diagnosticCode !== "worker_lease_expired") return "";
        const observed = diagnostic.observed && typeof diagnostic.observed === "object" ? diagnostic.observed : {};
        const renewal = observed.last_renewal && typeof observed.last_renewal === "object" ? observed.last_renewal : null;
@@ -460,6 +463,7 @@
          <div><strong>El worker no confirmó el fin del job</strong></div>
          <div>El plazo de reserva (lease) venció antes de que el Control Plane recibiera el resultado final. El job sigue pendiente de confirmación: una pérdida de comunicación no demuestra que el backup haya fallado. El worker reenviará los datos al recuperar la conexión.</div>
          <div>No se pudo determinar si el worker se detuvo, quedó esperando o perdió comunicación con el Control Plane.</div>
+         ${unknownOutcome ? `<div><strong>Resultado desconocido:</strong> Tras más de 24 horas sin confirmación del worker, el resultado se registra como desconocido: no se declara éxito ni fallo, se permiten nuevas tareas y el worker propietario aún puede reportar el resultado real.</div>` : ""}
          <details class="job-lease-diagnostics-technical">
            <summary>Detalles técnicos</summary>
            <div><strong>Código:</strong> <code>${value(diagnosticCode)}</code> · ${value(diagnosticCategory)}</div>
@@ -1108,7 +1112,8 @@
       const jobsSuccess = Number(byStatus.succeeded) || 0;
       const jobsFailed = Number(byStatus.failed) || 0;
       const jobsRunning = Number(byStatus.in_progress) || 0;
-      const jobsOther = Math.max(0, jobsTotal - jobsSuccess - jobsFailed - jobsRunning);
+      const jobsUnknown = Number(byStatus.unconfirmed) || 0;
+      const jobsOther = Math.max(0, jobsTotal - jobsSuccess - jobsFailed - jobsRunning - jobsUnknown);
       const successRate = jobsTotal > 0 ? Math.round((jobsSuccess / jobsTotal) * 100) : 0;
 
       const days = buildActivityDays(stats.by_day);
@@ -1118,6 +1123,7 @@
         { label: "Exitosos", value: jobsSuccess, color: "var(--success)" },
         { label: "Fallidos", value: jobsFailed, color: "var(--destructive)" },
         { label: "En progreso", value: jobsRunning, color: "var(--chart-2)" },
+        { label: "Resultados desconocidos", value: jobsUnknown, color: "var(--muted-foreground)" },
         { label: "Otros", value: jobsOther, color: "var(--muted-foreground)" },
       ].filter(s => s.value > 0);
 
@@ -5916,7 +5922,8 @@ docker compose up -d
     }
 
     function isTerminalJobStatus(status) {
-      const terminalStatuses = ["succeeded", "failed", "canceled", "cancelled"];
+      // Unconfirmed (outcome unknown after 24h) is finished for watching purposes.
+      const terminalStatuses = ["succeeded", "failed", "canceled", "cancelled", "unconfirmed"];
       return terminalStatuses.includes(String(status || "").toLowerCase()) || terminalStatuses.includes(normalizeJobStatus(status));
     }
 
@@ -6941,7 +6948,7 @@ docker compose up -d
     const JOBS_FILTER_DEBOUNCE_MS = 300;
     const JOB_COMMAND_OPTIONS = ["backup.run", "restore.run", "restore.dry_run", "retention.run", "snapshots.list", "snapshot.ls", "snapshot.dump", "snapshot.about", "stats.get", "storage.about", "inventory.refresh"];
     const JOB_TRIGGER_OPTIONS = ["manual", "schedule", "automatic", "interactive"];
-    const JOB_STATUS_OPTIONS = ["pending", "in_progress", "succeeded", "failed", "canceled"];
+    const JOB_STATUS_OPTIONS = ["pending", "in_progress", "succeeded", "failed", "canceled", "unconfirmed"];
     let jobsPollTimer = null;
     let jobsPolling = false;
     let jobsPollFailures = 0;
@@ -7321,7 +7328,7 @@ docker compose up -d
           const emptyRow = `<tr><td colspan="8" class="empty-state">Sin jobs que coincidan con los filtros</td></tr>`;
           const unavailableRow = `<tr><td colspan="8" class="empty-state">No se pudo cargar la lista de jobs.</td></tr>`;
           renderJobTableBodyPreservingAccordion(tbody, isLoading ? skeletonRows : !jobsListLoaded ? unavailableRow : pagedJobs.length === 0 ? emptyRow : pagedJobs.map(j => {
-            const canCancel = normalizeJobStatus(j.status) === "pending" || normalizeJobStatus(j.status) === "in_progress";
+            const canCancel = normalizeJobStatus(j.status) === "pending" || normalizeJobStatus(j.status) === "in_progress" || normalizeJobStatus(j.status) === "unconfirmed";
             const targetName = j.target_name || targetMap[j.target_id] || j.target_id || "—";
             const workerName = j.worker_name || workerMap[j.worker_id] || j.worker_id || "—";
             return `

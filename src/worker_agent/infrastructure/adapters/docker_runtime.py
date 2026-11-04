@@ -1,12 +1,16 @@
 import inspect
 import json
+import logging
 import math
 import os
+import posixpath
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 import logging
@@ -14,6 +18,14 @@ import logging
 from src.worker_agent.application.policies.runtime_command_policy import RuntimeCommandPolicy
 from src.worker_agent.application.ports.runtime_port import RuntimePort
 from src.worker_agent.infrastructure.adapters.runtime_watchdog import RuntimeWatchdog
+from src.worker_agent.infrastructure.security.execution_log_capture import (
+    DockerContainerLogSource,
+    ExecutionLogCapture,
+    ExecutionLogCaptureUnavailable,
+)
+from src.worker_agent.infrastructure.security.execution_log_recipe_stream import (
+    encode_recipe_frame,
+)
 
 try:
     import docker
@@ -58,7 +70,14 @@ class DockerRuntimeAdapter(RuntimePort):
     CACHE_MOUNT_PATH = "/root/.cache/restic"
     RUNTIME_TEMPORARY_LABEL = "docker-volume-backup.runtime.temporary"
     RUNTIME_JOB_ID_LABEL = "docker-volume-backup.runtime.job_id"
+    RUNTIME_CAPTURE_LABEL = "docker-volume-backup.runtime.capture"
     RUNTIME_TEMPORARY_VALUE = "true"
+    RUNTIME_CAPTURE_VALUE = "true"
+    _DEGRADED_CONTAINER_IDENTITY_REASON = (
+        "worker container identity could not be resolved through the docker daemon; "
+        "execution log capture degrades to the worker process and cannot survive "
+        "worker container recreation"
+    )
     CLEANUP_REMOVE_ATTEMPTS = 2
     MAX_CLEANUP_REPORT_IDS = 20
     MAX_LOG_BYTES = 4 * 1024 * 1024
@@ -90,6 +109,25 @@ class DockerRuntimeAdapter(RuntimePort):
         r"(?i)\b(password|passphrase|secret|token|private[_-]?key|access[_-]?key|credential)\b"
         r"(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;]+)"
     )
+    # Persistent execution-log capture (S1-S6): the bounded time this worker
+    # waits for the detached capture child to drain before the container is
+    # removed, the safe CP-visible warning prefix, the per-job name-shift
+    # attempts for same-second collisions and the fixed subdirectory inside
+    # the persistent worker state/recovery directory (S1: deployed Docker
+    # workers mount worker_state at /data; the executed container filesystem
+    # is ephemeral, so the default root must live on the mounted state
+    # volume, never on the container layer).
+    EXECUTION_LOG_DRAIN_SECONDS = 30.0
+    EXECUTION_LOG_WARNING_PREFIX = "[persistent-execution-log]"
+    EXECUTION_LOG_STATE_SUBDIR = "execution-logs"
+    EXECUTION_LOG_NAME_ATTEMPTS = 10
+    # Ephemeral framed-recipe transfer bound (S4/S5, native-parity): the
+    # maximum time either handoff path (the daemon-owned container's
+    # attached stdin or the detached host child's pipe) may block on the
+    # recipe frame before the worker fails open and lets the job proceed
+    # without the secrets. Matches the native adapter's
+    # ``RECIPE_FRAME_TRANSFER_TIMEOUT``.
+    RECIPE_FRAME_TRANSFER_TIMEOUT = 10.0
 
     def __init__(self, timeout_seconds: float | None = None, idle_timeout_seconds: float | None = None):
         self.timeout_seconds = timeout_seconds if timeout_seconds is not None else self._env_timeout(
@@ -106,6 +144,11 @@ class DockerRuntimeAdapter(RuntimePort):
         )
         self.no_lock = self._env_flag("SNAPSHOT_EXPLORER_NO_LOCK")
         self.cache_dir = os.environ.get("SNAPSHOT_EXPLORER_CACHE_DIR") or None
+        # Persistent execution-log capture identity: set here so
+        # ensure_registered() can mirror the registered worker identity onto
+        # this runtime (the same pattern as the Kubernetes adapter); the
+        # capture integration below never captures without a real identity.
+        self.worker_id = os.environ.get("WORKER_ID") or None
         if docker is None:
             self.client = None
             return
@@ -571,12 +614,27 @@ class DockerRuntimeAdapter(RuntimePort):
             )
             for container in containers or []:
                 summary["inspected"] += 1
+                if self._container_status(container) not in {"exited", "dead"}:
+                    summary["skipped"] += 1
+                    continue
                 labels = self._container_labels(container)
                 if labels.get(self.RUNTIME_TEMPORARY_LABEL) != self.RUNTIME_TEMPORARY_VALUE:
                     summary["skipped"] += 1
                     continue
-                if self._container_status(container) not in {"exited", "dead"}:
-                    summary["skipped"] += 1
+                if labels.get(self.RUNTIME_CAPTURE_LABEL) == self.RUNTIME_CAPTURE_VALUE:
+                    # Daemon-owned capture containers are self-cleaning evidence
+                    # writers: their redacted logs already live in the mounted
+                    # worker-state volume, so an exited capture container is
+                    # removed losslessly without consulting job recovery.
+                    result = self._cleanup_container(container, already_exited=True, job_id=None)
+                    if result["removed"]:
+                        summary["removed"] += 1
+                        if len(summary["removed_ids"]) < self.MAX_CLEANUP_REPORT_IDS:
+                            summary["removed_ids"].append(result["container_id"])
+                    else:
+                        summary["failed"] += 1
+                        if len(summary["failed_ids"]) < self.MAX_CLEANUP_REPORT_IDS:
+                            summary["failed_ids"].append(result["container_id"])
                     continue
                 job_id = labels.get(self.RUNTIME_JOB_ID_LABEL)
                 if recover_callback is not None:
@@ -1411,6 +1469,622 @@ class DockerRuntimeAdapter(RuntimePort):
                 errors.append(f"{container_id}: {exc}")
         return {"restarted": restarted, "errors": errors}
 
+    @classmethod
+    def _capture_socket_path(cls) -> str | None:
+        """Daemon location the detached capture child must use.
+
+        ``None`` keeps the child's platform-default daemon socket (the same
+        location ``docker.from_env()`` uses in this worker). A configured
+        ``DOCKER_HOST`` is honored only when it names a Unix socket or a
+        Windows named pipe; any other form is rejected here before daemon
+        contact so the capture fails safely instead of silently reading the
+        wrong daemon.
+        """
+        host = os.environ.get("DOCKER_HOST")
+        if host is None or not host.strip():
+            return None
+        normalized = host.strip().replace("\\", "/")
+        if normalized.startswith("unix://"):
+            return normalized[len("unix://"):]
+        if normalized.startswith("//./pipe/"):
+            return normalized
+        if normalized.startswith("npipe://") and normalized[len("npipe://"):].startswith("//./pipe/"):
+            return normalized[len("npipe://"):]
+        raise ValueError("unsupported docker daemon socket location")
+
+    @classmethod
+    def _execution_log_root(cls) -> str:
+        """S1: persistent worker-state directory hosting the fixed log
+        structure.
+
+        Resolution order: an explicit ``WORKER_EXECUTION_LOG_ROOT`` keeps its
+        original precedence; otherwise the existing worker state and recovery
+        configuration decides (``WORKER_STATE_DIR``, then the recovered job
+        journal directory, then the configured credential-file directory -
+        the deployed compose convention ``WORKER_CREDENTIAL_FILE=/data/
+        worker_credentials.json`` mounts the persistent ``worker_state``
+        volume at ``/data`` and ``main.py`` derives the recovery journal from
+        the same directory). Without any state configuration the committed
+        path-policy default is preserved (native/developer behavior is
+        untouched); no host-volume path is ever assumed for the daemon.
+        """
+        override = os.environ.get(ExecutionLogCapture.ROOT_ENV)
+        if isinstance(override, str) and override.strip():
+            return override.strip()
+        state_dir = os.environ.get("WORKER_STATE_DIR")
+        if isinstance(state_dir, str) and state_dir.strip():
+            return os.path.join(state_dir.strip(), cls.EXECUTION_LOG_STATE_SUBDIR)
+        recovery_file = os.environ.get("WORKER_JOB_RECOVERY_FILE")
+        if isinstance(recovery_file, str) and recovery_file.strip():
+            return str(Path(recovery_file.strip()).with_name(cls.EXECUTION_LOG_STATE_SUBDIR))
+        credential_file = os.environ.get("WORKER_CREDENTIAL_FILE")
+        if isinstance(credential_file, str) and credential_file.strip():
+            return str(Path(credential_file.strip()).with_name(cls.EXECUTION_LOG_STATE_SUBDIR))
+        return ExecutionLogCapture.default_root()
+
+    @classmethod
+    def _execution_log_capture_path(cls, worker_id: str, job_id: str, root: str) -> Path:
+        """Free the log name inside the fixed structure (S1).
+
+        Same-second captures of the same job id shift to a deterministic
+        ``-1..-9`` sibling name (the foundation's exclusive-name policy)
+        instead of colliding inside the child; existing logs and legacy
+        recipe siblings are only observed, never opened, moved or rewritten.
+        Secrets travel as an ephemeral stdin frame (S5), so no recipe name
+        is reserved anymore."""
+        base = ExecutionLogCapture.job_log_path(root, worker_id, cls.runtime_kind, job_id)
+        for index in range(cls.EXECUTION_LOG_NAME_ATTEMPTS):
+            log_path = base if index == 0 else base.with_name(f"{base.stem}-{index}{base.suffix}")
+            if not log_path.exists() and not log_path.with_name(f"{log_path.name}.recipe.json").exists():
+                return log_path
+        raise ExecutionLogCaptureUnavailable("execution log name could not be reserved")
+
+    @staticmethod
+    def _stream_recipe_frame_to_capture_container(capture_container: Any, recipe_frame: bytes) -> None:
+        """Attach to the daemon-owned capture container's stdin, write the
+        bounded framed recipe and close the stream so the child consumes the
+        one-shot secrets without any recipe file on the persistent volume.
+
+        The frame is bounded binary ``bytes`` (length-prefixed at the
+        ``encode_recipe_frame`` boundary); it is written to the attached
+        raw/stdin stream exactly like the native adapter's relay-stdin
+        handoff. The write is bounded by a daemon thread so a daemon or
+        capture child that never consumes the attached stdin cannot block
+        the job: on timeout this returns without raising (fail-open, S4).
+        A failed attach or write still raises; callers treat it as
+        fail-open (alert, never block the job)."""
+        stream = capture_container.attach(socket=True, stdin=True, stream=True)
+        transfer_done = threading.Event()
+        transfer_error: List[BaseException] = []
+
+        def _write_frame() -> None:
+            try:
+                stream.write(recipe_frame)
+            except Exception as error:
+                # Forwarded to the caller below so an immediately broken
+                # stream keeps its original fail-open disposal path.
+                transfer_error.append(error)
+            finally:
+                # The close always happens in the writer thread (never
+                # concurrently with a possibly still blocked write), so a
+                # write-held stream lock cannot deadlock the caller.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                transfer_done.set()
+
+        frame_writer = threading.Thread(target=_write_frame, daemon=True, name="recipe-frame-transfer")
+        frame_writer.start()
+        completed = transfer_done.wait(DockerRuntimeAdapter.RECIPE_FRAME_TRANSFER_TIMEOUT)
+        if not completed:
+            # Fail-open (S4): the daemon or child never consumed the frame
+            # within the bound. The stream stays in the writer thread so the
+            # caller is never blocked or raised into; the capture container
+            # keeps its original drain/orphan-sweep disposal.
+            return
+        if transfer_error:
+            raise transfer_error[0]
+
+    @staticmethod
+    def _python_capture_script(env: Any) -> str | None:
+        """Path of the capture child module inside the worker's own image.
+
+        The committed worker image copies ``src`` below ``PYTHONPATH``
+        (``/app``) with the same layout as this repository, so the capture
+        module is addressable without any host-path assumption."""
+        if not isinstance(env, (list, tuple)):
+            return None
+        for entry in env:
+            if isinstance(entry, str) and entry.startswith("PYTHONPATH="):
+                base = entry[len("PYTHONPATH="):].strip().split(os.pathsep)[0].strip()
+                if not base:
+                    return None
+                return posixpath.join(base, "src/worker_agent/infrastructure/security/execution_log_capture.py")
+        return None
+
+    @staticmethod
+    def _runs_inside_a_docker_container() -> bool:
+        """Safe container-vs-host distinction for the docker runtime topology.
+
+        The Docker daemon creates ``.dockerenv`` at the root of every container
+        it runs (podman keeps the same marker for compatibility) while native
+        host/service workers (deb/MSI) do not have it. It decides between the
+        silent host-native fallback and the actionable degraded-capture warning
+        when ``HOSTNAME`` cannot be resolved through the daemon, without
+        assuming any worker-internal path is a host path (the daemon-owned
+        capture mode keeps deriving its mounts from the worker's own daemon
+        record).
+        """
+        try:
+            return os.path.exists("/.dockerenv")
+        except (OSError, ValueError):
+            return False
+
+    def _execution_log_capture_mode(self, root: str, payload: Dict[str, Any], output_callback) -> Dict[str, Any]:
+        """S5: choose where the capture child runs.
+
+        A containerized worker (the deployed compose shape) inspects ITSELF
+        through the daemon with one read-only ``containers.get(HOSTNAME)``;
+        when its own image, runtime layout, worker-state mount and daemon
+        socket mount satisfy the invariants, the capture child runs as a
+        daemon-owned container that survives worker-container stop/recreate.
+        Native (host) workers keep the pre-existing detached child, which
+        already survives worker process death. A containerized worker whose
+        identity cannot resolve (e.g. a compose ``hostname:`` override) also
+        keeps the detached child but fails open with one safe actionable
+        degraded-capture alert (S4). Degraded topologies never fail the job.
+        """
+        hostname = os.environ.get("HOSTNAME")
+        if not isinstance(hostname, str) or not DockerContainerLogSource.CONTAINER_ID_PATTERN.fullmatch(hostname):
+            if self._runs_inside_a_docker_container():
+                return {"mode": "process", "alert": self._DEGRADED_CONTAINER_IDENTITY_REASON}
+            return {"mode": "process"}
+        try:
+            own = self.client.containers.get(hostname)
+            attrs = getattr(own, "attrs", None)
+            if not isinstance(attrs, dict):
+                raise ValueError("worker container record is unavailable")
+        except Exception:
+            # Host-native (deb/MSI/service) deployment: the hostname naturally
+            # does not resolve through the daemon and the detached child
+            # already covers worker process death; stay silent. A real worker
+            # container whose identity cannot resolve (e.g. a hostname
+            # override) degrades and must alert (S4).
+            if self._runs_inside_a_docker_container():
+                return {"mode": "process", "alert": self._DEGRADED_CONTAINER_IDENTITY_REASON}
+            return {"mode": "process"}
+        config = attrs.get("Config") if isinstance(attrs.get("Config"), dict) else {}
+        mounts = attrs.get("Mounts") if isinstance(attrs.get("Mounts"), list) else []
+        if not isinstance(config, dict):
+            config = {}
+        image = config.get("Image")
+        script = self._python_capture_script(config.get("Env"))
+        if not isinstance(image, str) or not image or not isinstance(script, str):
+            return {
+                "mode": "process",
+                "alert": "worker runtime layout is not usable for a daemon-owned capture container; execution log capture degrades to the worker process",
+            }
+        socket_mount = None
+        state_mount = None
+        root_path = "/" + str(root).replace("\\", "/").strip("/")
+        for mount in mounts:
+            if not isinstance(mount, dict):
+                continue
+            destination = mount.get("Destination")
+            if not isinstance(destination, str) or not destination:
+                continue
+            source = mount.get("Name") if mount.get("Type") == "volume" else mount.get("Source")
+            if not isinstance(source, str) or not source or not mount.get("RW", True):
+                continue
+            normalized = "/" + destination.replace("\\", "/").strip("/")
+            if (
+                socket_mount is None
+                and (source.endswith("docker.sock") or normalized.endswith("docker.sock"))
+            ):
+                socket_mount = (source, normalized)
+            if (
+                state_mount is None
+                and (normalized == root_path or root_path.startswith(normalized + "/"))
+            ):
+                state_mount = (source, normalized)
+        if socket_mount is None:
+            return {
+                "mode": "process",
+                "alert": "docker daemon socket mount is not visible to this worker container; execution log capture degrades to the worker process",
+            }
+        if state_mount is None:
+            return {
+                "mode": "process",
+                "alert": "execution log root is not inside a mounted worker-state volume; execution log capture degrades to the worker process",
+            }
+        return {
+            "mode": "daemon",
+            "spec": {
+                "image": image,
+                "script": script,
+                "socket": socket_mount[1],
+                "volumes": {
+                    state_mount[0]: {"bind": state_mount[1], "mode": "rw"},
+                    socket_mount[0]: {"bind": socket_mount[1], "mode": "rw"},
+                },
+            },
+        }
+
+    def _capture_container_labels(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        labels = self._runtime_container_labels(payload)
+        if isinstance(labels, dict):
+            normalized = dict(labels)
+        else:
+            normalized = {}
+            for item in labels or []:
+                if isinstance(item, str) and "=" in item:
+                    key, value = item.split("=", 1)
+                    normalized[key] = value
+        normalized[self.RUNTIME_CAPTURE_LABEL] = self.RUNTIME_CAPTURE_VALUE
+        return normalized
+
+    def _execution_log_alert(
+        self,
+        payload: Dict[str, Any],
+        reason: str,
+        output_callback: Callable[[str], None] | None,
+    ) -> None:
+        """S4: persistent-execution-log failures continue and alert.
+
+        The alert is a fixed, safe, actionable reason (no secret values, no
+        raw exception text) visible locally (worker log) and through the
+        existing job progress callback to the Control Plane.
+        """
+        job_id = self._runtime_job_id(payload)
+        logger.warning(
+            "Persistent execution log capture unavailable (job_id=%s runtime=%s reason=%s)",
+            job_id,
+            self.runtime_kind,
+            reason,
+        )
+        if output_callback is None:
+            return
+        try:
+            output_callback(
+                f"\n{self.EXECUTION_LOG_WARNING_PREFIX} execution log unavailable for job {job_id}: {reason}\n"
+            )
+        except Exception:
+            logger.debug("Execution log warning callback failed")
+
+    def _start_execution_log_capture(
+        self,
+        container: Any,
+        payload: Dict[str, Any],
+        secrets: set[str],
+        output_callback: Callable[[str], None] | None,
+    ) -> Dict[str, Any] | None:
+        """S1, S2, S5: spawn the independent, crash-resistant capture child.
+
+        The child re-follows this container's logs through the Docker daemon
+        (the same read-only SDK logs call as the live stream) and keeps
+        writing after this worker process dies; nothing is mounted and no
+        volume path is assumed to be daemon-visible. Never raises: any setup
+        failure alerts (S4) and returns ``None`` so the execution itself is
+        untouched.
+        """
+        worker_id = getattr(self, "worker_id", None)
+        if not isinstance(worker_id, str) or not worker_id:
+            self._execution_log_alert(
+                payload,
+                "worker identity is unavailable; register the worker before running jobs",
+                output_callback,
+            )
+            return None
+        container_id = self._container_identifier(container)
+        identity_usable = bool(
+            isinstance(container_id, str)
+            and container_id != "unknown"
+            and DockerContainerLogSource.CONTAINER_ID_PATTERN.fullmatch(container_id)
+        )
+        if not identity_usable:
+            self._execution_log_alert(
+                payload,
+                "container identity is unavailable; container logs cannot be followed",
+                output_callback,
+            )
+            return None
+        try:
+            root = self._execution_log_root()
+            log_path = self._execution_log_capture_path(
+                worker_id, self._runtime_job_id(payload), root
+            )
+        except ValueError:
+            self._execution_log_alert(
+                payload,
+                "worker or job identity is not valid for the fixed execution log structure",
+                output_callback,
+            )
+            return None
+        except ExecutionLogCaptureUnavailable:
+            self._execution_log_alert(
+                payload,
+                "execution log name could not be reserved under the fixed structure",
+                output_callback,
+            )
+            return None
+        try:
+            socket_path = self._capture_socket_path()
+        except ValueError:
+            self._execution_log_alert(
+                payload,
+                "docker daemon socket location is unsupported; set DOCKER_HOST to a unix socket or Windows named pipe",
+                output_callback,
+            )
+            return None
+        mode = self._execution_log_capture_mode(root, payload, output_callback)
+        if mode.get("alert"):
+            self._execution_log_alert(payload, mode["alert"], output_callback)
+        # Ephemeral secret transfer (S5): secrets are encoded as a bounded
+        # length-prefixed frame and piped to the capture child's stdin; no
+        # recipe file is ever written to disk, so a crash between preparation
+        # and consumption can never leave plaintext on persistent storage.
+        try:
+            recipe_frame = encode_recipe_frame(sorted(secrets))
+        except Exception:
+            self._execution_log_alert(
+                payload,
+                "redaction recipe frame could not be encoded",
+                output_callback,
+            )
+            return None
+        if mode.get("mode") == "daemon":
+            spec = mode["spec"]
+            command = [
+                "python",
+                spec["script"],
+                "--run-capture",
+                "--capture", os.fspath(Path(log_path)),
+                "--recipe-stream", "1",
+                "--container", container_id,
+                "--socket", spec["socket"],
+            ]
+            try:
+                capture_container = self.client.containers.run(
+                    image=spec["image"],
+                    command=command,
+                    volumes=spec["volumes"],
+                    network_mode="none",
+                    detach=True,
+                    remove=False,
+                    stdin_open=True,
+                    labels=self._capture_container_labels(payload),
+                )
+            except Exception:
+                self._execution_log_alert(
+                    payload,
+                    "capture container could not be created; execution log capture is unavailable for this run",
+                    output_callback,
+                )
+                return None
+            # Ephemeral secret handoff (S5): attach to the daemon-owned
+            # container's stdin and write the bounded framed recipe, then
+            # close the stream so the child consumes the secrets without any
+            # recipe file on the persistent volume. A failed attach or write
+            # is fail-open (S4): it removes the blocked container, alerts and
+            # never touches the execution.
+            try:
+                self._stream_recipe_frame_to_capture_container(capture_container, recipe_frame)
+            except Exception:
+                try:
+                    capture_container.remove(force=True)
+                except Exception:
+                    logger.debug(
+                        "Blocked capture container removal failed; the orphan sweep will remove it"
+                    )
+                self._execution_log_alert(
+                    payload,
+                    "redaction recipe frame could not be delivered to the capture container",
+                    output_callback,
+                )
+                return None
+            logger.info(
+                "Daemon-owned execution log capture container started (job_id=%s worker_id=%s executor_id=%s capture_container_id=%s)",
+                self._runtime_job_id(payload),
+                worker_id,
+                container_id,
+                self._container_identifier(capture_container),
+            )
+            self._prune_execution_logs(root)
+            return {
+                "process": capture_container,
+                "mode": "daemon",
+                "capture_container_id": self._container_identifier(capture_container),
+                "log_path": log_path,
+                "recipe_frame": recipe_frame,
+                "container_id": container_id,
+            }
+        # Ephemeral handoff for the detached host child (S5): a pipe carries
+        # the bounded framed recipe to the child's stdin, so no recipe file
+        # is ever created on disk and failed handoffs leave nothing to clean.
+        try:
+            recipe_source, recipe_sink = os.pipe()
+        except OSError:
+            self._execution_log_alert(payload, "detached capture process could not start", output_callback)
+            return None
+        try:
+            # Defined before the spawn attempt so the release below is
+            # also safe when the spawn itself fails (fail-open, S4).
+            transfer_done = threading.Event()
+            try:
+                process = ExecutionLogCapture.spawn_detached_docker_capture(
+                    log_path,
+                    None,
+                    container_id,
+                    socket_path=socket_path,
+                    stdin=recipe_source,
+                    recipe_stream=True,
+                )
+            except (ExecutionLogCaptureUnavailable, OSError):
+                self._execution_log_alert(payload, "detached capture process could not start", output_callback)
+                return None
+            except Exception:
+                self._execution_log_alert(payload, "execution log capture could not start unexpectedly", output_callback)
+                return None
+            # Bounded binary write (S4): the child consumes the length-
+            # prefixed frame; a child that died before reading surfaces as a
+            # broken pipe and capture merely skips the secrets, while a
+            # child that stops consuming (a full, unread pipe) is bounded by
+            # the transfer timeout so the job never blocks. The transfer
+            # runs on a daemon thread and the release below closes both pipe
+            # handles (closing the sink yields EOF for the child), then
+            # control proceeds with the job either way (fail-open).
+
+            def _write_frame_to_sink() -> None:
+                try:
+                    frame_local = memoryview(recipe_frame)
+                    while frame_local:
+                        frame_local = frame_local[os.write(recipe_sink, frame_local):]
+                except OSError:
+                    pass
+                finally:
+                    transfer_done.set()
+
+            frame_writer = threading.Thread(target=_write_frame_to_sink, daemon=True, name="recipe-frame-transfer")
+            frame_writer.start()
+            transfer_done.wait(self.RECIPE_FRAME_TRANSFER_TIMEOUT)
+        finally:
+            handles = (recipe_sink, recipe_source)
+            if transfer_done.is_set():
+                for handle in handles:
+                    try:
+                        os.close(handle)
+                    except OSError:
+                        pass
+            else:
+                # Fail-open (S4): a writer thread still blocked inside
+                # os.write (a full, never-drained pipe) makes os.close block
+                # indefinitely on Windows, so both pipe ends are released
+                # asynchronously instead - the relay capture sink's
+                # validated async-close pattern. The child then sees EOF,
+                # skips the secrets (its frame is incomplete) and proceeds.
+                threading.Thread(
+                    target=self._release_os_handle_pair,
+                    args=handles,
+                    daemon=True,
+                    name="recipe-frame-release",
+                ).start()
+        logger.info(
+            "Persistent execution log capture started (job_id=%s worker_id=%s container_id=%s)",
+            self._runtime_job_id(payload),
+            worker_id,
+            container_id,
+        )
+        self._prune_execution_logs(root)
+        return {
+            "process": process,
+            "mode": "process",
+            "log_path": log_path,
+            "recipe_frame": recipe_frame,
+            "container_id": container_id,
+        }
+
+    @staticmethod
+    def _release_os_handle_pair(*handles: int) -> None:
+        """Best-effort close of OS pipe handles without ever blocking:
+        failures are swallowed because the handoff is fail-open."""
+        for handle in handles:
+            try:
+                os.close(handle)
+            except (OSError, ValueError):
+                pass
+
+    def _prune_execution_logs(self, root: str) -> None:
+        """S3: opportunistically enforce the configured retention window on
+        the same persistent root (the committed sweep never raises and only
+        deletes managed job logs)."""
+        try:
+            summary = ExecutionLogCapture.prune(root)
+            if isinstance(summary, dict):
+                logger.debug(
+                    "Execution log retention sweep (deleted=%s failed=%s)",
+                    summary.get("deleted"),
+                    summary.get("failed"),
+                )
+        except Exception as exc:
+            logger.debug("Execution log retention sweep unavailable (error_type=%s)", exc.__class__.__name__)
+
+    def _finish_execution_log_capture(
+        self,
+        capture: Dict[str, Any] | None,
+        payload: Dict[str, Any],
+        output_callback: Callable[[str], None] | None,
+        *,
+        drain: bool,
+    ) -> None:
+        """Drain the capture child before the executor container is removed
+        (the executor/log stream must not be destroyed before capture
+        finishes) and alert when evidence could not be persisted; never
+        raises and never waits when the job did not exit on its own, so
+        cancellation and timeout latencies are unchanged."""
+        handle = capture or {}
+        process = handle.get("process")
+        if process is None or not hasattr(process, "wait"):
+            return
+        mode = handle.get("mode", "process")
+        try:
+            if not drain:
+                if mode == "daemon":
+                    # The daemon-owned capture keeps following the executor on
+                    # the daemon after cancellation; interrupted evidence stays
+                    # on the state volume and the container self-terminates at
+                    # stream EOF. The orphan sweep removes it once exited.
+                    return
+                if not hasattr(process, "poll"):
+                    return
+                exit_code = process.poll()
+                if exit_code is None or not isinstance(exit_code, int) or exit_code in (0, 1):
+                    return
+                self._alert_on_capture_exit(payload, exit_code, output_callback)
+                return
+            try:
+                result = process.wait(timeout=self.EXECUTION_LOG_DRAIN_SECONDS)
+            except Exception as exc:
+                logger.info(
+                    "Execution log capture still streaming after the job finished; it keeps the partial evidence separately (job_id=%s error_type=%s)",
+                    self._runtime_job_id(payload),
+                    exc.__class__.__name__,
+                )
+                return
+            exit_code = result.get("StatusCode") if isinstance(result, dict) else result
+            if not isinstance(exit_code, int):
+                return
+            if mode == "daemon":
+                try:
+                    process.remove()
+                except Exception as exc:
+                    logger.debug(
+                        "Capture container removal deferred to the orphan sweep (error_type=%s)",
+                        exc.__class__.__name__,
+                    )
+            if exit_code in (0, 1):
+                return
+            self._alert_on_capture_exit(payload, exit_code, output_callback)
+        except Exception:
+            logger.debug("Execution log capture drain failed", exc_info=True)
+
+    def _alert_on_capture_exit(
+        self,
+        payload: Dict[str, Any],
+        exit_code: int,
+        output_callback: Callable[[str], None] | None,
+    ) -> None:
+        reasons = {
+            2: "redaction recipe was rejected by the capture child",
+            3: "execution log file could not be created",
+            4: "docker daemon log stream could not be opened",
+        }
+        self._execution_log_alert(
+            payload,
+            reasons.get(exit_code, f"capture child exited with status {exit_code}"),
+            output_callback,
+        )
+
     def run_runtime_job(
         self,
         image: str,
@@ -1426,6 +2100,7 @@ class DockerRuntimeAdapter(RuntimePort):
         container_exited = False
         stream_state = None
         stream_thread = None
+        capture = None
         restore_result_path = None
         try:
             environment, volumes, command, network_mode, timeout, temp_dirs = self._prepare_runtime(payload, binary=False)
@@ -1447,6 +2122,10 @@ class DockerRuntimeAdapter(RuntimePort):
                 remove=False,
                 labels=self._runtime_container_labels(payload),
             )
+            # Independent persistent execution-log capture: the detached child
+            # follows the daemon's log stream and survives this worker's death;
+            # setup failure only alerts (S4) and never touches the execution.
+            capture = self._start_execution_log_capture(container, payload, secrets, output_callback)
             watchdog = RuntimeWatchdog(timeout, self._idle_timeout(), cancel_check, clock=self._monotonic)
             stream_state, stream_thread = self._start_log_stream(
                 container,
@@ -1503,6 +2182,11 @@ class DockerRuntimeAdapter(RuntimePort):
             return self._failure_result(f"runtime execution failed: {exc}", False, secrets)
         finally:
             self._finish_log_stream(stream_state, stream_thread)
+            # Drain the capture child before the executor container (and its
+            # daemon log stream) is destroyed; canceled or timed-out jobs do
+            # not wait (the child keeps the partial evidence via the stream
+            # termination that the removal causes).
+            self._finish_execution_log_capture(capture, payload, output_callback, drain=container_exited)
             if container is not None:
                 self._cleanup_container(
                     container,

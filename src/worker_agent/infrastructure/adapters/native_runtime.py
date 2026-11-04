@@ -1,8 +1,10 @@
 import json
+import logging
 import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -14,6 +16,13 @@ from src.worker_agent.application.policies.runtime_command_policy import Runtime
 from src.worker_agent.application.ports.runtime_port import RuntimePort
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
 from src.worker_agent.infrastructure.adapters.runtime_watchdog import RuntimeWatchdog
+from src.worker_agent.infrastructure.security.execution_log_capture import (
+    ExecutionLogCapture,
+    ExecutionLogCaptureUnavailable,
+)
+from src.worker_agent.infrastructure.security.execution_log_recipe_stream import (
+    encode_recipe_frame,
+)
 from src.restic_executable import (
     resolve_restic_executable,
     restic_command_with_backend_options,
@@ -24,6 +33,8 @@ from src.rclone_executable import resolve_rclone_executable
 MAX_RESOLVED_FILES = 32
 MAX_RESOLVED_FILE_BYTES = 1024 * 1024
 MAX_RESOLVED_FILES_BYTES = 4 * 1024 * 1024
+
+logger = logging.getLogger(__name__)
 
 
 def _platform_is_windows() -> bool:
@@ -57,6 +68,19 @@ class NativeRuntimeAdapter(RuntimePort):
     _TARGET_STATS_MODES = DockerRuntimeAdapter._TARGET_STATS_MODES
     _STATS_FIELD_PATTERN = DockerRuntimeAdapter._STATS_FIELD_PATTERN
     _SECRET_ENV_MARKERS = DockerRuntimeAdapter._SECRET_ENV_MARKERS
+    # Persistent execution-log capture (S1-S6): the bounded drain time before
+    # the job result is returned and the safe CP-visible warning prefix. The
+    # durable root/state configuration is shared with the Docker draft so
+    # both runtimes write under the same configured worker state directory.
+    EXECUTION_LOG_DRAIN_SECONDS = DockerRuntimeAdapter.EXECUTION_LOG_DRAIN_SECONDS
+    EXECUTION_LOG_WARNING_PREFIX = DockerRuntimeAdapter.EXECUTION_LOG_WARNING_PREFIX
+    EXECUTION_LOG_STATE_SUBDIR = DockerRuntimeAdapter.EXECUTION_LOG_STATE_SUBDIR
+    EXECUTION_LOG_NAME_ATTEMPTS = DockerRuntimeAdapter.EXECUTION_LOG_NAME_ATTEMPTS
+    # Bounded ephemeral recipe-frame transfer: a child that never consumes
+    # the frame cannot block the job longer than this (fail-open, S4).
+    RECIPE_FRAME_TRANSFER_TIMEOUT = 10.0
+    _runtime_job_id = staticmethod(DockerRuntimeAdapter._runtime_job_id)
+    _execution_log_root = staticmethod(DockerRuntimeAdapter._execution_log_root)
 
     def __init__(
         self,
@@ -78,6 +102,11 @@ class NativeRuntimeAdapter(RuntimePort):
         )
         self.python_executable = python_executable or sys.executable
         self.no_lock = os.environ.get("SNAPSHOT_EXPLORER_NO_LOCK", "").strip().lower() in {"1", "true", "yes", "on"}
+        # Persistent execution-log capture identity: the registered worker
+        # identity is mirrored here by ensure_registered() (the same pattern
+        # as the Docker adapter); the capture integration never captures
+        # without a real identity.
+        self.worker_id = os.environ.get("WORKER_ID") or None
 
     _monotonic = staticmethod(time.monotonic)
 
@@ -347,6 +376,279 @@ class NativeRuntimeAdapter(RuntimePort):
     def cleanup_orphaned_runtime_jobs(self, recover_callback: Callable[[Any, Dict[str, Any]], str] | None = None) -> Dict[str, Any]:
         return {"inspected": 0, "removed": 0, "failed": 0, "skipped": 0, "retained": 0, "removed_ids": [], "failed_ids": [], "retained_ids": []}
 
+    def _execution_log_alert(
+        self,
+        payload: Dict[str, Any],
+        reason: str,
+        output_callback: Callable[[str], None] | None,
+    ) -> None:
+        """S4: persistent-execution-log failures continue and alert.
+
+        The alert is a fixed, safe, actionable reason (no secret values, no
+        raw exception text) visible locally (worker log) and through the
+        existing job progress callback to the Control Plane.
+        """
+        job_id = self._runtime_job_id(payload)
+        logger.warning(
+            "Persistent execution log capture unavailable (job_id=%s runtime=%s reason=%s)",
+            job_id,
+            self.runtime_kind,
+            reason,
+        )
+        if output_callback is None:
+            return
+        try:
+            output_callback(
+                f"\n{self.EXECUTION_LOG_WARNING_PREFIX} execution log unavailable for job {job_id}: {reason}\n"
+            )
+        except Exception:
+            logger.debug("Execution log warning callback failed")
+
+    @classmethod
+    def _execution_log_capture_path(cls, worker_id: str, job_id: str, root: str) -> tuple:
+        """Free ``(log, recipe)`` names inside the fixed structure (S1).
+
+        Native mirror of the shared Docker policy: same-second captures of
+        the same job id shift to a deterministic ``-1..-9`` sibling name
+        (the foundation's exclusive-name policy) instead of colliding inside
+        the child; existing logs and recipes are only observed, never
+        opened, moved or rewritten. The runtime component is this adapter's
+        ``native`` kind.
+        """
+        base = ExecutionLogCapture.job_log_path(root, worker_id, cls.runtime_kind, job_id)
+        for index in range(cls.EXECUTION_LOG_NAME_ATTEMPTS):
+            log_path = base if index == 0 else base.with_name(f"{base.stem}-{index}{base.suffix}")
+            recipe_path = log_path.with_name(f"{log_path.name}.recipe.json")
+            if not log_path.exists() and not recipe_path.exists():
+                return log_path, recipe_path
+        raise ExecutionLogCaptureUnavailable("execution log name could not be reserved")
+
+    def _start_execution_log_capture(
+        self,
+        payload: Dict[str, Any],
+        secrets: set[str],
+        output_callback: Callable[[str], None] | None,
+    ) -> Dict[str, Any] | None:
+        """S1, S2, S5: prepare the executor-owning persistent capture.
+
+        Writes the one-shot redaction recipe next to the per-job log path
+        under the configured durable worker state root; the executor is then
+        wrapped into the executor-owning relay child (S5), which owns the
+        executor's own stdout/stderr pipes, forwards them verbatim to the
+        worker's live streams and feeds the detached redaction-gated capture
+        child, so capture continues after this worker or its live pipe dies.
+        Never raises: any setup failure alerts (S4) and returns ``None`` so
+        the execution itself is untouched (the command then runs directly).
+        """
+        worker_id = getattr(self, "worker_id", None)
+        if not isinstance(worker_id, str) or not worker_id:
+            self._execution_log_alert(
+                payload,
+                "worker identity is unavailable; register the worker before running jobs",
+                output_callback,
+            )
+            return None
+        try:
+            root = self._execution_log_root()
+            log_path, _recipe_path = self._execution_log_capture_path(
+                worker_id, self._runtime_job_id(payload), root
+            )
+        except ValueError:
+            self._execution_log_alert(
+                payload,
+                "worker or job identity is not valid for the fixed execution log structure",
+                output_callback,
+            )
+            return None
+        except ExecutionLogCaptureUnavailable:
+            self._execution_log_alert(
+                payload,
+                "execution log name could not be reserved under the fixed structure",
+                output_callback,
+            )
+            return None
+        # Ephemeral secret transfer (S5): secrets are encoded as a bounded
+        # length-prefixed frame and piped to the relay child's stdin; no
+        # recipe file is ever written to disk, so a crash between preparation
+        # and consumption can never leave plaintext on the host.
+        try:
+            recipe_frame = encode_recipe_frame(sorted(secrets))
+        except Exception:
+            self._execution_log_alert(
+                payload,
+                "redaction recipe frame could not be encoded",
+                output_callback,
+            )
+            return None
+        logger.info(
+            "Persistent execution log capture started (job_id=%s worker_id=%s)",
+            self._runtime_job_id(payload),
+            worker_id,
+        )
+        # S3: opportunistically enforce the configured retention window on the
+        # same persistent root (the committed sweep never raises and only
+        # deletes managed job logs).
+        try:
+            summary = ExecutionLogCapture.prune(root)
+            if isinstance(summary, dict):
+                logger.debug(
+                    "Execution log retention sweep (deleted=%s failed=%s)",
+                    summary.get("deleted"),
+                    summary.get("failed"),
+                )
+        except Exception as exc:
+            logger.debug("Execution log retention sweep unavailable (error_type=%s)", exc.__class__.__name__)
+        return {
+            "log_path": log_path,
+            "recipe_frame": recipe_frame,
+            "root": root,
+        }
+
+    def _relay_spawn_options(self) -> Dict[str, Any]:
+        """The relay must own its process group so cancellation can take down
+        the executor with it, while the detached capture child (its own
+        session/process group) is never targeted."""
+        if os.name == "nt":
+            return {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        return {"start_new_session": True}
+
+    def _relay_graceful_stop_request(self, process: Any) -> None:
+        """Ask the executor-owning relay to stop its executor and exit
+        (Windows: CTRL_BREAK into the relay's new process group, where both
+        console group members stop; the detached capture child has no
+        console and is never touched). POSIX cancellation relies on the
+        relay's own SIGTERM handler and the process-group fallbacks."""
+        if os.name != "nt":
+            return
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int):
+            return
+        try:
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _terminate_process_tree(process: Any) -> None:
+        """Best-effort termination of a relay process and its own children
+        (cancellation/timeout must not orphan the executor).
+
+        The relay runs in its own session/process group, so POSIX can signal
+        the whole group; on Windows the CTRL_BREAK request plus the relay's
+        own stop handler is the graceful path and otherwise the executor dies
+        on the broken pipe it writes into. The detached capture child holds
+        its own session and is never targeted."""
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int):
+            return
+        try:
+            if os.name == "nt":
+                return
+            os.killpg(pid, signal.SIGTERM)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _kill_process_tree(process: Any) -> None:
+        """Final fallback for the relay tree (POSIX SIGKILL on its own group;
+        the detached capture child is never targeted)."""
+        pid = getattr(process, "pid", None)
+        if not isinstance(pid, int):
+            return
+        try:
+            if os.name == "nt":
+                return
+            os.killpg(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+    def _finish_execution_log_capture(
+        self,
+        capture: Dict[str, Any] | None,
+        payload: Dict[str, Any],
+        output_callback: Callable[[str], None] | None,
+        *,
+        drain: bool,
+    ) -> None:
+        """Confirm the executor-owned evidence is on the host.
+
+        For a job that finished on its own the relay (and through it the
+        detached capture child) has already seen the executor's EOF; a
+        bounded wait confirms the evidence file was created and gives the
+        child time to persist the redacted evidence (never false-fails the
+        job). Canceled or timed-out jobs do not wait, so their latency is
+        unchanged: the detached child sees the relay's EOF and finalizes on
+        its own. Never raises.
+        """
+        if not capture:
+            return
+        log_path = capture.get("log_path")
+        if log_path is None:
+            return
+        try:
+            if not drain:
+                return
+            exists = self._wait_for_evidence(log_path, self.EXECUTION_LOG_DRAIN_SECONDS)
+            if not exists:
+                self._execution_log_alert(
+                    payload,
+                    "execution log file could not be created",
+                    output_callback,
+                )
+                return
+            finalized = self._wait_for_completion_marker(log_path, self.EXECUTION_LOG_DRAIN_SECONDS)
+            if not finalized:
+                logger.info(
+                    "Execution log capture still streaming after the job finished; it keeps the partial evidence separately (job_id=%s)",
+                    self._runtime_job_id(payload),
+                )
+            # Ephemeral recipe: no file to clean up; the frame lives only in
+            # the pipe buffer and the child's memory.
+        except Exception:
+            logger.debug("Execution log capture finalization failed", exc_info=True)
+
+    @staticmethod
+    def _wait_for_evidence(log_path: object, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                if os.path.exists(os.fspath(log_path)):
+                    return True
+            except OSError:
+                return False
+            time.sleep(0.05)
+        return os.path.exists(os.fspath(log_path))
+
+    @staticmethod
+    def _wait_for_completion_marker(log_path: object, timeout: float) -> bool:
+        """Bounded, cheap completion check: only the log tail is read."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                with open(os.fspath(log_path), "rb") as handle:
+                    handle.seek(0, os.SEEK_END)
+                    size = handle.tell()
+                    handle.seek(max(0, size - 4096))
+                    tail = handle.read()
+                if b"[completed]" in tail or b"[interrupted]" in tail:
+                    return True
+            except OSError:
+                return False
+            time.sleep(0.05)
+        return False
+
+    def _cleanup_recipe_file(self, recipe_path: object) -> None:
+        """Best-effort removal of the one-shot recipe once the capture child
+        had its window to consume it, so a child that died before reading it
+        can never leave secret-bearing bytes on the host; missing files are
+        fine."""
+        if not isinstance(recipe_path, (str, os.PathLike)):
+            return
+        try:
+            os.remove(os.fspath(recipe_path))
+        except OSError:
+            pass
+
     def _run_process(
         self,
         command: list[str],
@@ -355,6 +657,7 @@ class NativeRuntimeAdapter(RuntimePort):
         cancel_check: Callable[[], bool] | None,
         output_callback: Callable[[str], None] | None,
         binary: bool = False,
+        capture: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         secrets = self._payload_secrets(payload)
         if self._callback_is_true(cancel_check):
@@ -368,7 +671,52 @@ class NativeRuntimeAdapter(RuntimePort):
             encoding=None if binary else "utf-8",
             errors=None if binary else "replace",
             bufsize=1 if not binary else -1,
+            **((capture or {}).get("spawn_options") or {}),
         )
+        # Ephemeral secret handoff: write the framed recipe to the relay
+        # child's stdin and close it so the relay can consume the frame
+        # before spawning the executor. A broken or slow child never blocks
+        # the job: the write is best-effort and capture simply disables.
+        recipe_frame = (capture or {}).get("recipe_frame")
+        if recipe_frame and process.stdin is not None:
+            # The frame is binary; use the underlying buffer when the stream
+            # is text-mode so bytes are never written through a TextIOWrapper.
+            # The write is bounded by a daemon thread so a child that never
+            # consumes the frame cannot block the job (fail-open, S4).
+            stdin_binary = getattr(process.stdin, "buffer", process.stdin)
+            transfer_done = threading.Event()
+
+            def _write_frame():
+                try:
+                    stdin_binary.write(recipe_frame)
+                    stdin_binary.flush()
+                except (OSError, BrokenPipeError, TypeError):
+                    pass
+                finally:
+                    transfer_done.set()
+
+            frame_writer = threading.Thread(target=_write_frame, daemon=True)
+            frame_writer.start()
+            transfer_done.wait(self.RECIPE_FRAME_TRANSFER_TIMEOUT)
+            if not transfer_done.is_set():
+                # The write is still blocked on a full pipe (child not
+                # reading); a synchronous close would deadlock on the
+                # stream lock held by the blocked write. Close from a
+                # daemon thread instead (same pattern as
+                # _RelayCaptureSink._close_stream_async).
+
+                def _close_stdin_async():
+                    try:
+                        stdin_binary.close()
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_close_stdin_async, daemon=True).start()
+            else:
+                try:
+                    process.stdin.close()
+                except Exception:
+                    pass
         stdout_parts: list[Any] = []
         stderr_parts: list[Any] = []
         watchdog = RuntimeWatchdog(
@@ -397,6 +745,12 @@ class NativeRuntimeAdapter(RuntimePort):
         while True:
             stop_reason = watchdog.verdict()
             if stop_reason:
+                # The relay (when capture is active) is the executor owner:
+                # ask it to stop its executor first (Windows CTRL_BREAK),
+                # then fall back to terminate and the process-group fallbacks
+                # so the executor is never orphaned. The detached capture
+                # child holds its own session and survives to finalize.
+                self._relay_graceful_stop_request(process)
                 try:
                     process.terminate()
                 except Exception:
@@ -410,6 +764,7 @@ class NativeRuntimeAdapter(RuntimePort):
         canceled = stop_reason == RuntimeWatchdog.CANCELED
         timed_out = bool(stop_reason) and not canceled
         if stop_reason:
+            self._terminate_process_tree(process)
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
@@ -417,6 +772,8 @@ class NativeRuntimeAdapter(RuntimePort):
                     process.kill()
                 except Exception as exc:
                     cleanup_error = f"could not kill native runtime process: {exc}"
+                else:
+                    self._kill_process_tree(process)
                 try:
                     process.wait(timeout=2)
                 except subprocess.TimeoutExpired:
@@ -473,6 +830,8 @@ class NativeRuntimeAdapter(RuntimePort):
         result_dir = None
         secret_dir = None
         restore_result_path = None
+        capture: Dict[str, Any] | None = None
+        result: Dict[str, Any] | None = None
         try:
             command, environment = self._command_and_environment(payload)
             secret_dir = self._materialize_resolved_files(payload, environment)
@@ -481,7 +840,31 @@ class NativeRuntimeAdapter(RuntimePort):
                 os.chmod(result_dir, 0o700)
                 restore_result_path = os.path.join(result_dir, DockerRuntimeAdapter.RESTORE_RESULT_FILENAME)
                 environment["RESTORE_RESULT_FILE"] = restore_result_path
-            result = self._run_process(command, environment, payload, cancel_check, output_callback, binary=False)
+            # Independent persistent execution-log capture (S1, S2, S5): the
+            # validated executor command is wrapped into the executor-owning
+            # capture relay, which owns the executor's own stdout/stderr
+            # pipes, forwards them verbatim to the live streams and feeds the
+            # detached redaction-gated capture child; setup failure only
+            # alerts (S4) and runs the command directly.
+            capture = self._start_execution_log_capture(payload, secrets, output_callback)
+            if capture is not None:
+                try:
+                    command = list(
+                        ExecutionLogCapture.capture_relay_command(
+                            capture["log_path"], None, command, recipe_stream=True
+                        )
+                    )
+                    options = self._relay_spawn_options()
+                    options["stdin"] = subprocess.PIPE
+                    capture["spawn_options"] = options
+                except (TypeError, ValueError):
+                    capture = None
+                    self._execution_log_alert(
+                        payload,
+                        "execution log capture relay could not be prepared",
+                        output_callback,
+                    )
+            result = self._run_process(command, environment, payload, cancel_check, output_callback, binary=False, capture=capture)
             if restore_result_path:
                 restore_evidence, restore_error = DockerRuntimeAdapter._read_restore_result(restore_result_path, secrets)
                 if restore_evidence:
@@ -500,6 +883,18 @@ class NativeRuntimeAdapter(RuntimePort):
                 shutil.rmtree(result_dir, ignore_errors=True)
             if secret_dir:
                 shutil.rmtree(secret_dir, ignore_errors=True)
+            # Finalize the persistent capture: drained for jobs that finished
+            # on their own, EOF-only for canceled/timed-out jobs (latency
+            # unchanged); never raises and never changes the result.
+            self._finish_execution_log_capture(
+                capture,
+                payload,
+                output_callback,
+                drain=(
+                    result is not None
+                    and result.get("status_code") not in (124, 130)
+                ),
+            )
 
     def run_runtime_job_binary(self, image: str, payload: Dict[str, Any], cancel_check: Callable[[], bool] | None = None) -> Dict[str, Any]:
         secrets = self._payload_secrets(payload)

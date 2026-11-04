@@ -12,7 +12,7 @@ import ssl
 import threading
 import time
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
@@ -47,6 +47,8 @@ from src.control_plane.domain.models import (
     SnapshotRecord,
     StorageProfileRecord,
     TargetStatsRecord,
+    UNCONFIRMED_OUTCOME_LOG,
+    UNCONFIRMED_OUTCOME_RECOVERY,
     WorkerRecord,
     WorkerStatus,
     utcnow,
@@ -100,6 +102,9 @@ class ControlPlaneService:
     MAX_WORKER_OFFLINE_AFTER_SECONDS = 3600.0
     JOB_LEASE_DURATION_SECONDS = 300
     LEASE_DIAGNOSTIC_CODE = "worker_lease_expired"
+    # S7: deadline after which an unconfirmed outcome is recorded as unknown.
+    JOB_UNCONFIRMED_AFTER_SECONDS = 24 * 3600
+    CONFIRMATION_DEADLINE_KEY = "confirmation_deadline_at"
     LEASE_DIAGNOSTIC_CATEGORY = "worker_interrupted"
     LEASE_DIAGNOSTIC_MESSAGE = (
         "Control Plane observed that the worker lease expired before a terminal result arrived; "
@@ -595,14 +600,9 @@ class ControlPlaneService:
             return False
 
         self._reconcile_expired_jobs()
-        active_jobs = [
-            job
-            for job in self.job_repository.list()
-            if JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS)
-            and (job.worker_id == worker_id or job.owner_worker_id == worker_id)
-        ]
+        active_jobs = self.job_repository.active_for_worker(worker_id)
         if active_jobs:
-            job_ids = ", ".join(f"{job.id} ({JobStatus.normalize(job.status)})" for job in active_jobs)
+            job_ids = ", ".join(f"{job_id} ({status})" for job_id, status in active_jobs)
             raise WorkerDeletionConflict(
                 f"worker '{worker_id}' still has active or pending jobs: {job_ids}"
             )
@@ -1326,6 +1326,9 @@ class ControlPlaneService:
         )
 
     def has_active_backup_for_target(self, target_id: str) -> bool:
+        # Reconcile first so an awaiting-confirmation job that passed its 24h
+        # unknown-outcome deadline does not block scheduled backups forever.
+        self._reconcile_expired_jobs()
         return any(
             job.target_id == target_id
             and job.command == "backup.run"
@@ -4138,6 +4141,7 @@ class ControlPlaneService:
             "cache_hit",
             "snapshot_id",
             "recovery",
+            "confirmation_deadline_at",
             "error",
             "retention_command",
         }
@@ -4580,7 +4584,7 @@ class ControlPlaneService:
         # the job to the synthetic worker_lease_expired failure.
         current_summary = job.result_summary if isinstance(job.result_summary, dict) else {}
         late_after_lease_expiry = (
-            job.status in (JobStatus.FAILED, JobStatus.IN_PROGRESS)
+            job.status in (JobStatus.FAILED, JobStatus.IN_PROGRESS, JobStatus.UNCONFIRMED)
             and current_summary.get("diagnostic_code") == self.LEASE_DIAGNOSTIC_CODE
         )
         if not isinstance(lease_token, str) or not hmac.compare_digest(job.lease_token or "", lease_token):
@@ -4683,7 +4687,7 @@ class ControlPlaneService:
     def cancel_job(self, job_id: str) -> JobRecord:
         job = self._require_job(job_id)
         job.status = JobStatus.normalize(job.status)
-        if job.status not in (JobStatus.PENDING, JobStatus.IN_PROGRESS):
+        if job.status not in (JobStatus.PENDING, JobStatus.IN_PROGRESS, JobStatus.UNCONFIRMED):
             raise ValueError(f"job '{job_id}' cannot be cancelled (current status: {job.status})")
         job.status = JobStatus.CANCELED
         job.updated_at = utcnow()
@@ -5211,6 +5215,7 @@ class ControlPlaneService:
             return 0
         now = utcnow()
         expired_ids = self._capture_expired_lease_context(now)
+        deadline_ids = self._capture_unknown_outcome_candidates(now)
         reconciled = reconcile()
         if reconciled:
             for job_id in expired_ids:
@@ -5218,7 +5223,63 @@ class ControlPlaneService:
                 if job is not None:
                     self._publish_job_event(job)
                     # No terminal result was received: do not send a failure alert.
+            for job_id in deadline_ids:
+                job = self.job_repository.get(job_id)
+                if job is None:
+                    continue
+                if JobStatus.normalize(job.status) != JobStatus.UNCONFIRMED:
+                    continue
+                logger.info(
+                    "Job %s reached the 24-hour confirmation deadline; outcome recorded as "
+                    "unknown (not failed or succeeded) and new tasks are unblocked.",
+                    job_id,
+                )
+                if UNCONFIRMED_OUTCOME_LOG not in (job.log_lines or []):
+                    job.log_lines = list(job.log_lines or []) + [UNCONFIRMED_OUTCOME_LOG]
+                    self.job_repository.save(job)
+                self._publish_job_event(job)
+                # Missing communication never becomes a failure alert.
         return reconciled
+
+    def _capture_unknown_outcome_candidates(self, now: datetime) -> List[str]:
+        """Awaiting-confirmation jobs whose 24-hour deadline already passed.
+
+        Uses the bounded repository candidate query when available so a
+        large jobs table is never deserialized on every reconciliation.
+        """
+        candidates: List[str] = []
+        select_candidates = getattr(self.job_repository, "list_for_unconfirmed_outcomes", None)
+        try:
+            jobs = select_candidates() if callable(select_candidates) else self.job_repository.list()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return candidates
+        for job in jobs:
+            if JobStatus.normalize(job.status) != JobStatus.IN_PROGRESS:
+                continue
+            summary = job.result_summary if isinstance(job.result_summary, dict) else {}
+            if summary.get("diagnostic_code") != self.LEASE_DIAGNOSTIC_CODE:
+                continue
+            deadline = self._confirmation_deadline(summary, job.updated_at)
+            if deadline is not None and deadline <= now:
+                candidates.append(job.id)
+        return candidates
+
+    @classmethod
+    def _confirmation_deadline(cls, summary: Dict[str, Any], updated_at: Optional[datetime]) -> Optional[datetime]:
+        raw = summary.get(cls.CONFIRMATION_DEADLINE_KEY)
+        if isinstance(raw, str) and raw:
+            try:
+                deadline = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                if deadline.tzinfo:
+                    deadline = deadline.astimezone(timezone.utc).replace(tzinfo=None)
+                return deadline
+            except (TypeError, ValueError, OverflowError):
+                pass
+        if updated_at is None:
+            return None
+        if updated_at.tzinfo:
+            updated_at = updated_at.astimezone(timezone.utc).replace(tzinfo=None)
+        return updated_at + timedelta(seconds=cls.JOB_UNCONFIRMED_AFTER_SECONDS)
 
     def _require_target(self, target_id: str) -> BackupTargetRecord:
         target = self.target_repository.get(target_id)

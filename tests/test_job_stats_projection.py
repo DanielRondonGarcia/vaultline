@@ -388,16 +388,27 @@ class JobStatsProjectionTests(unittest.TestCase):
             )
 
             reconciled = repository.reconcile_expired_leases()
+            # S7: the lease expired months before now, so the same reconcile
+            # pass applies the awaiting-confirmation diagnostic and its 24h
+            # deadline has already passed; the unique reconciled-job count
+            # stays 1 even though both transitions occur in one pass.
             self.assertEqual(reconciled, 1)
+            closed = repository.get("p7-lease-cycle")
+            self.assertEqual(closed.status, "unconfirmed")
+            self.assertIsNone(closed.finished_at)
+            # Fencing is preserved: ownership and the lease token survive so
+            # the authenticated original owner can still deliver a late report.
+            self.assertEqual(closed.owner_worker_id, claimed[0].owner_worker_id)
+            self.assertEqual(closed.lease_token, claimed[0].lease_token)
             expired_stats = repository.job_stats(tz_offset_minutes=0, now=_STATS_NOW)
             self.assertEqual(expired_stats["total"], 1)
-            self.assertEqual(expired_stats["by_status"], {"in_progress": 1})
+            self.assertEqual(expired_stats["by_status"], {"unconfirmed": 1})
             # Reconciliation keeps the claim-time started_at, which in this
             # fixture is the current date, outside the frozen seven-day
             # window of _STATS_NOW's day keys: it counts in totals only.
             self.assertEqual(
                 self._facts_rows(database_path),
-                [("p7-lease-cycle", "in_progress", claimed_started_at)],
+                [("p7-lease-cycle", "unconfirmed", claimed_started_at)],
             )
 
     def test_empty_database_report_zeroed_shape(self):

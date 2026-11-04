@@ -72,6 +72,68 @@ class SchedulerDeploymentTests(unittest.TestCase):
         self.assertEqual(jobs[0].trigger, "schedule")
         self.assertEqual(scheduler.timezone_name, "America/Bogota")
 
+    def test_scheduler_dispatches_new_backup_after_unknown_outcome_deadline(self):
+        service = self._service()
+        target = BackupTargetRecord(name="target", worker_id="worker-a", cron_expression="0 3 * * *")
+        service.target_repository.save(target)
+        ticks = iter([
+            datetime(2024, 6, 3, 3, 0, tzinfo=timezone.utc),
+            datetime(2024, 6, 4, 3, 0, tzinfo=timezone.utc),
+            datetime(2024, 6, 5, 3, 0, tzinfo=timezone.utc),
+        ])
+        # ZoneInfo is unavailable in some test environments (Windows without
+        # tzdata): resolve the scheduler timezone directly to UTC so the test
+        # exercises the unknown-outcome dispatch decision itself.
+        with patch(
+            "src.control_plane.application.services.scheduler_service.resolve_scheduler_timezone",
+            return_value=("UTC", timezone.utc),
+        ):
+            scheduler = SchedulerService(service, timezone_name="UTC", now_fn=lambda: next(ticks))
+
+        scheduler._tick()
+        job = service.job_repository.list()[0]
+        claimed = service.fetch_jobs_for_worker("worker-a")[0]
+        claimed.lease_expires_at = utcnow() - timedelta(hours=24, minutes=2)
+        service.job_repository.save(claimed)
+        view = service.get_job_view(job.id)
+        self.assertEqual(view["status"], JobStatus.UNCONFIRMED)
+
+        scheduler._tick()
+
+        back_ups = [item for item in service.job_repository.list() if item.command == "backup.run"]
+        self.assertEqual(len(back_ups), 2)
+        self.assertTrue(any(item.trigger == "schedule" and item.id != job.id for item in back_ups))
+
+        scheduler._tick()
+
+        # The fresh backup still blocks a duplicate while it is running.
+        self.assertEqual(len([item for item in service.job_repository.list() if item.command == "backup.run"]), 2)
+    def test_scheduler_still_skips_backup_while_outcome_unconfirmed_before_24h(self):
+        service = self._service()
+        target = BackupTargetRecord(name="target", worker_id="worker-a", cron_expression="0 3 * * *")
+        service.target_repository.save(target)
+        ticks = iter([
+            datetime(2024, 6, 3, 3, 0, tzinfo=timezone.utc),
+            datetime(2024, 6, 3, 3, 1, tzinfo=timezone.utc),
+        ])
+        with patch(
+            "src.control_plane.application.services.scheduler_service.resolve_scheduler_timezone",
+            return_value=("UTC", timezone.utc),
+        ):
+            scheduler = SchedulerService(service, timezone_name="UTC", now_fn=lambda: next(ticks))
+
+        scheduler._tick()
+        job = service.job_repository.list()[0]
+        claimed = service.fetch_jobs_for_worker("worker-a")[0]
+        claimed.lease_expires_at = utcnow() - timedelta(hours=24, minutes=-2)
+        expired_by = utcnow() - claimed.lease_expires_at
+        self.assertGreaterEqual(expired_by, timedelta(hours=23, minutes=58))
+        service.job_repository.save(claimed)
+
+        scheduler._tick()
+
+        self.assertEqual(len(service.job_repository.list()), 1)
+
     def test_scheduler_preview_uses_target_then_global_cron_and_returns_timezone(self):
         service = self._service()
         service.settings_repository.save(SettingsRecord(global_cron_expression="0 3 * * *"))

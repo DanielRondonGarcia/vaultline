@@ -5922,7 +5922,8 @@ docker compose up -d
     }
 
     function isTerminalJobStatus(status) {
-      const terminalStatuses = ["succeeded", "failed", "canceled", "cancelled"];
+      // Unconfirmed (outcome unknown after 24h) is finished for watching purposes.
+      const terminalStatuses = ["succeeded", "failed", "canceled", "cancelled", "unconfirmed"];
       return terminalStatuses.includes(String(status || "").toLowerCase()) || terminalStatuses.includes(normalizeJobStatus(status));
     }
 

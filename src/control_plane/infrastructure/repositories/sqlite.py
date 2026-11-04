@@ -880,6 +880,51 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             )
         return jobs
 
+    def list_for_unconfirmed_outcomes(self) -> List[JobRecord]:
+        """Bounded candidate query for the 24-hour outcome reconciliation.
+
+        Mirrors list_for_lease_context: only the lightweight columns needed
+        for the reconciliation are decoded (no payload/log deserialization)
+        and only IN_PROGRESS jobs flagged with the expired-lease diagnostic
+        are returned.
+        """
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, worker_id, command, target_id, status, owner_worker_id,
+                       lease_issued_at, lease_expires_at, attempt_count,
+                       result_summary_json, submitted_at, started_at, finished_at, updated_at
+                FROM jobs
+                WHERE status = ? AND json_extract(result_summary_json, '$.diagnostic_code') = ?
+                """,
+                (JobStatus.IN_PROGRESS, LEASE_DIAGNOSTIC_CODE),
+            ).fetchall()
+        jobs = []
+        for row in rows:
+            try:
+                result_summary = _json_load(row["result_summary_json"], None)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                result_summary = None
+            jobs.append(
+                JobRecord(
+                    id=row["id"],
+                    worker_id=row["worker_id"],
+                    command=row["command"],
+                    target_id=row["target_id"],
+                    status=JobStatus.normalize(row["status"]),
+                    owner_worker_id=row["owner_worker_id"],
+                    lease_issued_at=_dt(row["lease_issued_at"]),
+                    lease_expires_at=_dt(row["lease_expires_at"]),
+                    attempt_count=row["attempt_count"] or 0,
+                    result_summary=result_summary if isinstance(result_summary, dict) else None,
+                    submitted_at=_dt(row["submitted_at"]) or datetime.utcnow(),
+                    started_at=_dt(row["started_at"]),
+                    finished_at=_dt(row["finished_at"]),
+                    updated_at=_dt(row["updated_at"]) or datetime.utcnow(),
+                )
+            )
+        return jobs
+
     def update_lease_context(self, job_id: str, lease_context: Dict[str, Any]) -> bool:
         with self._lock, self._connect() as connection:
             row = connection.execute("SELECT result_summary_json FROM jobs WHERE id = ?", (job_id,)).fetchone()

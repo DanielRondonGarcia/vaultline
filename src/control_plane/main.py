@@ -2096,10 +2096,13 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
 
     @staticmethod
     def _is_terminal_job_view(view) -> bool:
+        # An unconfirmed outcome (24-hour deadline passed) is finished for
+        # watching purposes: deliver the final event and release the stream.
         return JobStatus.normalize((view or {}).get("status")) in {
             JobStatus.SUCCEEDED,
             JobStatus.FAILED,
             JobStatus.CANCELED,
+            JobStatus.UNCONFIRMED,
         }
 
     def _write_sse_event(self, view) -> None:

@@ -1339,7 +1339,7 @@ process.stdout.write("open job log accordion survived table refresh");
         self.assertIn("renderJobs(content);", renderer.group(0))
         self.assertIn("renderJobLogs(job);", self.source)
         self.assertIn("await refreshAll();", self.source)
-        self.assertIn('["succeeded", "failed", "canceled", "cancelled"]', self.source)
+        self.assertIn('["succeeded", "failed", "canceled", "cancelled", "unconfirmed"]', self.source)
         self.assertNotIn('apiGet("/api/v1/jobs")', self.source)
         self.assertNotIn("apiGet('/api/v1/jobs')", self.source)
         self.assertNotIn("apiGet(`/api/v1/jobs`)", self.source)
@@ -3558,6 +3558,21 @@ process.stdout.write("sidebar Settings placement passed");
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "sidebar Settings placement passed")
         self.assertRegex(self.app_css, r"\.sidebar \.footer\s*\{\s*margin-top:\s*auto;")
+
+
+class TerminalJobStatusUiStateTests(unittest.TestCase):
+    """The UI must stop watching jobs whose outcome is recorded as unknown."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = UI_PATH.read_text(encoding="utf-8")
+
+    def test_terminal_job_status_list_includes_unconfirmed(self):
+        match = re.search(r"const terminalStatuses = \[([^\]]*)\]", self.source)
+        self.assertIsNotNone(match, "isTerminalJobStatus terminalStatuses literal not found")
+        statuses = [entry.strip().strip('"').strip("'") for entry in match.group(1).split(",")]
+        self.assertIn("unconfirmed", statuses)
+        self.assertIn("succeeded", statuses)
 
 
 if __name__ == "__main__":

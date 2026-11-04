@@ -267,6 +267,17 @@ class InMemoryJobRepository(JobRepository):
                 if JobStatus.normalize(job.status) == JobStatus.IN_PROGRESS and job.lease_expires_at is not None
             ]
 
+    def list_for_unconfirmed_outcomes(self) -> List[JobRecord]:
+        """Awaiting-confirmation candidates for the 24-hour outcome reconciliation."""
+        with self._lock:
+            return [
+                job
+                for job in self._items.values()
+                if JobStatus.normalize(job.status) == JobStatus.IN_PROGRESS
+                and isinstance(job.result_summary, dict)
+                and job.result_summary.get("diagnostic_code") == LEASE_DIAGNOSTIC_CODE
+            ]
+
     def update_lease_context(self, job_id: str, lease_context: Dict[str, Any]) -> bool:
         with self._lock:
             job = self._items.get(job_id)

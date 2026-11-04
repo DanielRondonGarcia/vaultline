@@ -5156,10 +5156,15 @@ class ControlPlaneService:
         return reconciled
 
     def _capture_unknown_outcome_candidates(self, now: datetime) -> List[str]:
-        """Awaiting-confirmation jobs whose 24-hour deadline already passed."""
+        """Awaiting-confirmation jobs whose 24-hour deadline already passed.
+
+        Uses the bounded repository candidate query when available so a
+        large jobs table is never deserialized on every reconciliation.
+        """
         candidates: List[str] = []
+        select_candidates = getattr(self.job_repository, "list_for_unconfirmed_outcomes", None)
         try:
-            jobs = self.job_repository.list()
+            jobs = select_candidates() if callable(select_candidates) else self.job_repository.list()
         except (TypeError, ValueError, json.JSONDecodeError):
             return candidates
         for job in jobs:

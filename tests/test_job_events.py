@@ -405,6 +405,38 @@ class JobEventRouteTests(unittest.TestCase):
         self.assertIn(b": heartbeat\n\n", handler.wfile.body)
         self.assertEqual(broker.subscriber_count("job-1"), 0)
 
+    def test_is_terminal_job_view_treats_unconfirmed_as_terminal(self):
+        # S8: a job whose 24-hour confirmation deadline passed is finished for
+        # watching purposes; an SSE handler must not wait forever on it.
+        self.assertTrue(ControlPlaneRequestHandler._is_terminal_job_view({"status": "unconfirmed"}))
+        self.assertTrue(ControlPlaneRequestHandler._is_terminal_job_view({"status": JobStatus.UNCONFIRMED}))
+
+    def test_stream_returns_after_unconfirmed_outcome_event(self):
+        broker = JobEventBroker(max_queue_size=2)
+        service = JobEventServiceTests.make_service(broker)
+        job = service.dispatch_job("worker-a", "backup.run")
+        claimed = service.fetch_jobs_for_worker("worker-a")[0]
+        handler = self.handler(service)
+        stream_thread = threading.Thread(target=handler._stream_job_events, args=(job.id,))
+        stream_thread.start()
+        self.assertTrue(self.wait_for(lambda: broker.subscriber_count(job.id) == 1))
+
+        # The reconcile pass flips the expired job to UNCONFIRMED and publishes
+        # one final event; the stream must deliver it and then end.
+        claimed.lease_expires_at = utcnow() - timedelta(hours=24, minutes=2)
+        service.job_repository.save(claimed)
+        broker.publish(job.id, service.get_job_view(job.id))
+        stream_thread.join(timeout=1)
+
+        self.assertFalse(stream_thread.is_alive())
+        self.assertEqual(broker.subscriber_count(job.id), 0)
+        frames = [
+            json.loads(line[len("data: "):])
+            for line in handler.wfile.body.decode("utf-8").splitlines()
+            if line.startswith("data: ")
+        ]
+        self.assertEqual(frames[-1]["status"], JobStatus.UNCONFIRMED)
+
     def test_event_route_is_selected_before_single_job_route(self):
         handler = object.__new__(ControlPlaneRequestHandler)
         handler.path = "/api/v1/jobs/job-1/events"

@@ -1354,7 +1354,25 @@ class ControlPlaneDispatchTests(unittest.TestCase):
         second_fingerprint = service._repository_fingerprint(target)
         self.assertNotEqual(first_fingerprint, second_fingerprint)
 
-    def test_path_storage_does_not_modify_legacy_tar_or_rclone_remote_environment(self):
+    def test_path_storage_does_not_modify_legacy_rclone_remote_environment(self):
+        # Adapted after "Eliminar TAR por completo" (S3): the legacy TAR record
+        # case is now rejected before any payload is emitted (see
+        # ResticOnlyTargetTests.test_dispatch_rejects_legacy_tar_strategy_record_without_emitting_a_job),
+        # so this keeps the original invariant for a Restic target: path storage
+        # applies only to the restic repository and never touches the legacy
+        # rclone remote environment of the target.
+        service = self.make_service()
+        target = service.target_repository.get("target-a")
+        target.runtime_environment = {"RCLONE_REMOTE": "legacy:archive"}
+        target.path_storage = "tenant/custom"
+
+        payload = service._build_backup_payload(target)
+
+        self.assertEqual(payload["environment"]["RCLONE_REMOTE"], "legacy:archive")
+        self.assertNotIn("RESTIC_REPOSITORY", payload["environment"])
+        self.assertEqual(payload["environment"]["BACKUP_STRATEGY"], "restic")
+
+    def test_legacy_tar_record_payload_is_rejected_and_the_record_is_not_converted(self):
         service = self.make_service()
         target = service.target_repository.get("target-a")
         target.backup_strategy = "tar"
@@ -1363,12 +1381,18 @@ class ControlPlaneDispatchTests(unittest.TestCase):
             "RESTIC_REPOSITORY": "local:/legacy-repository",
         }
         target.path_storage = "tenant/custom"
-        service.settings_repository.save(SettingsRecord(restic_repository_base="backup"))
 
-        payload = service._build_backup_payload(target)
+        with self.assertRaisesRegex(ValueError, "restic"):
+            service._build_backup_payload(target)
 
-        self.assertEqual(payload["environment"]["RCLONE_REMOTE"], "legacy:archive")
-        self.assertEqual(payload["environment"]["RESTIC_REPOSITORY"], "local:/legacy-repository")
+        self.assertEqual(target.backup_strategy, "tar")
+        self.assertEqual(
+            service.target_repository.get("target-a").runtime_environment,
+            {
+                "RCLONE_REMOTE": "legacy:archive",
+                "RESTIC_REPOSITORY": "local:/legacy-repository",
+            },
+        )
 
     def test_path_storage_does_not_turn_an_empty_profile_repository_into_global_fallback(self):
         service = self.make_service()

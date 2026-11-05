@@ -681,10 +681,15 @@ class ControlPlaneService:
         backup_mode = self._validate_runtime_backup_mode(runtime_type, backup_mode)
         if not isinstance(live_access_enabled, bool):
             raise ValueError("live_access_enabled must be a boolean")
+        backup_strategy = self._normalize_target_backup_strategy(backup_strategy, default="restic")
         normalized_path_storage = self._normalize_path_storage(path_storage)
         runtime_environment = runtime_environment or {}
         self._validate_path_storage_target_environment(
             normalized_path_storage, runtime_environment, backup_strategy
+        )
+        self._validate_target_backup_strategy_environment(
+            self._require_storage_profile(storage_profile_id) if storage_profile_id else None,
+            runtime_environment,
         )
         self._require_eligible_worker(worker_id)
         normalized_namespace, normalized_pvc_names = self._validate_target_runtime(
@@ -1131,10 +1136,27 @@ class ControlPlaneService:
         effective_runtime_environment = (
             runtime_environment if runtime_environment is not None else target.runtime_environment
         )
-        effective_backup_strategy = backup_strategy if backup_strategy is not None else target.backup_strategy
+        normalized_target_backup_strategy = self._normalize_target_backup_strategy(backup_strategy)
+        if normalized_target_backup_strategy is not None:
+            backup_strategy = normalized_target_backup_strategy
+            effective_backup_strategy = normalized_target_backup_strategy
+        else:
+            if backup_strategy is not None:
+                # Blank input means the field was omitted, never a stored value:
+                # drop it so the Restic-only strategy is preserved unchanged.
+                backup_strategy = None
+            effective_backup_strategy = str(target.backup_strategy or "").strip().lower()
         self._validate_path_storage_target_environment(
             normalized_path_storage, effective_runtime_environment, effective_backup_strategy
         )
+        if runtime_environment is not None or storage_profile_id is not None:
+            effective_profile_id = (
+                storage_profile_id if storage_profile_id is not None else target.storage_profile_id
+            )
+            self._validate_target_backup_strategy_environment(
+                self._require_storage_profile(effective_profile_id) if effective_profile_id else None,
+                runtime_environment if runtime_environment is not None else target.runtime_environment,
+            )
         if backup_mode is not None:
             backup_mode = self._validate_runtime_backup_mode(effective_runtime_type, backup_mode)
         elif effective_runtime_type == "native" and target.backup_mode != "hot":
@@ -1829,6 +1851,54 @@ class ControlPlaneService:
             raise ValueError("path_storage must be non-empty when supplied")
         return normalized
 
+    def _validate_target_backup_strategy_environment(
+        self,
+        storage_profile: Optional["StorageProfileRecord"],
+        runtime_environment: Any,
+    ) -> None:
+        """T5 blocker B2: no environment source may reactivate TAR jobs.
+
+        Both the target runtime environment and a storage profile's inherited
+        environment are validated: any BACKUP_STRATEGY value other than restic
+        is rejected so dispatch never emits invalid TAR jobs. Values are never
+        rewritten, so pre-existing TAR targets are not silently converted.
+        """
+        sources = []
+        if storage_profile is not None:
+            sources.append(("the storage profile", (storage_profile.environment or {}).get("BACKUP_STRATEGY")))
+        if isinstance(runtime_environment, dict):
+            sources.append(("the target runtime environment", runtime_environment.get("BACKUP_STRATEGY")))
+        for source, value in sources:
+            if value is None:
+                continue
+            normalized = str(value).strip().lower()
+            if normalized and normalized != "restic":
+                raise ValueError(
+                    f"BACKUP_STRATEGY '{value}' in {source} is not supported: the TAR strategy "
+                    "was removed and the Control Plane is Restic-only; use BACKUP_STRATEGY=restic"
+                )
+
+    @classmethod
+    def _normalize_target_backup_strategy(cls, backup_strategy: Any, default: Optional[str] = None) -> Optional[str]:
+        """T5 (S1, S2, S3): the Control Plane is Restic-only.
+
+        Returns the normalized strategy when ``restic`` is supplied (case and
+        surrounding whitespace are tolerated), ``default`` when the value is
+        omitted or empty, and raises for any other strategy: the TAR strategy
+        was removed and must not be accepted back.
+        """
+        if backup_strategy is None:
+            return default
+        if isinstance(backup_strategy, str) and not backup_strategy.strip():
+            return default
+        normalized = str(backup_strategy).strip().lower()
+        if normalized != "restic":
+            raise ValueError(
+                f"Unsupported backup strategy '{normalized}': the TAR strategy was removed and "
+                "the Control Plane is Restic-only; use backup_strategy=restic"
+            )
+        return normalized
+
     @staticmethod
     def _validate_path_storage_target_environment(
         path_storage: Optional[str], runtime_environment: Any, backup_strategy: str = "restic"
@@ -2223,7 +2293,24 @@ class ControlPlaneService:
         configured_mode = self._validate_runtime_backup_mode(target.runtime_type, target.backup_mode)
         effective_mode = configured_mode if backup_mode is None else self._validate_runtime_backup_mode(target.runtime_type, backup_mode)
         environment, volumes, resolved_files = self._resolve_runtime_dependencies(target)
-        environment.setdefault("BACKUP_STRATEGY", target.backup_strategy)
+        env_strategy = str(environment.get("BACKUP_STRATEGY") or "").strip().lower()
+        if env_strategy and env_strategy != "restic":
+            raise ValueError(
+                f"BACKUP_STRATEGY '{environment['BACKUP_STRATEGY']}' in the target runtime environment is not "
+                "supported: the TAR strategy was removed and the Control Plane is Restic-only; "
+                "use BACKUP_STRATEGY=restic"
+            )
+        # S3 ("Eliminar TAR por completo"): a legacy stored non-Restic record
+        # must fail before the job is emitted; the record itself is never
+        # rewritten here, so the failure is loud and the data stays untouched.
+        # Whitespace-only environment values mean unset, consistent with the
+        # blank-means-unset semantics of the target create/update API, so the
+        # normalized record strategy wins over stray environment values.
+        target_strategy = self._normalize_target_backup_strategy(target.backup_strategy)
+        if target_strategy is not None:
+            environment["BACKUP_STRATEGY"] = target_strategy
+        else:
+            environment.setdefault("BACKUP_STRATEGY", target.backup_strategy)
         if target.retention_policy_id and str(target.backup_strategy).strip().lower() == "restic":
             policy = self._require_retention_policy(target.retention_policy_id)
             environment = apply_target_retention_policy(environment, policy)
@@ -2568,6 +2655,12 @@ class ControlPlaneService:
         layout: Optional[str],
     ) -> Dict[str, Any]:
         environment, volumes, resolved_files = self._resolve_runtime_dependencies(target)
+        # S3 ("Eliminar TAR por completo"): a legacy stored non-Restic record
+        # must fail before the restore job is emitted; the record itself is
+        # never rewritten here, so the failure is loud and the data stays
+        # untouched. Environment-sourced RESTORE_BACKUP_STRATEGY values are
+        # already overridden below by the record strategy.
+        target_strategy = self._normalize_target_backup_strategy(target.backup_strategy)
         defaults = dict(target.restore_defaults)
         if target.runtime_type == "native":
             volumes = {}
@@ -2588,7 +2681,7 @@ class ControlPlaneService:
         storage_context = self._storage_context(target, environment, resolved_files)
         environment.update({
             "RESTORE_MODE": "true",
-            "RESTORE_BACKUP_STRATEGY": target.backup_strategy,
+            "RESTORE_BACKUP_STRATEGY": target_strategy if target_strategy is not None else target.backup_strategy,
             "RESTORE_DRY_RUN": "true" if dry_run else "false",
             "RESTORE_FORCE_OVERWRITE": "true" if force_overwrite else "false",
             "RESTORE_TARGET_PATH": target_path,

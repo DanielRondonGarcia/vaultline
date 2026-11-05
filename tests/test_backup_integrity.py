@@ -12,7 +12,7 @@ from src.app import main as runtime_main
 from src.app.domain.models import BackupConfig, BackupResult, ContainerConfig, RestoreConfig, RestoreResult
 from src.app.infrastructure.adapters.backup_strategy import _restore_backup_dir_layout
 from src.app.infrastructure.adapters import backup_strategy as backup_module
-from src.app.infrastructure.adapters.backup_strategy import ResticBackupStrategy, TarballBackupStrategy, _apply_chown
+from src.app.infrastructure.adapters.backup_strategy import ResticBackupStrategy, _apply_chown
 from src.app.infrastructure.adapters.storage.multi_storage_adapter import (
     MultiStorageAdapter,
     StorageUploadError,
@@ -63,11 +63,11 @@ class BackupIntegrityTests(unittest.TestCase):
             {
                 "BACKUP_RUNTIME_TYPE": "native",
                 "BACKUP_SOURCES_JSON": json.dumps(["/srv/data with spaces", r"C:\\Users\\Alice\\My Documents"]),
-                "BACKUP_STRATEGY": "tar",
+                "BACKUP_STRATEGY": "restic",
                 "BACKUP_STOP_CONTAINERS": "false",
             },
             clear=True,
-        ), patch.object(runtime_main, "TarballBackupStrategy", return_value=CapturingStrategy()), patch.object(
+        ), patch.object(runtime_main, "ResticBackupStrategy", return_value=CapturingStrategy()), patch.object(
             runtime_main.MultiStorageAdapter, "upload"
         ) as upload, patch.object(runtime_main.InfluxNotifier, "send_metrics"):
             runtime_main.main()
@@ -220,30 +220,29 @@ class BackupIntegrityTests(unittest.TestCase):
             self.assertFalse((target_root / "data2" / "old.txt").exists())
             self.assertFalse(any("data2" in action and "read-only" in action.lower() for action in actions))
 
-    def test_direct_restore_read_only_target_fails_before_mutation_for_tar_and_restic(self):
-        for strategy_type in (TarballBackupStrategy, ResticBackupStrategy):
-            with self.subTest(strategy=strategy_type.__name__), tempfile.TemporaryDirectory() as target:
-                marker = Path(target) / "must-remain.txt"
-                marker.write_text("preserve")
-                config = RestoreConfig(
-                    target,
-                    source="snapshot",
-                    dry_run=False,
-                    force_overwrite=True,
-                    layout="direct",
-                    read_only_paths=(target,),
-                )
-                with patch.object(backup_module, "_clear_target_contents") as clear, patch.object(
-                    backup_module.subprocess, "run"
-                ) as run:
-                    result = strategy_type().restore("snapshot", config)
+    def test_direct_restore_read_only_target_fails_before_mutation_for_restic(self):
+        with tempfile.TemporaryDirectory() as target:
+            marker = Path(target) / "must-remain.txt"
+            marker.write_text("preserve")
+            config = RestoreConfig(
+                target,
+                source="snapshot",
+                dry_run=False,
+                force_overwrite=True,
+                layout="direct",
+                read_only_paths=(target,),
+            )
+            with patch.object(backup_module, "_clear_target_contents") as clear, patch.object(
+                backup_module.subprocess, "run"
+            ) as run:
+                result = ResticBackupStrategy().restore("snapshot", config)
 
-                self.assertFalse(result.success)
-                self.assertEqual(result.category, "readonly_target")
-                self.assertEqual(result.destructive_state, "none")
-                self.assertEqual(marker.read_text(), "preserve")
-                clear.assert_not_called()
-                run.assert_not_called()
+            self.assertFalse(result.success)
+            self.assertEqual(result.category, "readonly_target")
+            self.assertEqual(result.destructive_state, "none")
+            self.assertEqual(marker.read_text(), "preserve")
+            clear.assert_not_called()
+            run.assert_not_called()
 
     def test_read_only_target_precedes_restic_binary_discovery_and_rejection_is_pre_mutate(self):
         def assertions(result, marker, clear, run, mkdtemp, which, category, which_call_count):
@@ -309,18 +308,17 @@ class BackupIntegrityTests(unittest.TestCase):
             self.assertFalse(result.success); self.assertEqual(result.category, "chown_capability_unknown")
             self.assertEqual(result.capability["userns_mode"], "unknown"); strategy.restore.assert_not_called()
 
-    def test_tar_and_restic_share_no_follow_normalization_and_partial_state(self):
-        for strategy_type, target_flag in ((TarballBackupStrategy, "-C"), (ResticBackupStrategy, "--target")):
-            with self.subTest(strategy=strategy_type.__name__), tempfile.TemporaryDirectory() as target:
-                target_path = Path(target); (target_path / "stale").write_text("old")
-                def run(command, **_):
-                    destination = command[command.index(target_flag) + 1]; Path(destination, "restored").write_text("new")
-                config = RestoreConfig(target, source="snapshot", dry_run=False, force_overwrite=True, chown="1000:1000", layout="direct")
-                with patch.object(backup_module.os, "lchown", create=True), patch.object(
-                    backup_module.shutil, "which", return_value="/usr/local/bin/fake-restic"
-                ), patch.object(backup_module.subprocess, "run", side_effect=run):
-                    result = strategy_type().restore("archive", config)
-                self.assertTrue(result.success); self.assertTrue(result.normalization["changed"]); self.assertEqual(result.destructive_state, "complete")
+    def test_direct_restore_preserves_no_follow_normalization_and_partial_state(self):
+        with tempfile.TemporaryDirectory() as target:
+            target_path = Path(target); (target_path / "stale").write_text("old")
+            def run(command, **_):
+                destination = command[command.index("--target") + 1]; Path(destination, "restored").write_text("new")
+            config = RestoreConfig(target, source="snapshot", dry_run=False, force_overwrite=True, chown="1000:1000", layout="direct")
+            with patch.object(backup_module.os, "lchown", create=True), patch.object(
+                backup_module.shutil, "which", return_value="/usr/local/bin/fake-restic"
+            ), patch.object(backup_module.subprocess, "run", side_effect=run):
+                result = ResticBackupStrategy().restore("snapshot", config)
+            self.assertTrue(result.success); self.assertTrue(result.normalization["changed"]); self.assertEqual(result.destructive_state, "complete")
 
     def test_symlink_boundary_and_partial_normalization_are_reported(self):
         with tempfile.TemporaryDirectory() as root:

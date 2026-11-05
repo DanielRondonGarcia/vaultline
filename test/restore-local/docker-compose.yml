@@ -1,8 +1,13 @@
 version: "3"
 
-# Manual restore verification for local tarball backups.
+# Manual restore verification with a restic repository. This replaces the
+# removed local .tar.gz flow and keeps the same profiles: dry-run preview,
+# loud failure cases (missing target path, missing force overwrite) and the
+# force-overwrite end-to-end verification. The restic snapshot keeps the
+# seeded source directory name inside the snapshot, exactly as
+# test/restore-restic/docker-compose.yml demonstrates.
 # Suggested flow:
-#   docker compose --profile setup up seed-backups seed-target
+#   docker compose --profile setup up seed-restic-backups seed-target
 #   docker compose --profile dry-run up restore-dry-run-latest
 #   docker compose --profile failures up restore-missing-target restore-no-force
 #   docker compose --profile force up restore-force-overwrite
@@ -10,20 +15,27 @@ version: "3"
 
 services:
 
-  seed-backups:
-    image: alpine:3.20
+  seed-restic-backups:
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["setup"]
-    working_dir: /fixtures
+    entrypoint: /bin/sh
     command: >
-      sh -c "rm -rf /backups/* &&
-             mkdir -p old latest &&
-             printf 'old backup\n' > old/restored.txt &&
-             printf 'latest backup\n' > latest/restored.txt &&
-             tar -czpf /backups/old.tar.gz -C old . &&
-             sleep 1 &&
-             tar -czpf /backups/latest.tar.gz -C latest ."
+      -c "rm -rf /restic-repo/* /source/* &&
+          mkdir -p /source &&
+          printf 'old backup\n' > /source/restored.txt &&
+          restic init || true &&
+          restic backup /source &&
+          sleep 1 &&
+          printf 'latest backup\n' > /source/restored.txt &&
+          restic backup /source"
+    environment:
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
-      - ./backups:/backups
+      - restic-repo:/restic-repo
+      - restic-source:/source
 
   seed-target:
     image: alpine:3.20
@@ -33,51 +45,64 @@ services:
       - restore-target:/restore-target
 
   restore-dry-run-latest:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["dry-run"]
     environment:
       RESTORE_MODE: "true"
       RESTORE_TARGET_PATH: /restore-target
-      BACKUP_ARCHIVE: /archive
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
       - restore-target:/restore-target
-      - ./backups:/archive:ro
+      - restic-repo:/restic-repo
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
   restore-missing-target:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["failures"]
     environment:
       RESTORE_MODE: "true"
-      BACKUP_ARCHIVE: /archive
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
-      - ./backups:/archive:ro
+      - restic-repo:/restic-repo
 
   restore-no-force:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["failures"]
     environment:
       RESTORE_MODE: "true"
       RESTORE_TARGET_PATH: /restore-target
-      RESTORE_SOURCE: /archive/latest.tar.gz
+      RESTORE_SOURCE: latest
       RESTORE_DRY_RUN: "false"
       RESTORE_FORCE_OVERWRITE: "false"
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
       - restore-target:/restore-target
-      - ./backups:/archive:ro
+      - restic-repo:/restic-repo
 
   restore-force-overwrite:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["force"]
     environment:
       RESTORE_MODE: "true"
       RESTORE_TARGET_PATH: /restore-target
-      RESTORE_SOURCE: /archive/latest.tar.gz
       RESTORE_DRY_RUN: "false"
       RESTORE_FORCE_OVERWRITE: "true"
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
       - restore-target:/restore-target
-      - ./backups:/archive:ro
+      - restic-repo:/restic-repo
 
   verify-force-overwrite:
     image: alpine:3.20
@@ -86,11 +111,13 @@ services:
       restore-force-overwrite:
         condition: service_completed_successfully
     command: >
-      sh -c "test -f /restore-target/restored.txt &&
-             grep -q 'latest backup' /restore-target/restored.txt &&
+      sh -c "test -f /restore-target/source/restored.txt &&
+             grep -q 'latest backup' /restore-target/source/restored.txt &&
              test ! -e /restore-target/stale.txt"
     volumes:
       - restore-target:/restore-target:ro
 
 volumes:
+  restic-repo:
+  restic-source:
   restore-target:

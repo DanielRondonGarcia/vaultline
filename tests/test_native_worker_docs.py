@@ -42,11 +42,14 @@ class NativeWorkerDocsTests(unittest.TestCase):
             "Restic v0.19.1 and rclone v1.75.2 executables are bundled with native worker packages",
             "The MSI installs them in `C:\\Program Files\\Vaultline` and the `.deb` in `/usr/lib/vaultline`",
             "Keep `rclone.conf` and repository credentials in their separate secrets",
-            "Install the remaining external tools (`tar`, `gpg`, `aws`, `ssh`, and `scp`) separately",
+            "Install the remaining external tools (`aws`, `ssh`, and `scp`) separately",
             "In source/development mode, executables (`restic`,",
             "espera el enrolamiento",
         ):
             self.assertIn(marker, self.quickstart)
+        # T7 (S3): the quickstart must not advertise the removed TAR/GPG tools.
+        self.assertNotIn("`tar`", self.quickstart)
+        self.assertNotIn("`gpg`", self.quickstart)
         self.assertNotIn("WORKER_ENROLLMENT_TOKEN=", self.quickstart)
         # The token is embedded in the enroll command on purpose; the old blanket ban is gone.
         self.assertNotIn("No pongas el token en argumentos", self.quickstart)

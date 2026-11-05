@@ -20,6 +20,8 @@ def line(mode="-rw-r--r--", uid=0, gid=0, size=12, path="/data/file"):
 def header(snapshot="073a90db", variant="restic-0.19.1"):
     if variant == "filtered-first":
         return f"snapshot {snapshot} of [/home/user/work.txt] filtered by [] at 2024-01-21 16:51:18.474558607 +0100 CET:"
+    if variant == "restic-0.14":
+        return f"snapshot {snapshot} of [/source] filtered by [] at 2026-11-05 01:57:22.30078874 +0000 UTC):"
     if variant == "time-first-legacy":
         return f"snapshot {snapshot} of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC filtered by []:"
     return f"snapshot {snapshot} of [/tmp/restic] at 2025-02-03 08:16:05.310764668 +0000 UTC by restic@backup-host filtered by []:"
@@ -128,6 +130,7 @@ class RestoreMetadataTests(unittest.TestCase):
             ("073a90db", "filtered-first"),
             ("711b0bb6", "time-first-legacy"),
             ("85ce8467", "restic-0.19.1"),
+            ("169b2436", "restic-0.14"),
         ):
             with self.subTest(variant=variant):
                 record = line(path="/data/ni\u00f1o")
@@ -135,6 +138,51 @@ class RestoreMetadataTests(unittest.TestCase):
                     f"{header(snapshot, variant)}\n{record}", snapshot=snapshot
                 )
                 self.assertEqual([item.path for item in evidence.files], ["/data/ni\u00f1o"])
+
+    def test_restic_014_legacy_header_with_closing_parenthesis_accepts_verbatim_records(self):
+        output = (
+            "snapshot 169b2436 of [/source] filtered by [] "
+            "at 2026-11-05 01:57:22.30078874 +0000 UTC):\n"
+            "drwxr-xr-x     0     0      0 2026-11-05 01:57:17 /source\n"
+            "-rw-r--r--     0     0     14 2026-11-05 01:57:22 /source/restored.txt"
+        )
+
+        evidence = parse_restic_ls_long(output, snapshot="169b2436")
+
+        self.assertTrue(evidence.success)
+        self.assertEqual(evidence.snapshot, "169b2436")
+        self.assertEqual([item.path for item in evidence.files], ["/source", "/source/restored.txt"])
+        self.assertEqual(
+            (
+                evidence.files[0].mode,
+                evidence.files[1].mode,
+                evidence.files[1].uid,
+                evidence.files[1].gid,
+                evidence.files[1].size,
+            ),
+            ("drwxr-xr-x", "-rw-r--r--", 0, 0, 14),
+        )
+        self.assertEqual(evidence.files[1].mtime.isoformat(), "2026-11-05T01:57:22")
+
+    def test_restic_014_legacy_header_snapshot_must_match_requested_snapshot(self):
+        output = f"{header('169b2436', 'restic-0.14')}\n{line(path='/source/restored.txt')}"
+
+        with self.assertRaisesRegex(ResticMetadataError, "does not match"):
+            parse_restic_ls_long(output, snapshot="deadbeef")
+        self.assertTrue(parse_restic_ls_long(output, snapshot="169b2436").success)
+
+    def test_restic_014_legacy_header_rejects_perturbations(self):
+        for broken in (
+            "snapshot 169b2436 of [/source] filtered by [] at 2026-11-05 01:57:22.30078874 +0000 UTC)",
+            "snapshot 169b2436 of [/source] filtered by [] at 2026-11-05 01:57:22.30078874 +0000 UTC):extra",
+            "snapshot 169b2436 of [/source] filtered by [] at 2026-11-05 01:57:22.30078874 +0000 UTC((:",
+            "snapshot 169b2436 of [/source] at 2026-11-05 01:57:22.30078874 +0000 UTC):",
+            "snapshot 169b2436 of [/source] filtered by [] at 2026-11-05 01:57:22.30078874 UTC):",
+            "snapshot 169b2436 of [/source] filtered by [] at 2026-11-05 01:57:22.30078874:",
+        ):
+            malformed = broken + "\n" + line(path="/source/restored.txt")
+            with self.subTest(output=broken), self.assertRaisesRegex(ResticMetadataError, "malformed header"):
+                parse_restic_ls_long(malformed, snapshot="169b2436")
 
     def test_restic_0191_header_with_username_and_hostname_accepts_valid_record(self):
         output = (

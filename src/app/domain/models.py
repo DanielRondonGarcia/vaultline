@@ -12,8 +12,6 @@ if TYPE_CHECKING:
 @dataclass
 class BackupConfig:
     source_paths: List[str]
-    backup_filename: str = "backup.tar.gz"
-    gpg_passphrase: Optional[str] = None
     aws_s3_bucket: Optional[str] = None
     aws_glacier_vault: Optional[str] = None
     scp_host: Optional[str] = None
@@ -23,7 +21,7 @@ class BackupConfig:
     restic_password: Optional[str] = None
     rclone_remote: Optional[str] = None
     local_archive_path: Optional[str] = None
-    backup_strategy: str = "tar"  # "tar" or "restic"
+    backup_strategy: str = "restic"  # the application is Restic-only; TAR was removed
     restic_keep_daily: Optional[int] = LEGACY_RETENTION_DEFAULTS["keep_daily"]
     restic_keep_weekly: Optional[int] = LEGACY_RETENTION_DEFAULTS["keep_weekly"]
     restic_keep_monthly: Optional[int] = LEGACY_RETENTION_DEFAULTS["keep_monthly"]
@@ -59,9 +57,8 @@ class RestoreConfig:
     force_overwrite: bool = False
     stop_containers: bool = False
     chown: Optional[str] = None
-    backup_strategy: str = "tar"
+    backup_strategy: str = "restic"
     layout: str = "auto"
-    gpg_passphrase: Optional[str] = None
     restic_repository: Optional[str] = None
     restic_password: Optional[str] = None
     aws_s3_bucket: Optional[str] = None
@@ -81,7 +78,7 @@ class RestoreConfig:
 @dataclass
 class RestoreCandidate:
     source: str
-    strategy: str = "tar"
+    strategy: str = "restic"
     created_at: Optional[datetime] = None
     size: Optional[int] = None
     available: bool = True

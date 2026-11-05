@@ -199,6 +199,20 @@ class SnapshotExplorerUiStateTests(unittest.TestCase):
         self.assertIn("const bypassSessionCache = options.bypassSessionCache === true;", about.group(0))
         self.assertIn("const cachedAbout = bypassSessionCache ? null", about.group(0))
 
+    def test_target_forms_show_restic_strategy_informationally_without_tar_choice(self):
+        # T5 (S2): create and edit target forms no longer offer a strategy
+        # selector; Restic is fixed and shown informationally.
+        self.assertNotIn('<option value="tar"', self.source)
+        self.assertRegex(self.source, r'<input id="targetBackupStrategy" value="restic" disabled')
+        self.assertRegex(self.source, r'<input id="etBackupStrategy" value="restic" disabled')
+        for marker in (
+            'Estrategia fija: los targets solo admiten backups restic.',
+            'backup_strategy: backupStrategy,',
+            'const backupStrategy = document.getElementById("targetBackupStrategy").value;',
+        ):
+            self.assertIn(marker, self.source)
+        self.assertNotIn("no aplica a tar", self.source)
+
     def test_target_stats_action_is_restic_only_and_cache_first_with_bounded_job_refresh(self):
         for marker in (
             'data-action="target-stats"',
@@ -2547,10 +2561,14 @@ class WorkerUiStateTests(unittest.TestCase):
             "SmartScreen",
             "Los ejecutables de Restic y rclone se incluyen con el worker nativo",
             "rclone.conf</code> y las credenciales del repositorio en secretos separados",
-            "Instala por separado las demás herramientas externas (tar, gpg, aws, ssh y scp)",
+            "Instala por separado las demás herramientas externas (aws, ssh y scp)",
             "espera el enrolamiento",
         ):
             self.assertIn(marker, self.source)
+        # T7 (S3): the native-worker info panel must not advertise the removed
+        # TAR/GPG tools anymore.
+        self.assertNotIn("tar, gpg", self.source)
+        self.assertNotIn("(tar, gpg, aws, ssh y scp)", self.source)
         self.assertNotIn("navigator.platform", self.source)
         self.assertNotIn("userAgent", self.source)
 
@@ -2722,6 +2740,16 @@ process.stdout.write(JSON.stringify({ name: nameInput.value, host: hostInput.val
         result = subprocess.run(["node", "--input-type=commonjs", "--eval", script], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {"name": "act-twc-14", "host": "act-twc-14"})
+
+    def test_worker_enrollment_commands_footer_is_inset(self):
+        self.assertIn('btn-row ${addWorkerState.connectionSucceeded ? "enrollment-success-actions" : "enrollment-commands-actions"}', self.source)
+        self.assertIn('class="helper enrollment-commands-helper"', self.source)
+        self.assertRegex(self.css, r"\.enrollment-commands-actions\s*\{[^}]*padding:")
+        self.assertRegex(self.css, r"\.enrollment-commands-helper\s*\{[^}]*padding:")
+
+    def test_worker_enrollment_success_button_is_centered_and_inset(self):
+        self.assertIn('btn-row ${addWorkerState.connectionSucceeded ? "enrollment-success-actions" : "enrollment-commands-actions"}', self.source)
+        self.assertRegex(self.css, r"\.enrollment-success-actions\s*\{[^}]*justify-content:\s*center;[^}]*padding:")
 
     def test_worker_enrollment_modal_confirms_only_a_fresh_online_heartbeat(self):
         finder = re.search(r"function findConnectedEnrollmentWorker\(.*?\n    \}", self.source, re.S)

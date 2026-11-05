@@ -10,7 +10,9 @@ version: "3"
 services:
 
   seed-restic-repo:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["setup"]
     entrypoint: /bin/sh
     command: >
@@ -34,7 +36,9 @@ services:
       - restore-target:/restore-target
 
   restore-restic-latest:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["latest"]
     environment:
       RESTORE_MODE: "true"
@@ -49,7 +53,9 @@ services:
       - restic-repo:/restic-repo
 
   restore-restic-selected:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["selected"]
     environment:
       RESTORE_MODE: "true"

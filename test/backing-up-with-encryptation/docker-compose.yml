@@ -1,5 +1,10 @@
 version: "3"
 
+# Restic-only backup with encryption at rest. The repository is always stored
+# encrypted by restic using RESTIC_PASSWORD (AES-256 content encryption), which
+# replaces the removed GPG/TAR passphrase behavior. A local restic
+# repository is created automatically on first backup at ./backups/restic-repo.
+
 services:
 
   dashboard:
@@ -10,10 +15,14 @@ services:
       - grafana-data:/var/lib/grafana
 
   backup:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     environment:
+      BACKUP_STRATEGY: restic
       BACKUP_CRON_EXPRESSION: "* * * * *"
-      GPG_PASSPHRASE: changeme
+      RESTIC_REPOSITORY: /archive/restic-repo
+      RESTIC_PASSWORD: changeme
     volumes:
       - grafana-data:/backup/grafana-data:ro
       - ./backups:/archive

@@ -21,7 +21,7 @@ _RECORD = re.compile(
 _HEADER_TIMESTAMP = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d{1,9})? [+-](?:[01]\d|2[0-3])[0-5]\d (?:[A-Za-z][A-Za-z0-9+-]{0,9}|[+-]\d{1,2})"
 _RESTIC_LS_HEADER = re.compile(
     r"^snapshot (?P<snapshot>[0-9a-fA-F]{8,64}) of \[[^\]\r\n]{0,4096}\] "
-    r"(?:filtered by \[[^\]\r\n]{0,4096}\] at (?P<filtered_at>" + _HEADER_TIMESTAMP + r")|"
+    r"(?:filtered by \[[^\]\r\n]{0,4096}\] at (?P<filtered_at>" + _HEADER_TIMESTAMP + r")\)?|"
     r"at (?P<listed_at>" + _HEADER_TIMESTAMP + r")"
     r"(?: by (?P<identity>(?:[^@\r\n]*@)+[^@\r\n]*))? filtered by \[[^\]\r\n]{0,4096}\])\:$"
 )

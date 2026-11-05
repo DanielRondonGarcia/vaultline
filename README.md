@@ -17,7 +17,6 @@ architecture, web UI, Restic/Rclone support, and cold or hot backups.
   del target, restaura, y los reinicia
 - **Restic**: backups eficientes, deduplicados e incrementales
 - **Rclone**: upload a cualquier cloud provider (Google Drive, OneDrive, S3, Dropbox, etc.)
-- **Tar**: backups tradicionales en tarball, con opción de cifrado GPG
 - **Múltiples backends de almacenamiento**: local, S3, SCP, Rclone
 - **Secretos cifrados** gestionados desde la UI
 - **Retention policies** configurables por target
@@ -260,10 +259,9 @@ docker compose run --rm restore
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `BACKUP_STRATEGY` | `tar` | `tar` o `restic` |
+| `BACKUP_STRATEGY` | `restic` | Solo se admite `restic` |
 | `BACKUP_SOURCES` | `/backup` | Path de lectura (puede ser lista separada por espacios) |
 | `BACKUP_CRON_EXPRESSION` | `@daily` | Expresión cron estándar |
-| `BACKUP_FILENAME` | `backup-%Y-%m-%dT%H-%M-%S.tar.gz` | Template del nombre del archivo |
 | `BACKUP_ARCHIVE` | `/archive` | Directorio de archivo local |
 | `BACKUP_CUSTOM_LABEL` | | Label custom para selectivamente detener/exec contenedores |
 | `RESTIC_REPOSITORY` | | Repositorio Restic (requerido si `BACKUP_STRATEGY=restic`) |
@@ -279,7 +277,6 @@ docker compose run --rm restore
 | `SCP_HOST` | | Host remoto para SCP |
 | `SCP_USER` | | Usuario SSH para SCP |
 | `SCP_DIRECTORY` | | Directorio remoto para SCP |
-| `GPG_PASSPHRASE` | | Cifra el backup con GPG |
 | `TZ` | `UTC` | Timezone del runtime de backup; el scheduler del Control Plane usa `CONTROL_PLANE_TIMEZONE` |
 
 ### Control Plane
@@ -297,7 +294,7 @@ docker compose run --rm restore
 | `RESTORE_SOURCE` | Latest | Source específico: path local, `s3://`, `scp://`, `rclone://`, o snapshot id Restic |
 | `RESTORE_DRY_RUN` | `true` | `false` para restore real |
 | `RESTORE_FORCE_OVERWRITE` | `false` | `true` para sobrescribir el target |
-| `RESTORE_BACKUP_STRATEGY` | `BACKUP_STRATEGY` | `tar` o `restic` |
+| `RESTORE_BACKUP_STRATEGY` | `BACKUP_STRATEGY` | Solo se admite `restic`; no se restauran archivos TAR |
 | `RESTORE_STOP_CONTAINERS` | `false` | `true` para cold restore (detiene contenedores del target) |
 | `RESTORE_CHOWN` | Archive ownership | `uid:gid` aplicado al target después del restore |
 
@@ -350,8 +347,13 @@ Los tests unitarios viven en [`tests/`](tests/):
 
 ```powershell
 .venv\Scripts\python.exe scripts\check_python_runtime.py
-.venv\Scripts\python.exe -m unittest discover tests
+.venv\Scripts\python.exe scripts\run_tests_silent.py
 ```
+
+El ejecutor de Windows inicia la suite con una consola oculta para evitar ventanas
+de los procesos que la heredan, mientras muestra los resultados en la terminal actual. Para pruebas
+específicas, añade argumentos de unittest, por ejemplo:
+`python scripts\run_tests_silent.py tests.test_ui_states -q`.
 
 <details>
 <summary>Linux / macOS</summary>

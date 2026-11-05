@@ -14,7 +14,7 @@ try:
 except ModuleNotFoundError:  # Native workers do not require the Docker SDK.
     DockerAdapter = None
 from src.app.infrastructure.adapters.notifier.influx_notifier import InfluxNotifier
-from src.app.infrastructure.adapters.backup_strategy import TarballBackupStrategy, ResticBackupStrategy
+from src.app.infrastructure.adapters.backup_strategy import ResticBackupStrategy
 from src.restic_retention import restic_retention_config_from_environment
 
 class FlushingStreamHandler(logging.StreamHandler):
@@ -36,9 +36,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 def _strategy_for(strategy_name: str):
-    if strategy_name == "restic":
+    name = (strategy_name or "").strip().lower()
+    if name == "restic":
         return ResticBackupStrategy()
-    return TarballBackupStrategy()
+    raise ValueError(
+        f"Unsupported backup strategy '{name}': the TAR strategy was removed and "
+        "the application is Restic-only; use BACKUP_STRATEGY=restic"
+    )
 
 
 def _backup_sources_from_env():
@@ -164,8 +168,6 @@ def _write_restore_result(result):
 def main():
     # Load config from env
     backup_sources = _backup_sources_from_env()
-    backup_filename = os.environ.get("BACKUP_FILENAME", "backup-%Y-%m-%dT%H-%M-%S.tar.gz")
-    gpg_passphrase = os.environ.get("GPG_PASSPHRASE")
 
     aws_s3_bucket = os.environ.get("AWS_S3_BUCKET_NAME")
     aws_glacier_vault = os.environ.get("AWS_GLACIER_VAULT_NAME")
@@ -185,8 +187,8 @@ def main():
     pre_backup_cmd = os.environ.get("PRE_BACKUP_COMMAND")
     post_backup_cmd = os.environ.get("POST_BACKUP_COMMAND")
 
-    backup_strategy_name = os.environ.get("BACKUP_STRATEGY", "tar").lower()
-    restore_strategy_name = os.environ.get("RESTORE_BACKUP_STRATEGY", backup_strategy_name).lower()
+    backup_strategy_name = (os.environ.get("BACKUP_STRATEGY") or "restic").lower()
+    restore_strategy_name = (os.environ.get("RESTORE_BACKUP_STRATEGY") or backup_strategy_name).lower()
 
     storage_port = MultiStorageAdapter()
     runtime_type = (os.environ.get("BACKUP_RUNTIME_TYPE") or "docker").strip().lower()
@@ -209,7 +211,6 @@ def main():
             chown=os.environ.get("RESTORE_CHOWN") or None,
             backup_strategy=restore_strategy_name,
             layout=os.environ.get("RESTORE_LAYOUT", "auto").lower(),
-            gpg_passphrase=gpg_passphrase,
             restic_repository=restic_repo,
             restic_password=restic_pass,
             aws_s3_bucket=aws_s3_bucket,
@@ -251,8 +252,6 @@ def main():
 
     config = BackupConfig(
         source_paths=backup_sources,
-        backup_filename=backup_filename,
-        gpg_passphrase=gpg_passphrase,
         aws_s3_bucket=aws_s3_bucket,
         aws_glacier_vault=aws_glacier_vault,
         scp_host=scp_host,

@@ -82,6 +82,15 @@ class NativeRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(environment["RESTIC_KEEP_YEARLY"], "")
         self.assertEqual(environment["RESTIC_PRUNE"], "false")
 
+    def test_native_self_check_stops_reporting_removed_tar_and_gpg(self):
+        """T7 (S3): TAR/GPG are removed; the native self-check must only report
+        executors that a remaining live feature can require."""
+        result = NativeRuntimeAdapter().self_check()
+        self.assertIn("restic", result["executables"])
+        self.assertIn("rclone", result["executables"])
+        self.assertNotIn("tar", result["executables"])
+        self.assertNotIn("gpg", result["executables"])
+
     def test_rclone_file_secret_is_materialized_and_removed_after_process(self):
         adapter = NativeRuntimeAdapter()
         secret = "[remote]\ntype = s3\nsecret_access_key = hidden-value\n"

@@ -1,9 +1,17 @@
 version: "3"
 
-# Manual SFTPGo/SQLite permission verification.
-# This scenario reproduces the non-root SQLite failure mode: a restored root-owned
-# sftpgo.db and root-owned parent directory can raise "attempt to write a readonly
-# database" for the SFTPGo runtime user. Then it verifies RESTORE_CHOWN fixes it.
+# Manual SFTPGo/SQLite permission verification with a restic repository.
+# This replaces the removed root-owned .tar.gz flow and keeps the same
+# profiles: it reproduces the non-root SQLite failure mode (a restored
+# root-owned sftpgo.db and a root-owned parent directory can raise "attempt
+# to write a readonly database" for the SFTPGo runtime user) and verifies
+# RESTORE_CHOWN fixes it.
+# The restic snapshot keeps the seeded source directory name inside the
+# snapshot (as test/restore-restic demonstrates), so the restored database
+# lives at /srv/sftpgo/source/sftpgo.db behind the shared volume; the parent
+# directory reproduced by the scenario is that restored source directory.
+# Non-Docker caveat: run the profiles on Linux to confirm the ownership
+# expectations; wrong expectations make the verify services fail loudly.
 # Suggested flow:
 #   docker compose --profile setup up seed-sftpgo-backup
 #   docker compose --profile readonly up restore-root-owned
@@ -14,18 +22,24 @@ version: "3"
 services:
 
   seed-sftpgo-backup:
-    image: python:3.11.17-alpine
+    build: ../..
     profiles: ["setup"]
+    entrypoint: /bin/sh
     command: >
-      sh -c "rm -rf /backups/* /fixtures/* &&
-             mkdir -p /fixtures &&
-             python -c \"import sqlite3; conn = sqlite3.connect('/fixtures/sftpgo.db'); conn.execute('create table if not exists checks(id integer primary key, value text)'); conn.execute('insert into checks(value) values (?)', ('seed',)); conn.commit(); conn.close()\" &&
-             chown -R 0:0 /fixtures &&
-             chmod 755 /fixtures &&
-             chmod 644 /fixtures/sftpgo.db &&
-             tar -czpf /backups/sftpgo-root-owned.tar.gz -C /fixtures ."
+      -c "rm -rf /restic-repo/* /source/* &&
+          mkdir -p /source &&
+          python3 -c \"import sqlite3; conn = sqlite3.connect('/source/sftpgo.db'); conn.execute('create table if not exists checks(id integer primary key, value text)'); conn.execute('insert into checks(value) values (?)', ('seed',)); conn.commit(); conn.close()\" &&
+          chown -R 0:0 /source &&
+          chmod 755 /source &&
+          chmod 644 /source/sftpgo.db &&
+          restic init || true &&
+          restic backup /source"
+    environment:
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
-      - ./backups:/backups
+      - restic-repo:/restic-repo
+      - restic-source:/source
 
   restore-root-owned:
     build: ../..
@@ -33,12 +47,13 @@ services:
     environment:
       RESTORE_MODE: "true"
       RESTORE_TARGET_PATH: /restore-target
-      RESTORE_SOURCE: /archive/sftpgo-root-owned.tar.gz
       RESTORE_DRY_RUN: "false"
       RESTORE_FORCE_OVERWRITE: "true"
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
       - sftpgo-data:/restore-target
-      - ./backups:/archive:ro
+      - restic-repo:/restic-repo
 
   verify-readonly-database-fails:
     image: python:3.11.17-alpine
@@ -48,7 +63,7 @@ services:
       restore-root-owned:
         condition: service_completed_successfully
     command: >
-      python -c "exec('''import sqlite3\nimport sys\nconn = sqlite3.connect('/srv/sftpgo/sftpgo.db')\ncur = conn.cursor()\ntry:\n    cur.execute('insert into checks(value) values (?)', ('should-fail',))\n    conn.commit()\nexcept sqlite3.OperationalError as exc:\n    print(exc)\n    message = str(exc).lower()\n    sys.exit(0 if 'readonly' in message or 'unable to open database file' in message else 1)\nsys.exit(1)''')"
+      python -c "exec('''import sqlite3\nimport sys\nconn = sqlite3.connect('/srv/sftpgo/source/sftpgo.db')\ncur = conn.cursor()\ntry:\n    cur.execute('insert into checks(value) values (?)', ('should-fail',))\n    conn.commit()\nexcept sqlite3.OperationalError as exc:\n    print(exc)\n    message = str(exc).lower()\n    sys.exit(0 if 'readonly' in message or 'unable to open database file' in message else 1)\nsys.exit(1)''')"
     volumes:
       - sftpgo-data:/srv/sftpgo
 
@@ -58,13 +73,14 @@ services:
     environment:
       RESTORE_MODE: "true"
       RESTORE_TARGET_PATH: /restore-target
-      RESTORE_SOURCE: /archive/sftpgo-root-owned.tar.gz
       RESTORE_DRY_RUN: "false"
       RESTORE_FORCE_OVERWRITE: "true"
       RESTORE_CHOWN: "1000:1000"
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
       - sftpgo-data:/restore-target
-      - ./backups:/archive:ro
+      - restic-repo:/restic-repo
 
   verify-sftpgo-user-can-write:
     image: python:3.11.17-alpine
@@ -75,7 +91,7 @@ services:
         condition: service_completed_successfully
     command: >
       python -c "import sqlite3;
-      conn = sqlite3.connect('/srv/sftpgo/sftpgo.db');
+      conn = sqlite3.connect('/srv/sftpgo/source/sftpgo.db');
       conn.execute('insert into checks(value) values (?)', ('write-ok',));
       conn.commit(); conn.close()"
     volumes:
@@ -83,3 +99,5 @@ services:
 
 volumes:
   sftpgo-data:
+  restic-repo:
+  restic-source:

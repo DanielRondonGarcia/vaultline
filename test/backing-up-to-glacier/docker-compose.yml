@@ -1,25 +1,20 @@
 version: "3"
 
+# UNSUPPORTED (TAR removed): this scenario backed volumes up to an S3 Glacier
+# vault from removed TAR/GPG uploads. The application is Restic-only, and
+# restic does not write directly into S3 Glacier vaults. The notice service
+# below exits non-zero on purpose so running this scenario cannot be silently
+# mistaken for a successful backup.
+# For a working backup use a restic-compatible backend instead:
+#   test/backing-up-to-s3 (restic S3 backend)
+#   examples/restic-rclone (restic rclone backend)
+
 services:
 
-  dashboard:
-    image: grafana/grafana
-    ports:
-      - "3000:3000"
-    volumes:
-      - grafana-data:/var/lib/grafana
-
-  backup:
-    build: ../..
-    environment:
-      BACKUP_CRON_EXPRESSION: "* * * * *"
-      BACKUP_FILENAME: glacier-test.tar.gz
-      AWS_GLACIER_VAULT_NAME: Backups
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
-    volumes:
-      - grafana-data:/backup/grafana-data:ro
-
-volumes:
-  grafana-data:
+  unsupported-glacier-notice:
+    image: alpine:3.20
+    command: >
+      sh -c "echo 'UNSUPPORTED (TAR removed): S3 Glacier vault uploads as part of the TAR strategy are no longer supported; the application is Restic-only.' &&
+             echo 'Restic does not write directly to S3 Glacier vaults; configure an S3 or rclone repository instead.' &&
+             echo 'Working examples: test/backing-up-to-s3 and examples/restic-rclone.' &&
+             exit 1"

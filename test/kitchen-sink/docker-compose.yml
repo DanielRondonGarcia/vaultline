@@ -1,6 +1,8 @@
 # To verify variable substitution from environment:
 # $ docker-compose config
 # If there's a .env file in the same directory, it will be sourced automatically
+# Note: backups are Restic-only now; BACKUP_FILENAME (a removed TAR archive
+# option) is no longer supported.
 
 version: "3"
 
@@ -25,7 +27,6 @@ services:
     environment:
       BACKUP_HOSTNAME: docker-volume-backup
       BACKUP_CRON_EXPRESSION: "* * * * *"
-      BACKUP_FILENAME: "backup-%Y-%m-%d-%H-%M-%S.tar.gz"
       BACKUP_WAIT_SECONDS: 0
       AWS_S3_BUCKET_NAME: docker-volume-backup-test
       AWS_ACCESS_KEY_ID: "${AWS_ACCESS_KEY_ID}"

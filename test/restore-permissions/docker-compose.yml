@@ -1,8 +1,17 @@
 version: "3"
 
-# Manual restore verification for ownership behavior.
+# Manual restore verification for ownership behavior with a restic
+# repository. This replaces the removed root-owned .tar.gz flow and keeps the
+# same profiles: restored files keep their 0:0 owner (preserve mode), and
+# RESTORE_CHOWN maps the whole target subtree, including the target root, to
+# 1000:1000. The restic snapshot keeps the seeded source directory name
+# inside the snapshot, as test/restore-restic/docker-compose.yml demonstrates.
+# Non-Docker caveat: the POSIX ownership expectations below follow restic's
+# root-owned extraction plus the repository's ownership normalization (see
+# test/restore-ownership). Run the profiles on Linux to confirm them; a wrong
+# expectation makes the verify service fail loudly.
 # Suggested flow:
-#   docker compose --profile setup up seed-permission-backup seed-target
+#   docker compose --profile setup up seed-restic-permission-backup seed-target
 #   docker compose --profile preserve up restore-preserve-archive-ownership
 #   docker compose --profile preserve up verify-preserved-root-owner
 #   docker compose --profile chown up seed-target
@@ -11,17 +20,23 @@ version: "3"
 
 services:
 
-  seed-permission-backup:
-    image: alpine:3.20
+  seed-restic-permission-backup:
+    build: ../..
     profiles: ["setup"]
+    entrypoint: /bin/sh
     command: >
-      sh -c "rm -rf /backups/* /fixtures/* &&
-             mkdir -p /fixtures/app-data &&
-             printf 'restored permissions fixture\n' > /fixtures/app-data/restored.txt &&
-             chown -R 0:0 /fixtures &&
-             tar -czpf /backups/root-owned.tar.gz -C /fixtures ."
+      -c "rm -rf /restic-repo/* /source/* &&
+          mkdir -p /source/app-data &&
+          printf 'restored permissions fixture\n' > /source/app-data/restored.txt &&
+          chown -R 0:0 /source &&
+          restic init || true &&
+          restic backup /source"
+    environment:
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
-      - ./backups:/backups
+      - restic-repo:/restic-repo
+      - restic-source:/source
 
   seed-target:
     image: alpine:3.20
@@ -36,12 +51,13 @@ services:
     environment:
       RESTORE_MODE: "true"
       RESTORE_TARGET_PATH: /restore-target
-      RESTORE_SOURCE: /archive/root-owned.tar.gz
       RESTORE_DRY_RUN: "false"
       RESTORE_FORCE_OVERWRITE: "true"
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
       - restore-target:/restore-target
-      - ./backups:/archive:ro
+      - restic-repo:/restic-repo
 
   verify-preserved-root-owner:
     image: alpine:3.20
@@ -49,7 +65,7 @@ services:
     depends_on:
       restore-preserve-archive-ownership:
         condition: service_completed_successfully
-    command: sh -c "test \"$(stat -c '%u:%g' /restore-target/app-data/restored.txt)\" = '0:0'"
+    command: sh -c "test \"$(stat -c '%u:%g' /restore-target/source/app-data/restored.txt)\" = '0:0'"
     volumes:
       - restore-target:/restore-target:ro
 
@@ -59,13 +75,14 @@ services:
     environment:
       RESTORE_MODE: "true"
       RESTORE_TARGET_PATH: /restore-target
-      RESTORE_SOURCE: /archive/root-owned.tar.gz
       RESTORE_DRY_RUN: "false"
       RESTORE_FORCE_OVERWRITE: "true"
       RESTORE_CHOWN: "1000:1000"
+      RESTIC_REPOSITORY: /restic-repo
+      RESTIC_PASSWORD: restic-test-password
     volumes:
       - restore-target:/restore-target
-      - ./backups:/archive:ro
+      - restic-repo:/restic-repo
 
   verify-chown-after-replacement:
     image: alpine:3.20
@@ -76,9 +93,11 @@ services:
     command: >
       sh -c "test ! -e /restore-target/stale.txt &&
              test \"$(stat -c '%u:%g' /restore-target)\" = '1000:1000' &&
-             test \"$(stat -c '%u:%g' /restore-target/app-data/restored.txt)\" = '1000:1000'"
+             test \"$(stat -c '%u:%g' /restore-target/source/app-data/restored.txt)\" = '1000:1000'"
     volumes:
       - restore-target:/restore-target:ro
 
 volumes:
+  restic-repo:
+  restic-source:
   restore-target:

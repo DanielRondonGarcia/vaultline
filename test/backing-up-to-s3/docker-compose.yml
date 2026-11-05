@@ -1,5 +1,10 @@
 version: "3"
 
+# Restic-only backup to an S3 bucket. The old BACKUP_FILENAME/TAR upload
+# behavior was removed; content is now stored encrypted in a restic
+# repository. The bucket below must already exist and the credentials are
+# what restic uses to access the S3 backend.
+
 services:
 
   dashboard:
@@ -12,11 +17,13 @@ services:
   backup:
     build: ../..
     environment:
+      BACKUP_STRATEGY: restic
       BACKUP_CRON_EXPRESSION: "* * * * *"
-      BACKUP_FILENAME: latest.tar.gz
-      AWS_S3_BUCKET_NAME: docker-volume-backup-test-bucket
+      RESTIC_REPOSITORY: s3:s3.amazonaws.com/docker-volume-backup-test-bucket
+      RESTIC_PASSWORD: change-me
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+
     volumes:
       - grafana-data:/backup/grafana-data:ro
 

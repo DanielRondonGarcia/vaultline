@@ -16,7 +16,9 @@ version: "3"
 services:
 
   seed-restic-backups:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["setup"]
     entrypoint: /bin/sh
     command: >
@@ -43,7 +45,9 @@ services:
       - restore-target:/restore-target
 
   restore-dry-run-latest:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["dry-run"]
     environment:
       RESTORE_MODE: "true"
@@ -56,7 +60,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
 
   restore-missing-target:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["failures"]
     environment:
       RESTORE_MODE: "true"
@@ -66,7 +72,9 @@ services:
       - restic-repo:/restic-repo
 
   restore-no-force:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["failures"]
     environment:
       RESTORE_MODE: "true"
@@ -81,7 +89,9 @@ services:
       - restic-repo:/restic-repo
 
   restore-force-overwrite:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["force"]
     environment:
       RESTORE_MODE: "true"

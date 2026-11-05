@@ -12,6 +12,8 @@ tracked test/restore-restic/docker-compose.yml fixture demonstrates."""
 import unittest
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = ROOT / "doc" / "control-plane-spec.md"
 QUICKSTART = ROOT / "doc" / "control-plane-quickstart.md"
@@ -41,6 +43,16 @@ RESTIC_RESTORE_COMPOSE_FILES = (
     ROOT / "test" / "restore-permissions" / "docker-compose.yml",
     ROOT / "test" / "restore-sftpgo-sqlite" / "docker-compose.yml",
 )
+
+# Fixtures with services that build the image from the repository root; each
+# built service must name the backup-runtime Dockerfile target explicitly so
+# the final `worker` stage is never used.
+BUILD_TARGET_FIXTURES = (
+    ROOT / "test" / "kitchen-sink" / "docker-compose.yml",
+    ROOT / "test" / "backing-up-to-s3" / "docker-compose.yml",
+    ROOT / "test" / "backing-up-with-encryptation" / "docker-compose.yml",
+    ROOT / "test" / "restore-restic" / "docker-compose.yml",
+) + RESTIC_RESTORE_COMPOSE_FILES
 
 
 class TarRemovedDocsTests(unittest.TestCase):
@@ -147,6 +159,22 @@ class TarRemovedDocsTests(unittest.TestCase):
             for marker in shared_markers + scenario_markers[path]:
                 with self.subTest(compose=str(path.relative_to(ROOT)), marker=marker):
                     self.assertIn(marker, source)
+
+    def test_every_built_service_selects_backup_runtime_target(self):
+        """The Dockerfile's final stage is `worker`; without an explicit
+        `build.target` Compose runs the wrong stage and backup/restore
+        commands fail with "RuntimeError: worker is not enrolled"."""
+        for path in BUILD_TARGET_FIXTURES:
+            document = yaml.safe_load(path.read_text(encoding="utf-8"))
+            services = (document or {}).get("services") or {}
+            build_names = [name for name, config in services.items() if config.get("build")]
+            with self.subTest(compose=str(path.relative_to(ROOT)), built=build_names):
+                self.assertTrue(build_names, "fixture should define at least one built service")
+            for name in build_names:
+                build = services[name]["build"]
+                with self.subTest(compose=str(path.relative_to(ROOT)), service=name):
+                    self.assertIsInstance(build, dict)
+                    self.assertEqual(build.get("target"), "backup-runtime")
 
 
 if __name__ == "__main__":

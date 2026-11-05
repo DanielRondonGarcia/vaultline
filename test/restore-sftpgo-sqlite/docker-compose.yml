@@ -22,7 +22,9 @@ version: "3"
 services:
 
   seed-sftpgo-backup:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["setup"]
     entrypoint: /bin/sh
     command: >
@@ -42,7 +44,9 @@ services:
       - restic-source:/source
 
   restore-root-owned:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["readonly"]
     environment:
       RESTORE_MODE: "true"
@@ -68,7 +72,9 @@ services:
       - sftpgo-data:/srv/sftpgo
 
   restore-chown:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["writable"]
     environment:
       RESTORE_MODE: "true"

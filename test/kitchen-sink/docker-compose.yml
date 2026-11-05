@@ -23,7 +23,9 @@ services:
       - "docker-volume-backup.stop-during-backup=true"
 
   backup:
-    build: .
+    build:
+      context: ../..
+      target: backup-runtime
     environment:
       BACKUP_HOSTNAME: docker-volume-backup
       BACKUP_CRON_EXPRESSION: "* * * * *"

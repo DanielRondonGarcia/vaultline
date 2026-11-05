@@ -21,7 +21,9 @@ version: "3"
 services:
 
   seed-restic-permission-backup:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["setup"]
     entrypoint: /bin/sh
     command: >
@@ -46,7 +48,9 @@ services:
       - restore-target:/restore-target
 
   restore-preserve-archive-ownership:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["preserve"]
     environment:
       RESTORE_MODE: "true"
@@ -70,7 +74,9 @@ services:
       - restore-target:/restore-target:ro
 
   restore-chown:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     profiles: ["chown"]
     environment:
       RESTORE_MODE: "true"

@@ -15,7 +15,9 @@ services:
       - grafana-data:/var/lib/grafana
 
   backup:
-    build: ../..
+    build:
+      context: ../..
+      target: backup-runtime
     environment:
       BACKUP_STRATEGY: restic
       BACKUP_CRON_EXPRESSION: "* * * * *"

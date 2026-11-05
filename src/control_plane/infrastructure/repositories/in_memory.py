@@ -35,6 +35,8 @@ from src.control_plane.domain.models import (
     JobRecord,
     JobStatus,
     NotificationChannelRecord,
+    READ_ONLY_SNAPSHOT_COMMANDS,
+    READ_ONLY_UNCONFIRMED_LOG,
     RetentionPolicyRecord,
     SecretRecord,
     SettingsRecord,
@@ -397,8 +399,10 @@ class InMemoryJobRepository(JobRepository):
             if summary.get("diagnostic_code") != LEASE_DIAGNOSTIC_CODE:
                 continue
             deadline = _confirmation_deadline(summary, job.updated_at)
-            if deadline is None or deadline > now:
+            read_only = job.command in READ_ONLY_SNAPSHOT_COMMANDS
+            if not read_only and (deadline is None or deadline > now):
                 continue
+            unknown_log = READ_ONLY_UNCONFIRMED_LOG if read_only else UNCONFIRMED_OUTCOME_LOG
             summary["recovery"] = UNCONFIRMED_OUTCOME_RECOVERY
             job.result_summary = summary
             if unknown_log not in (job.log_lines or []):

@@ -207,6 +207,53 @@ class OutcomeUnknownDeadlineTests(unittest.TestCase):
                     self.assertEqual(self._view(service, job.id), before)
                     service._schedule_failed_backup_notifications.assert_called_once()
 
+    def test_expired_snapshot_sync_retries_without_losing_unknown_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for service, target in self.services_with_target(directory):
+                with self.subTest(repository=type(service.job_repository).__name__):
+                    old = service.dispatch_job("worker-a", "snapshots.list", target_id=target.id)
+                    claimed = service.fetch_jobs_for_worker("worker-a")[0]
+                    claimed.lease_expires_at = utcnow() - timedelta(seconds=1)
+                    service.job_repository.save(claimed)
+                    view = self._view(service, old.id)
+                    self.assertEqual(view["status"], JobStatus.UNCONFIRMED)
+                    self.assertEqual(view["diagnostics"]["code"], "worker_lease_expired")
+                    self.assertEqual(service.snapshot_job_contract(old.id)["status"], JobStatus.UNCONFIRMED)
+                    self.assertFalse(service.has_active_snapshot_sync_for_target(target.id))
+                    replacement = service.dispatch_snapshot_sync_for_target(target.id)
+                    self.assertNotEqual(replacement.id, old.id)
+                    self.assertEqual(service.dispatch_snapshot_sync_for_target(target.id).id, replacement.id)
+                    self.assertEqual(service.get_job_view(old.id)["diagnostics"]["code"], "worker_lease_expired")
+
+    def test_expired_snapshot_reads_are_unconfirmed(self):
+        for command in ("snapshots.list", "snapshot.ls", "snapshot.about", "snapshot.dump", "snapshot.search"):
+            with tempfile.TemporaryDirectory() as directory:
+                for service, target in self.services_with_target(directory):
+                    with self.subTest(command=command, repository=type(service.job_repository).__name__):
+                        job = service.dispatch_job("worker-a", command, target_id=target.id)
+                        claimed = service.fetch_jobs_for_worker("worker-a")[0]
+                        claimed.lease_expires_at = utcnow() - timedelta(seconds=1)
+                        service.job_repository.save(claimed)
+                        view = self._view(service, job.id)
+                        self.assertEqual(view["status"], JobStatus.UNCONFIRMED)
+                        self.assertIsNone(view["finished_at"])
+                        self.assertEqual(view["diagnostics"]["code"], "worker_lease_expired")
+                        self.assertEqual(service.snapshot_job_contract(job.id)["status"], JobStatus.UNCONFIRMED)
+
+    def test_late_expired_snapshot_result_does_not_replace_new_catalog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for service, target in self.services_with_target(directory):
+                with self.subTest(repository=type(service.job_repository).__name__):
+                    job = service.dispatch_job("worker-a", "snapshots.list", target_id=target.id)
+                    claimed = service.fetch_jobs_for_worker("worker-a")[0]
+                    claimed.lease_expires_at = utcnow() - timedelta(seconds=1)
+                    service.job_repository.save(claimed)
+                    self._view(service, job.id)
+                    service._sync_snapshots_from_result = Mock()
+                    service.update_job_status("worker-a", job.id, JobStatus.SUCCEEDED, {"snapshots": []}, [], claimed.lease_token)
+                    self.assertEqual(service.get_job(job.id).status, JobStatus.SUCCEEDED)
+                    service._sync_snapshots_from_result.assert_not_called()
+
     def test_unconfirmed_snapshot_sync_allows_a_new_sync(self):
         with tempfile.TemporaryDirectory() as directory:
             for service, target in self.services_with_target(directory):

@@ -12,6 +12,12 @@ def utcnow() -> datetime:
 # result, progress, or renewal) the outcome of an in-progress job is recorded
 # as unknown instead of staying blocked forever.
 JOB_UNCONFIRMED_AFTER_SECONDS = 24 * 3600
+# Read-only snapshot jobs can be retried as soon as their lease expires.
+READ_ONLY_SNAPSHOT_COMMANDS = frozenset({"snapshots.list", "snapshot.ls", "snapshot.about", "snapshot.dump", "snapshot.search"})
+READ_ONLY_UNCONFIRMED_LOG = (
+    "Snapshot read lease expired before worker confirmation; the outcome is "
+    "unconfirmed and new reads may proceed."
+)
 # Result-summary key holding the ISO deadline after which the outcome becomes
 # unknown. Refreshed whenever the owner shows liveness (progress) after the
 # lease expired; cleared on renewal.

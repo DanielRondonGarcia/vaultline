@@ -3946,7 +3946,7 @@ docker compose up -d
       if (!normalized) return false;
       return Array.isArray(normalized.entries)
         || typeof normalized.job_id === "string"
-        || ["pending", "queued", "running", "in_progress", "succeeded", "success", "failed", "error", "canceled", "cancelled"].includes(snapshotStatus(normalized));
+        || ["pending", "queued", "running", "in_progress", "succeeded", "success", "failed", "error", "canceled", "cancelled", "unconfirmed"].includes(snapshotStatus(normalized));
     }
 
     function waitForSnapshotPoll(delay, signal) {
@@ -3963,9 +3963,18 @@ docker compose up -d
       });
     }
 
+    function rejectUnconfirmedSnapshotResult(result) {
+      if (snapshotStatus(result) === "unconfirmed") {
+        const error = new Error("El worker no confirmó el resultado. Puedes reintentar.");
+        error.code = "snapshot-result-unconfirmed";
+        throw error;
+      }
+    }
+
     async function pollSnapshotJob(request, initialResult) {
       let result = normalizeSnapshotContract(initialResult);
       request.jobId = result.job_id || request.jobId;
+      rejectUnconfirmedSnapshotResult(result);
       if (!request.jobId) return result;
       if (isSnapshotTerminalStatus(snapshotStatus(result))) return result;
       const deadline = Date.now() + SNAPSHOT_POLL_MAX_MS;
@@ -3990,6 +3999,7 @@ docker compose up -d
         }
         if (!isSnapshotContract(polled)) throw unsupportedSnapshotResponse("Unsupported snapshot job response");
         result = normalizeSnapshotContract(polled);
+        rejectUnconfirmedSnapshotResult(result);
         if (isSnapshotTerminalStatus(snapshotStatus(result))) return result;
         attempt += 1;
       }
@@ -4692,7 +4702,7 @@ docker compose up -d
       } catch (error) {
         if (isSnapshotAbortError(error) || syncRequest.controller.signal.aborted) return;
         const timeout = error && error.code === "snapshot-poll-timeout";
-        const failed = error && ["snapshot-sync-failed", "snapshot-sync-incomplete"].includes(error.code);
+        const failed = error && ["snapshot-sync-failed", "snapshot-sync-incomplete", "snapshot-result-unconfirmed"].includes(error.code);
         const listingFailure = failed && error && error.listing_error_code
           ? classifySnapshotListingFailure(error)
           : null;

@@ -4740,7 +4740,10 @@ class ControlPlaneService:
             job.finished_at = utcnow()
             completed_summary = result_summary or job.result_summary or {}
             if status == JobStatus.SUCCEEDED and job.command == "snapshots.list" and job.target_id:
-                self._sync_snapshots_from_result(job.target_id, worker_id, completed_summary)
+                if late_after_lease_expiry:
+                    logger.info("Late snapshot sync result recorded without updating catalog: target=%s job=%s", job.target_id, job.id)
+                else:
+                    self._sync_snapshots_from_result(job.target_id, worker_id, completed_summary)
             if status == JobStatus.SUCCEEDED and job.command == "stats.get" and job.target_id:
                 self._sync_stats_from_result(job.target_id, worker_id, completed_summary)
             if status == JobStatus.SUCCEEDED:

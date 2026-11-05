@@ -1083,6 +1083,11 @@ process.stdout.write("open job log accordion survived table refresh");
         self.assertIn("setTimeout(() => {", self.source)
         self.assertIn("}, 250);", self.source)
 
+    def test_snapshot_poll_surfaces_unconfirmed_result(self):
+        self.assertIn('snapshotStatus(result) === "unconfirmed"', self.source)
+        self.assertIn('snapshot-result-unconfirmed', self.source)
+        self.assertIn('El worker no confirmó el resultado. Puedes reintentar.', self.source)
+
     def test_snapshot_explorer_has_bounded_wall_clock_poll_budget(self):
         match = re.search(r"const SNAPSHOT_POLL_MAX_MS\s*=\s*(\d+)", self.source)
         self.assertIsNotNone(match)

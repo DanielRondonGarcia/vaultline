@@ -38,6 +38,8 @@ from src.control_plane.domain.models import (
     JobRecord,
     JobStatus,
     NotificationChannelRecord,
+    READ_ONLY_SNAPSHOT_COMMANDS,
+    READ_ONLY_UNCONFIRMED_LOG,
     RetentionPolicyRecord,
     SecretRecord,
     SettingsRecord,
@@ -1197,7 +1199,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
         unknown_log = UNCONFIRMED_OUTCOME_LOG
         rows = connection.execute(
             """
-            SELECT id, result_summary_json, log_lines_json, updated_at
+            SELECT id, command, result_summary_json, log_lines_json, updated_at
             FROM jobs
             WHERE status = ?
             """,
@@ -1214,8 +1216,10 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             if summary.get("diagnostic_code") != LEASE_DIAGNOSTIC_CODE:
                 continue
             deadline = _confirmation_deadline(summary, _dt(row["updated_at"]))
-            if deadline is None or deadline > now:
+            read_only = row["command"] in READ_ONLY_SNAPSHOT_COMMANDS
+            if not read_only and (deadline is None or deadline > now):
                 continue
+            unknown_log = READ_ONLY_UNCONFIRMED_LOG if read_only else UNCONFIRMED_OUTCOME_LOG
             summary["recovery"] = UNCONFIRMED_OUTCOME_RECOVERY
             log_lines = _json_load(row["log_lines_json"], [])
             log_lines = list(log_lines) if isinstance(log_lines, list) else []

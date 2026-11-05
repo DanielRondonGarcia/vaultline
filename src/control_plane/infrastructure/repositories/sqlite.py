@@ -847,6 +847,15 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             rows = connection.execute("SELECT * FROM jobs ORDER BY submitted_at DESC").fetchall()
         return [self._row_to_job(row) for row in rows]
 
+    def find_active_snapshot_sync(self, target_id: str, worker_id: str) -> Optional[JobRecord]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM jobs WHERE target_id = ? AND worker_id = ? AND command = ? "
+                "AND status IN (?, ?) ORDER BY submitted_at DESC LIMIT 1",
+                (target_id, worker_id, "snapshots.list", JobStatus.PENDING, JobStatus.IN_PROGRESS),
+            ).fetchone()
+        return self._row_to_job(row) if row else None
+
     def active_for_worker(self, worker_id: str) -> List[Tuple[str, str]]:
         with self._connect() as connection:
             rows = connection.execute(

@@ -1362,13 +1362,7 @@ class ControlPlaneService:
         self._reconcile_expired_jobs()
         target = self._require_target(target_id)
         expected_worker_id = worker_id or target.worker_id
-        return any(
-            job.target_id == target_id
-            and job.worker_id == expected_worker_id
-            and job.command == "snapshots.list"
-            and JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS)
-            for job in self.job_repository.list()
-        )
+        return self.job_repository.find_active_snapshot_sync(target_id, expected_worker_id) is not None
 
     def dispatch_snapshot_sync_for_target(
         self,
@@ -1379,21 +1373,12 @@ class ControlPlaneService:
         target = self._require_target(target_id)
         self._require_eligible_worker(target.worker_id)
         self._reconcile_expired_jobs()
-        existing = next(
-            (
-                job
-                for job in self.job_repository.list()
-                if job.target_id == target.id
-                and job.worker_id == target.worker_id
-                and job.command == "snapshots.list"
-                and JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS)
-            ),
-            None,
-        )
+        existing = self.job_repository.find_active_snapshot_sync(target.id, target.worker_id)
         if existing is not None:
+            logger.info("Snapshot sync reused: target=%s worker=%s job=%s status=%s", target.id, target.worker_id, existing.id, existing.status)
             return existing
         payload = self._build_snapshot_list_payload(target)
-        return self.dispatch_job(
+        job = self.dispatch_job(
             worker_id=target.worker_id,
             command="snapshots.list",
             payload=payload,
@@ -1401,6 +1386,8 @@ class ControlPlaneService:
             target_id=target.id,
             trigger=trigger,
         )
+        logger.info("Snapshot sync dispatched: target=%s worker=%s job=%s", target.id, target.worker_id, job.id)
+        return job
 
     def dispatch_snapshot_read(
         self,
@@ -4760,6 +4747,8 @@ class ControlPlaneService:
                 self._invalidate_explorer_metadata_after_success(job)
         saved_job = self.job_repository.save(job)
         self._publish_job_event(saved_job)
+        if saved_job.command in ("snapshots.list", "snapshot.about", "snapshot.ls", "snapshot.dump"):
+            logger.info("Snapshot job completed: target=%s worker=%s job=%s operation=%s status=%s", saved_job.target_id, worker_id, saved_job.id, saved_job.command, status)
         if status == JobStatus.FAILED:
             self._schedule_failed_backup_notifications(saved_job)
         if status == JobStatus.SUCCEEDED:

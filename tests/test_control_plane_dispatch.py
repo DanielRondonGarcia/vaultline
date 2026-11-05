@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+import tempfile
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
@@ -27,6 +28,7 @@ from src.control_plane.domain.models import (
     utcnow,
 )
 from src.control_plane.infrastructure.security.secret_codec import SecretCodec
+from src.control_plane.infrastructure.repositories.sqlite import SQLiteJobRepository
 from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryCacheRepository,
     InMemoryIndexRepository,
@@ -1462,6 +1464,36 @@ class ControlPlaneDispatchTests(unittest.TestCase):
         indexed.upsert_status(IndexStatusRecord("target-a", "abcdef12", status="indexed"))
         indexed_service.update_target("target-a", path_storage="tenant/custom")
         self.assertEqual(indexed.list_by_target("target-a"), [])
+
+    def test_snapshot_sync_lookup_is_bounded_and_filters_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLiteJobRepository(os.path.join(directory, "jobs.db"))
+            for job in (
+                JobRecord(id="wrong-target", worker_id="worker-a", target_id="target-b", command="snapshots.list"),
+                JobRecord(id="wrong-worker", worker_id="worker-b", target_id="target-a", command="snapshots.list"),
+                JobRecord(id="completed", worker_id="worker-a", target_id="target-a", command="snapshots.list", status=JobStatus.SUCCEEDED),
+                JobRecord(id="active", worker_id="worker-a", target_id="target-a", command="snapshots.list"),
+            ):
+                repository.save(job)
+            with patch.object(repository, "list", side_effect=AssertionError("must not load job history")):
+                self.assertEqual(repository.find_active_snapshot_sync("target-a", "worker-a").id, "active")
+                self.assertIsNone(repository.find_active_snapshot_sync("missing", "worker-a"))
+
+    def test_snapshot_sync_logs_lifecycle_without_payload(self):
+        service = self.make_service()
+        service.target_repository.get("target-a").runtime_environment["RESTIC_PASSWORD"] = "test-secret-value"
+        with self.assertLogs("src.control_plane.application.services.control_plane_service", level="INFO") as captured:
+            first = service.dispatch_snapshot_sync_for_target("target-a")
+            duplicate = service.dispatch_snapshot_sync_for_target("target-a")
+            claimed = service.fetch_jobs_for_worker("worker-a")[0]
+            service.update_job_status("worker-a", claimed.id, JobStatus.FAILED, result_summary={"error": "test-secret-value"}, lease_token=claimed.lease_token)
+        self.assertEqual(first.id, duplicate.id)
+        messages = "\n".join(captured.output)
+        self.assertIn("Snapshot sync dispatched", messages)
+        self.assertIn("Snapshot sync reused", messages)
+        self.assertIn("Snapshot job completed", messages)
+        self.assertIn("status=failed", messages)
+        self.assertNotIn("test-secret-value", messages)
 
     def test_snapshot_sync_persists_catalog_and_deduplicates_pending_job(self):
         service = self.make_service()

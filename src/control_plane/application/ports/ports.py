@@ -221,6 +221,13 @@ class JobRepository(ABC):
     def list(self) -> List[JobRecord]:
         raise NotImplementedError
 
+    def find_active_snapshot_sync(self, target_id: str, worker_id: str) -> Optional[JobRecord]:
+        """Find the newest active sync without requiring callers to load history."""
+        return next((job for job in self.list()
+                     if job.target_id == target_id and job.worker_id == worker_id
+                     and job.command == "snapshots.list"
+                     and JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS)), None)
+
     def active_for_worker(self, worker_id: str) -> List[Tuple[str, str]]:
         """Return IDs and statuses of jobs that prevent worker deletion."""
         return [

@@ -1,0 +1,18 @@
+name: Feature request
+description: Propose a new feature or improvement for this project.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem or limitation does this feature request address?
+    validations:
+      required: true
+  - type: textarea
+    id: expected-change
+    attributes:
+      label: Expected change
+      description: What change should be made to address it?
+    validations:
+      required: true

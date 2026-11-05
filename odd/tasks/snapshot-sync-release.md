@@ -11,8 +11,8 @@ Isolate the snapshot sync fix and publish a stable patch release.
 ## Tasks
 
 - T1 [S1] DONE: Isolate the existing fix on the stable base; route inline; commit 995aa1b.
-- T2 [S1, S2] IN PROGRESS: Verify and integrate the fix; route inline; commit 995aa1b.
-- T3 [S2, S3] Publish and verify the stable release; route workflow; commit pending.
+- T2 [S1, S2] DONE: Verify and integrate the fix; route inline; commit 995aa1b, master d5abaf1.
+- T3 [S2, S3] DONE: Publish and verify the stable release; route workflow; release commit d5abaf1.
 
 ## Log
 
@@ -22,3 +22,4 @@ Isolate the snapshot sync fix and publish a stable patch release.
 - L4: Current working branch has unrelated commits after 4.0.0; isolate only the four requested fix files on the current master base.
 - L5: Engram runtime rejected its contract; mirror unavailable.
 - L6: Isolated commit 995aa1b on origin/master; focused suite 103 passed, 72 subtests passed; full tests suite 1455 passed, 37 skipped, 1075 subtests passed. One pre-existing DeprecationWarning appeared in the focused run.
+- L7: Workflow 42075727338 succeeded; stable release 4.0.1 points to d5abaf1, is latest, and contains Linux amd64/arm64 packages, Windows exe/MSI and SHA256SUMS. Image publication succeeded. No deployment was performed.

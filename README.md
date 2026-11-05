@@ -347,8 +347,13 @@ Los tests unitarios viven en [`tests/`](tests/):
 
 ```powershell
 .venv\Scripts\python.exe scripts\check_python_runtime.py
-.venv\Scripts\python.exe -m unittest discover tests
+.venv\Scripts\python.exe scripts\run_tests_silent.py
 ```
+
+El ejecutor de Windows inicia la suite con una consola oculta para evitar ventanas
+de los procesos que la heredan, mientras muestra los resultados en la terminal actual. Para pruebas
+específicas, añade argumentos de unittest, por ejemplo:
+`python scripts\run_tests_silent.py tests.test_ui_states -q`.
 
 <details>
 <summary>Linux / macOS</summary>

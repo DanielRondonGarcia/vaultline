@@ -1913,11 +1913,11 @@ docker compose up -d
             <div id="tabContent"></div>
               `}
             </div>
-            <div class="btn-row">
+            <div class="btn-row ${addWorkerState.connectionSucceeded ? "enrollment-success-actions" : "enrollment-commands-actions"}">
               <button class="btn primary sm" id="awDone">Listo</button>
               ${addWorkerState.connectionSucceeded ? "" : `<button class="btn ghost sm" id="awBack">Volver</button>`}
             </div>
-            ${addWorkerState.connectionSucceeded ? "" : `<div class="helper">El secreto de enrolamiento se usa una sola vez. Si necesitas re-enrolar, genera una credencial nueva.</div>`}
+            ${addWorkerState.connectionSucceeded ? "" : `<div class="helper enrollment-commands-helper">El secreto de enrolamiento se usa una sola vez. Si necesitas re-enrolar, genera una credencial nueva.</div>`}
           </div>
         </div>
       `;

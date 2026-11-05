@@ -415,6 +415,9 @@ details.form-section[open] > .form-body { border-top: 1px solid var(--border); p
 .native-worker-info h4, .native-worker-info p { margin: 0; }
 .native-download { align-self: flex-start; }
 .copy-secret-btn { min-height: 32px; }
+.enrollment-success-actions { display: flex; justify-content: center; padding: 0 20px 24px; }
+.enrollment-commands-actions { display: flex; justify-content: center; gap: 10px; padding: 16px 20px 8px; }
+.enrollment-commands-helper { padding: 0 20px 20px; text-align: center; }
 .enrollment-success { margin: auto; padding: 28px 20px; text-align: center; }
 .enrollment-success-icon { display: grid; width: 44px; height: 44px; margin: 0 auto 12px; place-items: center; border-radius: 50%; background: color-mix(in srgb, var(--success) 16%, var(--background)); color: var(--success); font-size: 24px; font-weight: 700; }
 .enrollment-success h4 { margin: 0 0 8px; color: var(--foreground); font-size: 18px; }

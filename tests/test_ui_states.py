@@ -2723,6 +2723,16 @@ process.stdout.write(JSON.stringify({ name: nameInput.value, host: hostInput.val
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), {"name": "act-twc-14", "host": "act-twc-14"})
 
+    def test_worker_enrollment_commands_footer_is_inset(self):
+        self.assertIn('btn-row ${addWorkerState.connectionSucceeded ? "enrollment-success-actions" : "enrollment-commands-actions"}', self.source)
+        self.assertIn('class="helper enrollment-commands-helper"', self.source)
+        self.assertRegex(self.css, r"\.enrollment-commands-actions\s*\{[^}]*padding:")
+        self.assertRegex(self.css, r"\.enrollment-commands-helper\s*\{[^}]*padding:")
+
+    def test_worker_enrollment_success_button_is_centered_and_inset(self):
+        self.assertIn('btn-row ${addWorkerState.connectionSucceeded ? "enrollment-success-actions" : "enrollment-commands-actions"}', self.source)
+        self.assertRegex(self.css, r"\.enrollment-success-actions\s*\{[^}]*justify-content:\s*center;[^}]*padding:")
+
     def test_worker_enrollment_modal_confirms_only_a_fresh_online_heartbeat(self):
         finder = re.search(r"function findConnectedEnrollmentWorker\(.*?\n    \}", self.source, re.S)
         renderer = re.search(r"function renderEnrollmentSuccess\(.*?\n    \}", self.source, re.S)

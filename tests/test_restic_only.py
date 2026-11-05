@@ -105,6 +105,29 @@ class ResticOnlyStandaloneRuntimeTests(unittest.TestCase):
                 runtime_main.main()
         self.assert_clear_tar_rejection(raised)
 
+    def test_removed_tar_configuration_is_not_loaded_from_environment(self):
+        """T7 (S1, S3): BACKUP_FILENAME and GPG_PASSPHRASE only fed the removed
+        TAR strategy; the Restic-only runtime must not read them at all."""
+        recorded = self.run_backup_main(
+            dict(self.BACKUP_ENV, BACKUP_FILENAME="obsolete.tar.gz", GPG_PASSPHRASE="secret")
+        )
+        self.assertFalse(
+            hasattr(recorded["backup_config"], "backup_filename"),
+            "BackupConfig must not carry the removed BACKUP_FILENAME option",
+        )
+        self.assertFalse(
+            hasattr(recorded["backup_config"], "gpg_passphrase"),
+            "BackupConfig must not carry the removed GPG_PASSPHRASE option",
+        )
+        recorded_restore = self.run_restore_main(
+            dict(self.RESTORE_ENV, GPG_PASSPHRASE="secret", RESTORE_FILENAME="ignored")
+        )
+        self.assertFalse(
+            hasattr(recorded_restore["restore_config"], "gpg_passphrase"),
+            "RestoreConfig must not carry the removed GPG_PASSPHRASE option",
+        )
+
+
     def test_tar_backup_strategy_is_rejected_instead_of_falling_back(self):
         self.assert_selection_rejected(dict(self.BACKUP_ENV, BACKUP_STRATEGY="tar"))
 

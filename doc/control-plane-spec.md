@@ -91,7 +91,7 @@ Se reutiliza el runtime actual del repositorio:
 - Imagen actual de `docker-volume-backup`.
 - Modo backup.
 - Modo restore.
-- Estrategias `tar` y `restic`.
+- Estrategia única `restic` (la estrategia TAR fue eliminada).
 - Restore inteligente ya implementado.
 
 El worker no debe reimplementar la lógica compleja de backup/restore si ya existe en el runtime actual.
@@ -271,7 +271,7 @@ Campos sugeridos:
 - `namespace` and `pvc_names[]` (Kubernetes only)
 - `filesystem_paths[]` (native filesystem workers only; one or more explicit Linux or Windows paths)
 - `backup_mode` = `hot|cold` (`native` targets are hot-only)
-- `backup_strategy` = `restic|tar`
+- `backup_strategy` = `restic` (única estrategia admitida; el modo TAR fue eliminado)
 - `storage_profile_id`
 - `retention_policy_id`
 - `execution_policy_id`
@@ -582,8 +582,8 @@ Reglas de ejecución nativa:
 
 - solo acepta targets `runtime_type: "native"` y `backup_mode: "hot"`;
 - rechaza `volume_targets`, `runtime_volumes`, `pvc_names` y modo frío;
-- usa las estrategias existentes `tar` y `restic` cuando sus ejecutables están instalados en el host;
-- reporta claramente ejecutables faltantes (`tar`, `restic`, `gpg`, `rclone`, etc.) mediante `worker.self_check` o el resultado del job;
+- usa la única estrategia admitida, `restic`, cuyo ejecutable viene incluido en los paquetes nativos;
+- reporta claramente ejecutables faltantes (`restic`, `rclone`, etc.) mediante `worker.self_check` o el resultado del job;
 - mantiene el ciclo existente de lease, progreso, cancelación, logs redactados y resultado del worker;
 - soporta operaciones Restic de metadatos/retención existentes que usan el mismo contrato de comando validado;
 - soporta `restore.dry_run` y `restore.run` cuando el payload incluye un destino explícito del host;

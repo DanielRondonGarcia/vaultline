@@ -168,8 +168,6 @@ def _write_restore_result(result):
 def main():
     # Load config from env
     backup_sources = _backup_sources_from_env()
-    backup_filename = os.environ.get("BACKUP_FILENAME", "backup-%Y-%m-%dT%H-%M-%S.tar.gz")
-    gpg_passphrase = os.environ.get("GPG_PASSPHRASE")
 
     aws_s3_bucket = os.environ.get("AWS_S3_BUCKET_NAME")
     aws_glacier_vault = os.environ.get("AWS_GLACIER_VAULT_NAME")
@@ -213,7 +211,6 @@ def main():
             chown=os.environ.get("RESTORE_CHOWN") or None,
             backup_strategy=restore_strategy_name,
             layout=os.environ.get("RESTORE_LAYOUT", "auto").lower(),
-            gpg_passphrase=gpg_passphrase,
             restic_repository=restic_repo,
             restic_password=restic_pass,
             aws_s3_bucket=aws_s3_bucket,
@@ -255,8 +252,6 @@ def main():
 
     config = BackupConfig(
         source_paths=backup_sources,
-        backup_filename=backup_filename,
-        gpg_passphrase=gpg_passphrase,
         aws_s3_bucket=aws_s3_bucket,
         aws_glacier_vault=aws_glacier_vault,
         scp_host=scp_host,

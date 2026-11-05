@@ -43,22 +43,25 @@ class EntrypointStrategyDefaultsTests(unittest.TestCase):
         if cls.bash is None:
             raise unittest.SkipTest("bash is required to exercise the entrypoint defaults")
 
-    def run_entrypoint_env_defaults(self, env_overrides=None):
+    def run_entrypoint_env_defaults(self, env_overrides=None, extra_env_names=()):
         workdir = tempfile.mkdtemp(prefix="entrypoint-defaults-")
         self.addCleanup(shutil.rmtree, workdir, ignore_errors=True)
+        names = ("BACKUP_STRATEGY", "RESTORE_BACKUP_STRATEGY", *extra_env_names)
         harness = (
             "set -e\n"
             "cat <<EOF > env.sh\n"
             + "\n".join(env_sh_block_lines())
             + "\nEOF\n"
             "source env.sh\n"
-            'printf \'BACKUP_STRATEGY=%s\\n\' "$BACKUP_STRATEGY"\n'
-            'printf \'RESTORE_BACKUP_STRATEGY=%s\\n\' "$RESTORE_BACKUP_STRATEGY"\n'
+            + "".join(
+                'printf \'{0}=%s\\n\' "${0}"\n'.format(name)
+                for name in names
+            )
         )
         script = Path(workdir) / "run.sh"
         script.write_bytes(harness.encode("utf-8"))
         env = os.environ.copy()
-        for name in ("BACKUP_STRATEGY", "RESTORE_BACKUP_STRATEGY"):
+        for name in ("BACKUP_STRATEGY", "RESTORE_BACKUP_STRATEGY", *extra_env_names):
             env.pop(name, None)
         env.pop("RESTORE_MODE", None)
         for name, value in (env_overrides or {}).items():
@@ -78,12 +81,12 @@ class EntrypointStrategyDefaultsTests(unittest.TestCase):
             )
         resolved = {}
         for line in completed.stdout.splitlines():
-            for name in ("BACKUP_STRATEGY", "RESTORE_BACKUP_STRATEGY"):
+            for name in ("BACKUP_STRATEGY", "RESTORE_BACKUP_STRATEGY", *extra_env_names):
                 if line.startswith(name + "="):
                     resolved[name] = line[len(name) + 1 :]
         self.assertEqual(
             sorted(resolved),
-            ["BACKUP_STRATEGY", "RESTORE_BACKUP_STRATEGY"],
+            sorted(["BACKUP_STRATEGY", "RESTORE_BACKUP_STRATEGY", *extra_env_names]),
             f"unexpected env.sh defaults output: {completed.stdout!r}",
         )
         return resolved
@@ -105,6 +108,26 @@ class EntrypointStrategyDefaultsTests(unittest.TestCase):
 
         self.assertEqual(resolved["BACKUP_STRATEGY"], "tar")
         self.assertEqual(resolved["RESTORE_BACKUP_STRATEGY"], "tar")
+
+    def test_removed_tar_configuration_defaults_are_not_written_anymore(self):
+        """T7 (S1, S3): BACKUP_FILENAME and GPG_PASSPHRASE were only consumed
+        by the removed TAR strategy. The entrypoint must stop carrying their
+        defaults and must not inject them from env.sh; a bare environment
+        must end up with neither variable defined."""
+        self.assertTrue(
+            all(
+                not line.startswith(("BACKUP_FILENAME", "GPG_PASSPHRASE"))
+                for line in env_sh_block_lines()
+            ),
+            "env.sh defaults must not contain obsolete BACKUP_FILENAME/GPG_PASSPHRASE",
+        )
+        resolved = self.run_entrypoint_env_defaults(
+            extra_env_names=("BACKUP_FILENAME", "GPG_PASSPHRASE")
+        )
+        # The removed variables must not be defined after sourcing env.sh;
+        # printf prints an empty value marker for each unset name.
+        self.assertEqual(resolved["BACKUP_FILENAME"], "")
+        self.assertEqual(resolved["GPG_PASSPHRASE"], "")
 
     def test_explicit_restore_strategy_selection_is_preserved(self):
         resolved = self.run_entrypoint_env_defaults({"RESTORE_BACKUP_STRATEGY": "restic"})

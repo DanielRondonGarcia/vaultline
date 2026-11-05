@@ -2561,10 +2561,14 @@ class WorkerUiStateTests(unittest.TestCase):
             "SmartScreen",
             "Los ejecutables de Restic y rclone se incluyen con el worker nativo",
             "rclone.conf</code> y las credenciales del repositorio en secretos separados",
-            "Instala por separado las demás herramientas externas (tar, gpg, aws, ssh y scp)",
+            "Instala por separado las demás herramientas externas (aws, ssh y scp)",
             "espera el enrolamiento",
         ):
             self.assertIn(marker, self.source)
+        # T7 (S3): the native-worker info panel must not advertise the removed
+        # TAR/GPG tools anymore.
+        self.assertNotIn("tar, gpg", self.source)
+        self.assertNotIn("(tar, gpg, aws, ssh y scp)", self.source)
         self.assertNotIn("navigator.platform", self.source)
         self.assertNotIn("userAgent", self.source)
 

@@ -358,7 +358,7 @@ class NativeRuntimeAdapter(RuntimePort):
 
     def self_check(self) -> Dict[str, Any]:
         executables = {}
-        for name in ("tar", "restic", "gpg", "rclone", "aws", "ssh", "scp"):
+        for name in ("restic", "rclone", "aws", "ssh", "scp"):
             if name in {"restic", "rclone"} and getattr(sys, "frozen", False):
                 try:
                     if name == "restic":

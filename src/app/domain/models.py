@@ -12,8 +12,6 @@ if TYPE_CHECKING:
 @dataclass
 class BackupConfig:
     source_paths: List[str]
-    backup_filename: str = "backup.tar.gz"
-    gpg_passphrase: Optional[str] = None
     aws_s3_bucket: Optional[str] = None
     aws_glacier_vault: Optional[str] = None
     scp_host: Optional[str] = None
@@ -61,7 +59,6 @@ class RestoreConfig:
     chown: Optional[str] = None
     backup_strategy: str = "restic"
     layout: str = "auto"
-    gpg_passphrase: Optional[str] = None
     restic_repository: Optional[str] = None
     restic_password: Optional[str] = None
     aws_s3_bucket: Optional[str] = None

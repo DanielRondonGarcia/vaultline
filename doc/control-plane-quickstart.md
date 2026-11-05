@@ -651,6 +651,13 @@ tampoco se muestra un aviso de actualización. Mientras se consulta el último r
 
 ### Crear un target de backup
 
+La estrategia de backup es Restic-only: el API rechaza cualquier valor de
+`backup_strategy` distinto de `restic` (el modo TAR fue eliminado del sistema)
+sin alterar el target almacenado, y el formulario de la UI ya no ofrece
+selector de estrategia; muestra `restic` como dato informativo fijo.
+Los backups y la restauración siguen usando restic, y los storage profiles
+por rclone (`backend_type: rclone`) funcionan sin cambios.
+
 Ejemplo orientado al runtime actual del proyecto:
 
 ```powershell
@@ -682,7 +689,7 @@ Crear un `storage profile` usando referencias a secretos:
 ```powershell
 curl -X POST http://127.0.0.1:8080/api/v1/storage-profiles `
   -H "Content-Type: application/json" `
-  -d "{\"name\":\"s3-restic\",\"backend_type\":\"restic-rclone\",\"environment\":{\"RESTIC_REPOSITORY\":\"rclone:remote:/docker-backups\",\"RCLONE_CONFIG\":\"/run/secrets/rclone.conf\"},\"secret_refs\":{\"RESTIC_PASSWORD\":\"<secret_id_password>\"},\"file_secret_refs\":{\"/run/secrets/rclone.conf\":\"<secret_id_rclone_conf>\"}}"
+  -d "{\"name\":\"s3-restic\",\"backend_type\":\"rclone\",\"environment\":{\"RESTIC_REPOSITORY\":\"rclone:remote:/docker-backups\",\"RCLONE_CONFIG\":\"/run/secrets/rclone.conf\"},\"secret_refs\":{\"RESTIC_PASSWORD\":\"<secret_id_password>\"},\"file_secret_refs\":{\"/run/secrets/rclone.conf\":\"<secret_id_rclone_conf>\"}}"
 ```
 
 Listar `storage profiles`:

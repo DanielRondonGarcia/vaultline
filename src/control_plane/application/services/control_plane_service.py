@@ -681,6 +681,7 @@ class ControlPlaneService:
         backup_mode = self._validate_runtime_backup_mode(runtime_type, backup_mode)
         if not isinstance(live_access_enabled, bool):
             raise ValueError("live_access_enabled must be a boolean")
+        backup_strategy = self._normalize_target_backup_strategy(backup_strategy, default="restic")
         normalized_path_storage = self._normalize_path_storage(path_storage)
         runtime_environment = runtime_environment or {}
         self._validate_path_storage_target_environment(
@@ -1131,7 +1132,16 @@ class ControlPlaneService:
         effective_runtime_environment = (
             runtime_environment if runtime_environment is not None else target.runtime_environment
         )
-        effective_backup_strategy = backup_strategy if backup_strategy is not None else target.backup_strategy
+        normalized_target_backup_strategy = self._normalize_target_backup_strategy(backup_strategy)
+        if normalized_target_backup_strategy is not None:
+            backup_strategy = normalized_target_backup_strategy
+            effective_backup_strategy = normalized_target_backup_strategy
+        else:
+            if backup_strategy is not None:
+                # Blank input means the field was omitted, never a stored value:
+                # drop it so the Restic-only strategy is preserved unchanged.
+                backup_strategy = None
+            effective_backup_strategy = str(target.backup_strategy or "").strip().lower()
         self._validate_path_storage_target_environment(
             normalized_path_storage, effective_runtime_environment, effective_backup_strategy
         )
@@ -1827,6 +1837,27 @@ class ControlPlaneService:
         normalized = "/".join(part for part in parts if part)
         if not normalized:
             raise ValueError("path_storage must be non-empty when supplied")
+        return normalized
+
+    @classmethod
+    def _normalize_target_backup_strategy(cls, backup_strategy: Any, default: Optional[str] = None) -> Optional[str]:
+        """T5 (S1, S2, S3): the Control Plane is Restic-only.
+
+        Returns the normalized strategy when ``restic`` is supplied (case and
+        surrounding whitespace are tolerated), ``default`` when the value is
+        omitted or empty, and raises for any other strategy: the TAR strategy
+        was removed and must not be accepted back.
+        """
+        if backup_strategy is None:
+            return default
+        if isinstance(backup_strategy, str) and not backup_strategy.strip():
+            return default
+        normalized = str(backup_strategy).strip().lower()
+        if normalized != "restic":
+            raise ValueError(
+                f"Unsupported backup strategy '{normalized}': the TAR strategy was removed and "
+                "the Control Plane is Restic-only; use backup_strategy=restic"
+            )
         return normalized
 
     @staticmethod

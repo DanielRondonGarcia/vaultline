@@ -199,6 +199,20 @@ class SnapshotExplorerUiStateTests(unittest.TestCase):
         self.assertIn("const bypassSessionCache = options.bypassSessionCache === true;", about.group(0))
         self.assertIn("const cachedAbout = bypassSessionCache ? null", about.group(0))
 
+    def test_target_forms_show_restic_strategy_informationally_without_tar_choice(self):
+        # T5 (S2): create and edit target forms no longer offer a strategy
+        # selector; Restic is fixed and shown informationally.
+        self.assertNotIn('<option value="tar"', self.source)
+        self.assertRegex(self.source, r'<input id="targetBackupStrategy" value="restic" disabled')
+        self.assertRegex(self.source, r'<input id="etBackupStrategy" value="restic" disabled')
+        for marker in (
+            'Estrategia fija: los targets solo admiten backups restic.',
+            'backup_strategy: backupStrategy,',
+            'const backupStrategy = document.getElementById("targetBackupStrategy").value;',
+        ):
+            self.assertIn(marker, self.source)
+        self.assertNotIn("no aplica a tar", self.source)
+
     def test_target_stats_action_is_restic_only_and_cache_first_with_bounded_job_refresh(self):
         for marker in (
             'data-action="target-stats"',

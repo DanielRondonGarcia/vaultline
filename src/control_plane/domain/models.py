@@ -221,6 +221,26 @@ class JobRecord:
 
 
 @dataclass
+class WorkerScheduleClaimRecord:
+    """A worker's ownership claim over its fetched backup schedule.
+
+    Created when an authenticated worker downloads schedule state for the
+    first time and refreshed on every fetch. While a claim covers a target,
+    the control plane stops dispatching scheduled backups for it: the worker
+    evaluates the cron offline and reports results through the offline-result
+    reconciliation route. Build failures are stored beside the claim so the
+    suppressed-vs-failing distinction stays visible.
+    """
+
+    worker_id: str
+    revision: str
+    target_ids: List[str] = field(default_factory=list)
+    errors: Dict[str, str] = field(default_factory=dict)
+    claimed_at: datetime = field(default_factory=utcnow)
+    updated_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass
 class SettingsRecord:
     DEFAULT_SNAPSHOT_EXPLORER_LISTING_MAX_OUTPUT_BYTES: ClassVar[int] = 4 * 1024 * 1024
     MIN_SNAPSHOT_EXPLORER_LISTING_MAX_OUTPUT_BYTES: ClassVar[int] = 1 * 1024 * 1024

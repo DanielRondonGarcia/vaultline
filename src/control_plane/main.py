@@ -1341,7 +1341,10 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             if len(parts) == 5 and parts[:3] == ["api", "v1", "workers"] and parts[4] == "schedule-state":
                 if not self._require_worker_identity(parts[3]):
                     return
-                state = self._control_plane_service().get_worker_schedule_state(parts[3])
+                service = self._control_plane_service()
+                if service.worker_schedule_claim_repository is None:
+                    return self._write_json(404, {"error": "worker schedule ownership is unavailable"})
+                state = service.get_worker_schedule_state(parts[3])
                 return self._write_json(200, _to_jsonable(state))
 
             if len(parts) == 5 and parts[:3] == ["api", "v1", "workers"] and parts[4] == "schedule-ack":

@@ -59,6 +59,7 @@ from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryTargetStatsRepository,
     InMemoryTargetRepository,
     InMemoryWorkerRepository,
+    InMemoryWorkerScheduleClaimRepository,
 )
 from src.control_plane.infrastructure.repositories.sqlite import (
     SQLiteDashboardReadSnapshotRepository,
@@ -75,6 +76,7 @@ from src.control_plane.infrastructure.repositories.sqlite import (
     SQLiteTargetStatsRepository,
     SQLiteTargetRepository,
     SQLiteWorkerRepository,
+    SQLiteWorkerScheduleClaimRepository,
 )
 from src.control_plane.infrastructure.security.secret_codec import SecretCodec
 from src.control_plane.infrastructure.security.tls import TLSMaterialManager
@@ -1120,6 +1122,15 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                         200,
                         self._control_plane_service().revoke_worker(parts[4], body.get("version")),
                     )
+                if parts[5] == "release-schedule":
+                    if not isinstance(body, dict) or set(body) != {"target_id", "confirmation"}:
+                        raise ValueError("target_id and confirmation are required")
+                    return self._write_json(
+                        200,
+                        self._control_plane_service().release_worker_schedule_claim(
+                            parts[4], body["target_id"], body["confirmation"]
+                        ),
+                    )
 
             if path == "/api/v1/filesystem-size-estimates":
                 if not self._require_auth(ROLE_ADMIN, api_mode=True):
@@ -1326,6 +1337,28 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     labels=body.get("labels"),
                 )
                 return self._write_json(200, _to_jsonable(worker))
+
+            if len(parts) == 5 and parts[:3] == ["api", "v1", "workers"] and parts[4] == "schedule-state":
+                if not self._require_worker_identity(parts[3]):
+                    return
+                state = self._control_plane_service().get_worker_schedule_state(parts[3])
+                return self._write_json(200, _to_jsonable(state))
+
+            if len(parts) == 5 and parts[:3] == ["api", "v1", "workers"] and parts[4] == "schedule-ack":
+                if not self._require_worker_identity(parts[3]):
+                    return
+                outcome = self._control_plane_service().acknowledge_worker_schedule_state(
+                    parts[3], body.get("revision")
+                )
+                return self._write_json(200, outcome)
+
+            if len(parts) == 5 and parts[:3] == ["api", "v1", "workers"] and parts[4] == "offline-results":
+                if not self._require_worker_identity(parts[3]):
+                    return
+                outcome = self._control_plane_service().record_offline_result(
+                    parts[3], body.get("result")
+                )
+                return self._write_json(200, outcome)
 
             if len(parts) == 5 and parts[:3] == ["api", "v1", "workers"] and parts[4] == "inventory":
                 if not self._require_worker_identity(parts[3]):

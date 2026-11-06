@@ -63,6 +63,24 @@ class ControlPlaneAsyncRecoveryTests(unittest.TestCase):
                     self.assertEqual(service.get_job_view(job.id), before)
 
 
+class ScheduledBackupLookupTests(unittest.TestCase):
+    def test_sqlite_active_lookup_does_not_load_job_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLiteJobRepository(f"{directory}/cp.db")
+            service = test_job_ownership.JobOwnershipTests().make_service(repository)
+            service.target_repository.save(BackupTargetRecord(id="target-a", name="target", worker_id="worker-a"))
+            job = service.dispatch_job("worker-a", "backup.run", target_id="target-a")
+            with unittest.mock.patch.object(repository, "list", side_effect=AssertionError("history loaded")):
+                self.assertTrue(service.has_active_backup_for_target("target-a"))
+                self.assertFalse(service.has_active_backup_for_target("target-b"))
+                job.status = JobStatus.IN_PROGRESS
+                repository.save(job)
+                self.assertTrue(service.has_active_backup_for_target("target-a"))
+                job.status = JobStatus.UNCONFIRMED
+                repository.save(job)
+                self.assertFalse(service.has_active_backup_for_target("target-a"))
+
+
 class OutcomeUnknownDeadlineTests(unittest.TestCase):
     """S7: after at least 24 hours without worker confirmation the outcome is unknown.
 

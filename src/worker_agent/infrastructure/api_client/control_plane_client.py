@@ -263,6 +263,26 @@ class ControlPlaneClient:
             },
         )
 
+    def download_schedule_state(self, worker_id: str) -> Optional[Dict[str, Any]]:
+        """Download the control-plane schedule state with resolved payloads.
+
+        Control planes that predate the schedule contract answer 404/405/501;
+        they yield ``None`` so the worker keeps its durable last configuration.
+        """
+        try:
+            return self._post(f"/api/v1/workers/{worker_id}/schedule-state", {})
+        except ControlPlaneHTTPError as exc:
+            if exc.code in (404, 405, 501):
+                return None
+            raise
+
+    def acknowledge_schedule_state(self, worker_id: str, revision: str) -> Dict[str, Any]:
+        return self._post(f"/api/v1/workers/{worker_id}/schedule-ack", {"revision": revision})
+
+    def submit_offline_result(self, worker_id: str, record: Dict[str, Any]) -> Dict[str, Any]:
+        """Deliver one offline scheduled result after reconnection."""
+        return self._post(f"/api/v1/workers/{worker_id}/offline-results", {"result": record})
+
     def fetch_live_requests(self, worker_id: str, limit: int = 4) -> List[Dict[str, Any]]:
         bounded = max(1, min(int(limit), 16))
         return self._post(f"/api/v1/workers/{worker_id}/live/poll", {"limit": bounded}).get("items", [])

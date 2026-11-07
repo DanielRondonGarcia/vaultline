@@ -2176,10 +2176,11 @@ class DockerExecutionLogCaptureTests(unittest.TestCase):
         fake.remove = Mock(side_effect=remove_mock)
         fake.id = "capturecontainerid0123456789"
         fake.attrs = {"Config": {"Labels": {}}}
-        # Ephemeral framed-stdin handoff: attach returns a fake stream whose
-        # write (binary bytes) and close are observable.
+        # Ephemeral framed-stdin handoff uses the SDK's socket API.
         fake.capture_stream = Mock()
-        fake.attach = Mock(return_value=fake.capture_stream)
+        fake.capture_stream.write.side_effect = lambda data: len(data)
+        fake.capture_stream.sendall = None
+        fake.attach_socket = Mock(return_value=fake.capture_stream)
         return fake
 
     def test_containerized_worker_uses_a_daemon_owned_capture_container(self):
@@ -2237,8 +2238,8 @@ class DockerExecutionLogCaptureTests(unittest.TestCase):
         self.assertEqual(capture.wait.call_args.kwargs.get("timeout"), DockerRuntimeAdapter.EXECUTION_LOG_DRAIN_SECONDS)
         # The bounded framed recipe was attached and written to the capture
         # container's stdin, then closed: secrets never rest on the volume.
-        capture.attach.assert_called_once_with(socket=True, stdin=True, stream=True)
-        frame = capture.capture_stream.write.call_args.args[0]
+        capture.attach_socket.assert_called_once_with(params={"stdin": 1, "stream": 1})
+        frame = bytes(capture.capture_stream.write.call_args.args[0])
         self.assertIsInstance(frame, bytes)
         self.assertIn(f'"{self.SECRET}"'.encode("utf-8"), frame)
         capture.capture_stream.close.assert_called_once()

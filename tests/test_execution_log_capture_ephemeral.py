@@ -386,7 +386,7 @@ class EphemeralRecipeCrashSafetyTests(unittest.TestCase):
 
 class _AttachingChildContainer:
     """Minimal real-child container fake for the Docker adapter seams: the
-    attach() seam returns the child's true binary stdin so the bounded
+    attach_socket() seam returns the child's true binary stdin so the bounded
     write exercises a real, never-drained OS pipe."""
 
     def __init__(self, process, *, identifier="capcontainerid0123456789"):
@@ -394,7 +394,7 @@ class _AttachingChildContainer:
         self.id = identifier
         self.attached = 0
 
-    def attach(self, **kwargs):
+    def attach_socket(self, params=None):
         self.attached += 1
         if self.inner is None:
             return Mock()

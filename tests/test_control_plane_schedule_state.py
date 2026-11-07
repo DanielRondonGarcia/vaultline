@@ -158,6 +158,14 @@ class ScheduleStateServiceTests(unittest.TestCase):
         service.acknowledge_worker_schedule_state("worker-a", new_state["revision"])
         self.assertIn("target-a", {entry["target_id"] for entry in service.get_worker_schedule_state("worker-b")["entries"]})
 
+    def test_schedule_delivery_requires_a_claim_repository(self):
+        service = self.make_service()
+        service.worker_schedule_claim_repository = None
+        with self.assertRaises(ValueError):
+            service.get_worker_schedule_state("worker-a")
+        job = service.dispatch_backup_for_target("target-a", trigger="schedule")
+        self.assertEqual(job.trigger, "schedule")
+
     def test_schedule_state_returns_version_revision_resolved_payloads_and_timezone(self):
         with patch.dict("os.environ", {"CONTROL_PLANE_TIMEZONE": "UTC"}):
             service = self.make_service()
@@ -502,6 +510,12 @@ class WorkerScheduleRouteTests(unittest.TestCase):
         self.assertEqual(body["entries"][0]["target_id"], "target-a")
         # The delivery itself transferred schedule ownership (suppression active).
         self.assertTrue(self.service.schedule_ownership_status("worker-a")["claims_schedule"])
+
+    def test_schedule_state_route_is_legacy_when_claims_are_unavailable(self):
+        self.service.worker_schedule_claim_repository = None
+        status, body = self.signed_request("/api/v1/workers/worker-a/schedule-state", {})
+        self.assertEqual(status, 404)
+        self.assertNotIn("entries", body)
 
     def test_schedule_state_route_rejects_bad_worker_signature(self):
         status, body = self.signed_request(

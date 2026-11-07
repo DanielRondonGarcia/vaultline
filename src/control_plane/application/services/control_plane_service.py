@@ -812,6 +812,8 @@ class ControlPlaneService:
         durable last configuration).
         """
         self._require_worker(worker_id)
+        if self.worker_schedule_claim_repository is None:
+            raise ValueError("worker schedule ownership is unavailable")
         timezone_name = self._worker_schedule_timezone()
         entries, errors, claimed = self._build_schedule_entries(worker_id)
         revision_source = json.dumps(

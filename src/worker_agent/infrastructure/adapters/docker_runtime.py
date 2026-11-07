@@ -1037,6 +1037,18 @@ class DockerRuntimeAdapter(RuntimePort):
             return
         thread.join(timeout=2)
         if thread.is_alive():
+            # The stream did not finish on its own within the bounded join
+            # window, so closing it now ends its delivered output early. A
+            # Docker-style stream fails closed without raising, which would
+            # silently pass the truncated tail off as the complete output of
+            # a successful exit (observed as "failed to parse restic
+            # snapshots JSON" with status_code 0). Mark the state so the
+            # caller re-reads the complete bounded logs through the existing
+            # non-streamed fallback instead of trusting what was captured.
+            if isinstance(state, dict) and state.get("error") is None:
+                state["error"] = RuntimeError(
+                    "output stream was closed before it finished; captured output may be truncated"
+                )
             stream = state.get("stream") if isinstance(state, dict) else None
             close = getattr(stream, "close", None)
             if callable(close):

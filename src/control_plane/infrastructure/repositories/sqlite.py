@@ -23,6 +23,7 @@ from src.control_plane.application.ports.ports import (
     TargetRepository,
     WorkerEnrollmentRepository,
     WorkerRepository,
+    WorkerScheduleClaimRepository,
     JOB_LISTING_SORT_KEYS,
     build_job_stats,
     job_stats_day_keys,
@@ -50,6 +51,7 @@ from src.control_plane.domain.models import (
     UNCONFIRMED_OUTCOME_RECOVERY,
     WorkerEnrollmentRecord,
     WorkerRecord,
+    WorkerScheduleClaimRecord,
     utcnow,
 )
 from src.control_plane.infrastructure.sqlite_runtime import SQLiteConnection as _SQLiteConnection
@@ -394,6 +396,15 @@ class SQLiteRepositoryBase:
                     global_cron_expression TEXT,
                     control_plane_public_url TEXT NOT NULL DEFAULT '',
                     snapshot_explorer_listing_max_output_bytes INTEGER NOT NULL DEFAULT 4194304,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS worker_schedule_claims (
+                    worker_id TEXT PRIMARY KEY,
+                    revision TEXT NOT NULL,
+                    target_ids_json TEXT NOT NULL,
+                    errors_json TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
 
@@ -848,6 +859,24 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM jobs ORDER BY submitted_at DESC").fetchall()
         return [self._row_to_job(row) for row in rows]
+
+    def has_active_backup_for_target(self, target_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM jobs WHERE target_id = ? AND command = ? "
+                "AND status IN (?, ?) LIMIT 1",
+                (target_id, "backup.run", JobStatus.PENDING, JobStatus.IN_PROGRESS),
+            ).fetchone()
+        return row is not None
+
+    def has_blocking_backup_for_schedule_handover(self, target_id: str) -> bool:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM jobs WHERE target_id = ? AND command = ? "
+                "AND status IN (?, ?, ?) LIMIT 1",
+                (target_id, "backup.run", JobStatus.PENDING, JobStatus.IN_PROGRESS, JobStatus.UNCONFIRMED),
+            ).fetchone()
+        return row is not None
 
     def find_active_snapshot_sync(self, target_id: str, worker_id: str) -> Optional[JobRecord]:
         with self._connect() as connection:
@@ -1896,6 +1925,60 @@ class SQLiteTargetStatsRepository(SQLiteRepositoryBase, TargetStatsRepository):
     def delete_by_worker(self, worker_id: str) -> bool:
         with self._lock, self._connect() as connection:
             cursor = connection.execute("DELETE FROM target_stats WHERE worker_id = ?", (worker_id,))
+            return cursor.rowcount > 0
+
+
+class SQLiteWorkerScheduleClaimRepository(SQLiteRepositoryBase, WorkerScheduleClaimRepository):
+    """One durable claim row per worker; refreshed while the worker polls."""
+
+    def save(self, claim: WorkerScheduleClaimRecord) -> WorkerScheduleClaimRecord:
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO worker_schedule_claims (
+                    worker_id, revision, target_ids_json, errors_json, claimed_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    claim.worker_id,
+                    claim.revision,
+                    json.dumps(claim.target_ids),
+                    json.dumps(claim.errors),
+                    claim.claimed_at.isoformat(),
+                    claim.updated_at.isoformat(),
+                ),
+            )
+        return claim
+
+    def get_by_worker(self, worker_id: str) -> Optional[WorkerScheduleClaimRecord]:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM worker_schedule_claims WHERE worker_id = ?", (worker_id,)
+            ).fetchone()
+        if not row:
+            return None
+        return WorkerScheduleClaimRecord(
+            worker_id=row["worker_id"],
+            revision=row["revision"],
+            target_ids=_json_load(row["target_ids_json"], []),
+            errors=_json_load(row["errors_json"], {}),
+            claimed_at=_dt(row["claimed_at"]) or datetime.utcnow(),
+            updated_at=_dt(row["updated_at"]) or datetime.utcnow(),
+        )
+
+    def list(self) -> List[WorkerScheduleClaimRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT worker_id FROM worker_schedule_claims ORDER BY claimed_at"
+            ).fetchall()
+        claims = [self.get_by_worker(row["worker_id"]) for row in rows]
+        return [claim for claim in claims if claim is not None]
+
+    def delete_by_worker(self, worker_id: str) -> bool:
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM worker_schedule_claims WHERE worker_id = ?", (worker_id,)
+            )
             return cursor.rowcount > 0
 
 

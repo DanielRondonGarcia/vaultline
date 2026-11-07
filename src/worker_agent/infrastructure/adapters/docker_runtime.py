@@ -1565,13 +1565,22 @@ class DockerRuntimeAdapter(RuntimePort):
         the job: on timeout this returns without raising (fail-open, S4).
         A failed attach or write still raises; callers treat it as
         fail-open (alert, never block the job)."""
-        stream = capture_container.attach(socket=True, stdin=True, stream=True)
+        stream = capture_container.attach_socket(params={"stdin": 1, "stream": 1})
         transfer_done = threading.Event()
         transfer_error: List[BaseException] = []
 
         def _write_frame() -> None:
             try:
-                stream.write(recipe_frame)
+                sendall = getattr(stream, "sendall", None)
+                if callable(sendall):
+                    sendall(recipe_frame)
+                else:
+                    remaining = memoryview(recipe_frame)
+                    while remaining:
+                        written = stream.write(remaining)
+                        if not isinstance(written, int) or written <= 0:
+                            raise OSError("capture stdin did not accept the recipe frame")
+                        remaining = remaining[written:]
             except Exception as error:
                 # Forwarded to the caller below so an immediately broken
                 # stream keeps its original fail-open disposal path.

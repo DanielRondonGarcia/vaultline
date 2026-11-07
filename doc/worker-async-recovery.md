@@ -33,6 +33,18 @@ El resultado real posterior sustituye el diagnóstico. Si confirma un fallo, se 
 
 Si el worker nunca regresa, el job pasa a «Resultado desconocido» (estado `unconfirmed`) 24 horas después de la expiración del lease. Investiga el host y el runtime antes de esa marca si puedes; pasado el plazo se permiten nuevas tareas y, si corresponde, cancela el trabajo desde el CP para cerrarlo. No se declara éxito ni fallo basándose únicamente en la ausencia de comunicación.
 
+## Programación local durante una desconexión
+
+El worker con la programación asignada guarda la última configuración recibida y evalúa el cron localmente. Si pierde conexión, sigue utilizándola y almacena resultados pendientes para enviarlos cuando el Control Plane vuelva a responder. Los cambios, desactivaciones y revocaciones realizados durante la desconexión no llegan al worker hasta que se restablezca la comunicación. Si un resultado es rechazado, se conserva y los demás pueden seguir enviándose; al llenarse la cola se descartan los resultados más antiguos y el worker registra una advertencia.
+
+La configuración local contiene credenciales resueltas y se guarda con los mismos permisos privados del archivo de credenciales del worker. Esos permisos no protegen frente a un administrador comprometido del propio host. Si un Control Plane antiguo responde con 404, 405 o 501 para la programación local, el worker no ejecuta la copia antigua mientras reciba esa respuesta, para evitar dos programadores activos. Otros errores se tratan como una desconexión y el worker sigue con su última configuración; esto puede causar duplicados si el Control Plane se ha degradado a una versión antigua y responde con otro error. Durante el traspaso de propiedad, una ejecución pendiente o con resultado desconocido impide asignar el cron al worker hasta que se resuelva.
+
+## Recuperar un propietario de programación perdido
+
+Un worker desconectado puede seguir usando su última programación. Revocarlo en el Control Plane **no detiene** ese proceso ni demuestra que el host esté apagado. Para evitar backups simultáneos, la propiedad se conserva hasta que el worker confirme la nueva programación; no se puede eliminar un worker mientras conserve destinos programados.
+
+Si el host se perdió definitivamente, un administrador debe comprobar primero que el worker y cualquier runtime que haya iniciado están detenidos permanentemente. Después de revocar el worker, puede liberar un destino concreto mediante `POST /api/v1/admin/workers/{worker_id}/release-schedule`, con el cuerpo `{"target_id":"<target_id>","confirmation":"WORKER_STOPPED"}`. Repetir por cada destino. Esta operación confía en la confirmación del administrador: si el worker anterior vuelve a ejecutar, puede producirse un backup duplicado. No libera otros destinos ni borra snapshots.
+
 ## Límites y protección
 
 Los logs se redactan antes de guardarlos. Los archivos usan permisos privados y escritura atómica. La cola admite 64 lotes por ejecución, hasta 64 KiB por lote, con una antigüedad máxima de 7 días. Bajo presión de retención, se conservan los datos más recientes; una advertencia señala la omisión de líneas antiguas. El journal de resultados conserva hasta 32 resultados de hasta 2 MiB cada uno.

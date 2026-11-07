@@ -2061,6 +2061,21 @@ class ControlPlaneRouteTests(unittest.TestCase):
         )
         self.assertEqual(handler._write_json.call_args.args, (202, {"ok": True}))
 
+    def test_admin_schedule_release_requires_admin_and_explicit_target_confirmation(self):
+        handler = self.make_handler(
+            "/api/v1/admin/workers/worker-a/release-schedule",
+            '{"target_id":"target-a","confirmation":"WORKER_STOPPED"}',
+        )
+        handler._require_auth.reset_mock()
+        handler._require_auth.return_value = {"role": ROLE_ADMIN}
+        service = Mock()
+        service.release_worker_schedule_claim.return_value = {"released": True}
+        handler._control_plane_service = Mock(return_value=service)
+        handler.do_POST()
+        handler._require_auth.assert_called_once_with(ROLE_ADMIN, api_mode=True)
+        service.release_worker_schedule_claim.assert_called_once_with("worker-a", "target-a", "WORKER_STOPPED")
+        self.assertEqual(handler._write_json.call_args.args[0], 200)
+
     def test_admin_revoke_route_delegates_worker_state_change_to_service(self):
         handler = self.make_handler("/api/v1/admin/workers/worker-a/revoke", "{}")
         handler._require_auth.reset_mock()

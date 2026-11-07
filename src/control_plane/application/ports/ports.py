@@ -23,6 +23,7 @@ from src.control_plane.domain.models import (
     TargetStatsRecord,
     WorkerEnrollmentRecord,
     WorkerRecord,
+    WorkerScheduleClaimRecord,
 )
 
 
@@ -63,6 +64,31 @@ class WorkerEnrollmentRepository(ABC):
 
     @abstractmethod
     def list(self) -> List[WorkerEnrollmentRecord]:
+        raise NotImplementedError
+
+
+class WorkerScheduleClaimRepository(ABC):
+    """Durable per-worker ownership claims over fetched schedule state.
+
+    One claim row per worker: the covered target ids and build failures of
+    the last delivered schedule. Claims are never expired by time, matching
+    the permanent offline ownership of the worker's durable schedule.
+    """
+
+    @abstractmethod
+    def save(self, claim: WorkerScheduleClaimRecord) -> WorkerScheduleClaimRecord:
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_by_worker(self, worker_id: str) -> Optional[WorkerScheduleClaimRecord]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list(self) -> List[WorkerScheduleClaimRecord]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_by_worker(self, worker_id: str) -> bool:
         raise NotImplementedError
 
 
@@ -220,6 +246,18 @@ class JobRepository(ABC):
     @abstractmethod
     def list(self) -> List[JobRecord]:
         raise NotImplementedError
+
+    def has_active_backup_for_target(self, target_id: str) -> bool:
+        """Check for a pending or in-progress backup for a target."""
+        return any(job.target_id == target_id and job.command == "backup.run"
+                   and JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS)
+                   for job in self.list())
+
+    def has_blocking_backup_for_schedule_handover(self, target_id: str) -> bool:
+        """An unknown outcome may still be executing and must block handover."""
+        return any(job.target_id == target_id and job.command == "backup.run"
+                   and JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS, JobStatus.UNCONFIRMED)
+                   for job in self.list())
 
     def find_active_snapshot_sync(self, target_id: str, worker_id: str) -> Optional[JobRecord]:
         """Find the newest active sync without requiring callers to load history."""

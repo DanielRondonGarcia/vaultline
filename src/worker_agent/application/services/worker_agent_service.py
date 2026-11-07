@@ -638,6 +638,7 @@ class WorkerAgentService:
         recovery_journal: Optional[WorkerJobRecoveryJournal] = None,
         live_session_manager: Optional[LiveTargetSessionManager] = None,
         terminal_report_journal: Optional[WorkerTerminalReportJournal] = None,
+        local_schedule: Optional[Any] = None,
     ):
         self.config = config
         self.control_plane_client = control_plane_client
@@ -654,6 +655,7 @@ class WorkerAgentService:
             if recovery_file
             else None
         )
+        self.local_schedule = local_schedule
         self.progress_spool_directory = str(Path(recovery_file).with_name("worker_progress")) if recovery_file else None
         self._pending_terminal_reports: Optional[List[Dict[str, Any]]] = None
         self._terminal_retry_delay = self.TERMINAL_REPORT_RETRY_MIN_SECONDS
@@ -2172,6 +2174,33 @@ class WorkerAgentService:
                 self._clear_recovery_record(job.get("id"))
             results.append(updated)
         return results
+
+    def execute_offline_backup(
+        self, payload: Dict[str, Any], entry_or_schedule_key: Any, schedule_key: Optional[str] = None,
+    ) -> WorkerJobExecutionResult:
+        """Run one scheduled backup offline through the normal job execution path.
+
+        The control plane cannot dispatch or cancel what it cannot see, so the
+        remote cancellation probe is bypassed: cancellation of offline jobs is
+        not a supported contract.
+        """
+        effective_key = schedule_key if schedule_key is not None else entry_or_schedule_key
+        job_id = "offline-" + hashlib.sha256(str(effective_key).encode()).hexdigest()[:16]
+        job = {"id": job_id, "command": "backup.run", "payload": payload}
+        return self.execute_job(job, cancel_check=lambda: False)
+
+    def poll_local_schedule(self, worker_id: Optional[str]) -> Dict[str, Any]:
+        """Refresh, replay and evaluate the durable local schedule once."""
+        if self.local_schedule is None:
+            return {"configured": False, "schedule": "not_configured", "replayed": 0, "executed": 0}
+        try:
+            return self.local_schedule.poll(worker_id)
+        except Exception as exc:
+            logger.warning(
+                "Local schedule lane failed (error_type=%s)",
+                _safe_worker_error_type(exc),
+            )
+            return {"configured": True, "error": True}
 
     def sync_inventory(self):
         worker_id = self.ensure_registered()

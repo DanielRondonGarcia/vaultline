@@ -20,6 +20,7 @@ from src.control_plane.application.ports.ports import (
     TargetRepository,
     WorkerEnrollmentRepository,
     WorkerRepository,
+    WorkerScheduleClaimRepository,
     apply_job_listing_query,
     compute_job_stats,
     paginate_job_listing,
@@ -47,6 +48,7 @@ from src.control_plane.domain.models import (
     UNCONFIRMED_OUTCOME_RECOVERY,
     WorkerEnrollmentRecord,
     WorkerRecord,
+    WorkerScheduleClaimRecord,
     utcnow,
 )
 
@@ -216,6 +218,30 @@ class InMemoryInventoryRepository(InventoryRepository):
     def delete_by_worker(self, worker_id: str) -> bool:
         with self._lock:
             return self._items.pop(worker_id, None) is not None
+
+
+class InMemoryWorkerScheduleClaimRepository(WorkerScheduleClaimRepository):
+    def __init__(self):
+        self._items: Dict[str, WorkerScheduleClaimRecord] = {}
+        self._lock = Lock()
+
+    def save(self, claim: WorkerScheduleClaimRecord) -> WorkerScheduleClaimRecord:
+        with self._lock:
+            self._items[claim.worker_id] = claim
+        return claim
+
+    def get_by_worker(self, worker_id: str) -> Optional[WorkerScheduleClaimRecord]:
+        return self._items.get(worker_id)
+
+    def list(self) -> List[WorkerScheduleClaimRecord]:
+        with self._lock:
+            return sorted(self._items.values(), key=lambda item: item.claimed_at)
+
+    def delete_by_worker(self, worker_id: str) -> bool:
+        with self._lock:
+            existed = worker_id in self._items
+            self._items.pop(worker_id, None)
+            return existed
 
 
 class InMemoryTargetRepository(TargetRepository):

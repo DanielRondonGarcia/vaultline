@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional
 from urllib.error import HTTPError, URLError
 
 from src.worker_agent.application.services.worker_agent_service import WorkerAgentService
+from src.worker_agent.application.services.local_schedule_service import LocalScheduleService
 from src.worker_agent._build_info import VERSION as BUILD_VERSION
 from src.worker_agent.domain.models import WorkerAgentConfig
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
@@ -26,6 +27,8 @@ from src.worker_agent.infrastructure.api_client.control_plane_client import (
     ControlPlaneHTTPError,
 )
 from src.worker_agent.infrastructure.security.credential_store import WorkerCredentialStore
+from src.worker_agent.infrastructure.security.offline_result_outbox import OfflineResultOutbox
+from src.worker_agent.infrastructure.security.schedule_state_journal import WorkerScheduleStateJournal
 from src.worker_agent.state_paths import (
     enrollment_files_trusted,
     load_enrollment_config,
@@ -418,13 +421,22 @@ def build_service() -> WorkerAgentService:
     runtime = _build_runtime(runtime_kind, config)
     config.labels = _runtime_labels(config.labels, runtime_kind)
     snapshot_cache = RedisSnapshotCache.from_env()
-    return WorkerAgentService(
+    service = WorkerAgentService(
         config,
         client,
         runtime,
         snapshot_cache=snapshot_cache,
         recovery_file=recovery_file,
     )
+    service.local_schedule = LocalScheduleService(
+        journal=WorkerScheduleStateJournal(credential_file.with_name("worker_schedule_state.json")),
+        outbox=OfflineResultOutbox(credential_file.with_name("worker_offline_results.json")),
+        fetch=client.download_schedule_state,
+        acknowledge=client.acknowledge_schedule_state,
+        deliver=client.submit_offline_result,
+        executor=service.execute_offline_backup,
+    )
+    return service
 
 
 def start_health_server(state: WorkerHealthState):
@@ -572,8 +584,14 @@ def main():
     start_health_server(health_state)
     live_lane = start_live_lane(service, interactive_interval)
     idle_cycles = 0
+    offline_schedule_interval = _bounded_interval(
+        "WORKER_OFFLINE_SCHEDULE_INTERVAL_SECONDS", 30.0, 1.0, 86400.0,
+    )
+    next_schedule_poll_at = 0.0
 
     while not _STOP_EVENT.is_set():
+        worker_id = None
+        now = None
         if not _resolve_worker_identity(service, health_state):
             # Idle until an administrator runs `enroll`; this is not a failure and
             # never counts against the startup retry cap.
@@ -618,6 +636,24 @@ def main():
                         "Runtime orphan sweep failed; expired in-progress leases await worker confirmation "
                         "(error_type=%s)",
                         exc.__class__.__name__,
+                    )
+            if now >= next_schedule_poll_at:
+                next_schedule_poll_at = now + offline_schedule_interval
+                try:
+                    schedule_summary = service.poll_local_schedule(worker_id)
+                except Exception as exc:
+                    schedule_summary = None
+                    logger.warning(
+                        "Local schedule execution failed (error_type=%s)", exc.__class__.__name__,
+                    )
+                if isinstance(schedule_summary, dict) and (
+                    schedule_summary.get("executed") or schedule_summary.get("replayed")
+                ):
+                    logger.info(
+                        "Offline schedule: executed=%s replayed=%s dropped_results=%s",
+                        schedule_summary.get("executed"),
+                        schedule_summary.get("replayed"),
+                        schedule_summary.get("dropped_results"),
                     )
             now = time.monotonic()
             if run_once or now - last_heartbeat_at >= poll_interval:

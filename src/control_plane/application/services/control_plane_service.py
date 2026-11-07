@@ -17,6 +17,7 @@ from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from src.control_plane.application.ports.ports import (
     CacheRepository,
@@ -32,6 +33,7 @@ from src.control_plane.application.ports.ports import (
     TargetStatsRepository,
     TargetRepository,
     WorkerRepository,
+    WorkerScheduleClaimRepository,
 )
 from src.control_plane.application.services.job_event_broker import JobEventBroker
 from src.control_plane.domain.models import (
@@ -50,6 +52,7 @@ from src.control_plane.domain.models import (
     UNCONFIRMED_OUTCOME_LOG,
     UNCONFIRMED_OUTCOME_RECOVERY,
     WorkerRecord,
+    WorkerScheduleClaimRecord,
     WorkerStatus,
     utcnow,
 )
@@ -74,6 +77,26 @@ class WorkerDeletionConflict(ValueError):
 # validated first) on the SMTP test path. JSON null must not collapse into the
 # omitted case.
 SMTP_TEST_RECIPIENTS_OMITTED = object()
+
+
+# Worker schedule ownership (worker autonomous scheduling): the same
+# environment settings the SchedulerService uses; declared locally because a
+# module-level import of scheduler_service would be circular.
+SCHEDULER_TIMEZONE_ENV = "CONTROL_PLANE_TIMEZONE"
+DEFAULT_WORKER_SCHEDULE_TIMEZONE = "America/Bogota"
+# Journal-format version the worker schedule journal normalizes (1).
+WORKER_SCHEDULE_STATE_VERSION = 1
+# The worker journal accepts at most 32 entries; remaining scheduled targets
+# are still claimed (no double scheduling) with an explicit error recorded.
+MAX_SCHEDULE_STATE_ENTRIES = 32
+# The worker journal caps one encoded entry at 256 KiB; stay below it.
+MAX_SCHEDULE_ENTRY_BYTES = 192 * 1024
+# Each offline result is one bounded record; the worker outbox already
+# trims to 192 KiB, so anything larger is a protocol violation.
+MAX_OFFLINE_RESULT_BYTES = 192 * 1024
+MAX_WORKER_SCHEDULE_ERROR_TEXT = 512
+OFFLINE_RESULT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$")
+OFFLINE_SCHEDULE_TRIGGER = "offline_schedule"
 
 
 class ControlPlaneService:
@@ -205,6 +228,7 @@ class ControlPlaneService:
         index_repository: Optional[IndexRepository] = None,
         job_event_broker: Optional[JobEventBroker] = None,
         notification_channel_repository: Optional[NotificationChannelRepository] = None,
+        worker_schedule_claim_repository: Optional[WorkerScheduleClaimRepository] = None,
     ):
         self.worker_repository = worker_repository
         self.inventory_repository = inventory_repository
@@ -221,6 +245,8 @@ class ControlPlaneService:
         self.index_repository = index_repository
         self.job_event_broker = job_event_broker or JobEventBroker()
         self.notification_channel_repository = notification_channel_repository
+        self.worker_schedule_claim_repository = worker_schedule_claim_repository
+        self._schedule_claim_lock = threading.RLock()
         self.worker_auth = None
 
     def register_worker(
@@ -599,6 +625,12 @@ class ControlPlaneService:
         if worker is None:
             return False
 
+        claims = (self.worker_schedule_claim_repository.get_by_worker(worker_id)
+                  if self.worker_schedule_claim_repository is not None else None)
+        if claims is not None and claims.target_ids:
+            raise WorkerDeletionConflict(
+                f"worker '{worker_id}' still owns schedules; disable targets and wait for schedule acknowledgement before deletion"
+            )
         self._reconcile_expired_jobs()
         active_jobs = self.job_repository.active_for_worker(worker_id)
         if active_jobs:
@@ -630,6 +662,335 @@ class ControlPlaneService:
             target.enabled = False
             target.updated_at = utcnow()
             self.target_repository.save(target)
+
+        # Revocation cannot stop an offline worker that already holds a
+        # schedule. Preserve ownership until a safe handover is confirmed.
+
+    # ------------------------------------------------ worker schedule ownership
+
+    @classmethod
+    def _worker_schedule_timezone(cls) -> str:
+        """Resolve the schedule timezone exactly like the SchedulerService.
+
+        An invalid configured zone is a visible failure, never a silent
+        fallback to a different city: the worker would otherwise evaluate
+        crons in the wrong local time while claiming schedule ownership.
+        """
+        # Imported lazily: the scheduler module imports this service module.
+        from src.control_plane.application.services.scheduler_service import resolve_scheduler_timezone
+
+        name, _ = resolve_scheduler_timezone(os.environ.get(SCHEDULER_TIMEZONE_ENV))
+        return name
+
+    @staticmethod
+    def _is_valid_schedule_cron(expression: Any) -> bool:
+        try:
+            from src.control_plane.application.services.scheduler_service import _parse_cron_expression
+
+            _parse_cron_expression(expression)
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return False
+        return isinstance(expression, str)
+
+    @classmethod
+    def _bounded_schedule_error(cls, message: Any) -> str:
+        text = " ".join(str(message).split())
+        return text[:MAX_WORKER_SCHEDULE_ERROR_TEXT] or "schedule payload build failed"
+
+    def _build_schedule_entries(self, worker_id: str) -> Tuple[List[Dict[str, Any]], Dict[str, str], List[str]]:
+        """Resolve the per-target offline schedule entries one worker owns.
+
+        Entries follow the worker journal contract (version 1): target id,
+        cron, enabled flag and the fully resolved backup payload. Targets
+        whose payload cannot be resolved are left out and recorded as errors:
+        CP scheduling for them is not suppressed, so the failure stays a loud
+        control-plane dispatch failure instead of silent inactivity.
+        """
+        settings = self.get_settings()
+        global_cron = getattr(settings, "global_cron_expression", None) if settings else None
+        scheduled = []
+        for target in self.target_repository.list():
+            if target.worker_id != worker_id or not target.enabled:
+                continue
+            existing_owner = self._schedule_claim_owner(target)
+            if existing_owner is not None and existing_owner != worker_id:
+                logger.warning("Schedule target %s remains owned by worker %s pending safe handover", target.id, existing_owner)
+                continue
+            cron = (target.cron_expression or "").strip() or (global_cron or "").strip()
+            if not cron:
+                continue
+            scheduled.append((target, cron))
+        scheduled.sort(key=lambda item: item[0].id)
+
+        entries: List[Dict[str, Any]] = []
+        errors: Dict[str, str] = {}
+        claimed: List[str] = []
+        previous_claim = (self.worker_schedule_claim_repository.get_by_worker(worker_id)
+                          if self.worker_schedule_claim_repository is not None else None)
+        previous_ids = set(previous_claim.target_ids) if previous_claim is not None else set()
+        for target, cron in scheduled:
+            if target.id not in previous_ids and self.job_repository.has_blocking_backup_for_schedule_handover(target.id):
+                errors[target.id] = self._bounded_schedule_error("active backup prevents schedule handover")
+                continue
+            if not self._is_valid_schedule_cron(cron):
+                errors[target.id] = self._bounded_schedule_error(f"invalid cron expression: {cron}")
+                continue
+            try:
+                payload = self._build_backup_payload(target)
+            except Exception as exc:  # payload build depends on profiles/secrets
+                errors[target.id] = self._bounded_schedule_error(f"schedule payload build failed: {exc}")
+                continue
+            entry = {
+                "target_id": target.id,
+                "cron_expression": cron,
+                "enabled": True,
+                "payload": payload,
+            }
+            try:
+                encoded = json.dumps(entry, separators=(",", ":"), ensure_ascii=True, default=str)
+            except (TypeError, ValueError, RecursionError):
+                errors[target.id] = self._bounded_schedule_error("schedule entry is not serializable")
+                continue
+            if len(encoded.encode("utf-8")) > MAX_SCHEDULE_ENTRY_BYTES:
+                errors[target.id] = self._bounded_schedule_error("schedule entry exceeds the permitted size")
+                continue
+            if len(entries) >= MAX_SCHEDULE_STATE_ENTRIES:
+                errors[target.id] = self._bounded_schedule_error(
+                    "schedule state entry limit reached for this worker"
+                )
+                # Never suppress a target the worker was not given. Preserve a
+                # prior owner until safe handover is available, since that
+                # worker might still be running its durable old configuration.
+                if target.id in previous_ids:
+                    claimed.append(target.id)
+                continue
+            entries.append(entry)
+            claimed.append(target.id)
+        return entries, errors, claimed
+
+    def _refresh_schedule_claim(
+        self, worker_id: str, revision: str, target_ids: List[str], errors: Dict[str, str]
+    ) -> None:
+        claim_repository = self.worker_schedule_claim_repository
+        if claim_repository is None:
+            return
+        existing = claim_repository.get_by_worker(worker_id)
+        if existing is not None:
+            # An unreachable worker may still run its previously received
+            # schedule. Keep those claims until a confirmed handover exists.
+            target_ids = list(dict.fromkeys([*existing.target_ids, *target_ids]))
+        if (
+            existing is not None
+            and existing.revision == revision
+            and existing.target_ids == list(target_ids)
+            and existing.errors == dict(errors)
+        ):
+            return
+        now = utcnow()
+        claim_repository.save(
+            WorkerScheduleClaimRecord(
+                worker_id=worker_id,
+                revision=revision,
+                target_ids=list(target_ids),
+                errors=dict(errors),
+                claimed_at=existing.claimed_at if existing is not None else now,
+                updated_at=now,
+            )
+        )
+
+    def get_worker_schedule_state(self, worker_id: str) -> Dict[str, Any]:
+        with self._schedule_claim_lock:
+            return self._get_worker_schedule_state(worker_id)
+
+    def _get_worker_schedule_state(self, worker_id: str) -> Dict[str, Any]:
+        """Deliver the resolved offline schedule for a worker and claim it.
+
+        Downloading the state transfers schedule ownership for those targets:
+        from now on the worker evaluates the cron offline and the control
+        plane stops dispatching scheduled backups (single-writer invariant;
+        permanent while the worker keeps claiming, matching the worker's
+        durable last configuration).
+        """
+        self._require_worker(worker_id)
+        if self.worker_schedule_claim_repository is None:
+            raise ValueError("worker schedule ownership is unavailable")
+        timezone_name = self._worker_schedule_timezone()
+        entries, errors, claimed = self._build_schedule_entries(worker_id)
+        revision_source = json.dumps(
+            {"timezone": timezone_name, "entries": entries},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str,
+        )
+        revision = hashlib.sha256(revision_source.encode("utf-8")).hexdigest()
+        self._refresh_schedule_claim(worker_id, revision, claimed, errors)
+        if errors:
+            logger.warning(
+                "Worker schedule state for %s includes %d unresolved target(s): %s",
+                worker_id,
+                len(errors),
+                ", ".join(sorted(errors)),
+            )
+        return {
+            "version": WORKER_SCHEDULE_STATE_VERSION,
+            "revision": revision,
+            "generated_at": utcnow().isoformat(),
+            "timezone": timezone_name,
+            "entries": entries,
+        }
+
+    def acknowledge_worker_schedule_state(self, worker_id: str, revision: str) -> Dict[str, Any]:
+        """Release obsolete claims only after the worker persisted this revision."""
+        with self._schedule_claim_lock:
+            state = self._get_worker_schedule_state(worker_id)
+            if not isinstance(revision, str) or revision != state["revision"]:
+                raise ValueError("schedule revision is stale")
+            repository = self.worker_schedule_claim_repository
+            claim = repository.get_by_worker(worker_id) if repository else None
+            if claim is None:
+                raise ValueError("schedule claim does not exist")
+            claim.target_ids = [entry["target_id"] for entry in state["entries"]]
+            claim.updated_at = utcnow()
+            repository.save(claim)
+            return {"acknowledged": True, "revision": revision}
+
+    def release_worker_schedule_claim(self, worker_id: str, target_id: str, confirmation: str) -> Dict[str, Any]:
+        """Release one claim only after an administrator confirms permanent shutdown."""
+        with self._schedule_claim_lock:
+            worker = self._require_worker(worker_id)
+            if worker.status != WorkerStatus.DISABLED:
+                raise ValueError("worker must be revoked before releasing a schedule")
+            if confirmation != "WORKER_STOPPED":
+                raise ValueError("confirmation must be WORKER_STOPPED")
+            repository = self.worker_schedule_claim_repository
+            claim = repository.get_by_worker(worker_id) if repository else None
+            if claim is None or target_id not in claim.target_ids:
+                raise ValueError("target is not owned by this worker")
+            claim.target_ids = [item for item in claim.target_ids if item != target_id]
+            claim.updated_at = utcnow()
+            repository.save(claim)
+            logger.warning("Administrator released schedule for target %s from revoked worker %s after confirming it stopped", target_id, worker_id)
+            return {"worker_id": worker_id, "target_id": target_id, "released": True}
+
+    def schedule_ownership_status(self, worker_id: str) -> Dict[str, Any]:
+        """Failure-visible ownership state: claimed targets and build errors."""
+        claim_repository = self.worker_schedule_claim_repository
+        claim = claim_repository.get_by_worker(worker_id) if claim_repository is not None else None
+        if claim is None:
+            return {"worker_id": worker_id, "claims_schedule": False, "target_ids": [], "errors": {}}
+        return {
+            "worker_id": worker_id,
+            "claims_schedule": bool(claim.target_ids),
+            "revision": claim.revision,
+            "target_ids": list(claim.target_ids),
+            "errors": dict(claim.errors),
+            "claimed_at": claim.claimed_at.isoformat(),
+            "updated_at": claim.updated_at.isoformat(),
+        }
+
+    def _schedule_claim_owner(self, target: BackupTargetRecord) -> Optional[str]:
+        claim_repository = self.worker_schedule_claim_repository
+        if claim_repository is None:
+            return None
+        for claim in claim_repository.list():
+            if target.id in (claim.target_ids or []):
+                return claim.worker_id
+        return None
+
+    # ------------------------------------------------ online reconciliation
+
+    def record_offline_result(self, worker_id: str, record: Any) -> Dict[str, Any]:
+        """Idempotently store one offline scheduled result from a worker.
+
+        Records are keyed on the stable execution identifier the worker
+        minted (``offline:<target>:<slot>``) and become ordinary terminal
+        ``backup.run`` jobs, so they stay visible in the job history, the
+        per-day stats and the failure notifications. Re-delivery of an
+        already stored id is acknowledged as a duplicate without touching
+        the stored record (first write wins).
+        """
+        self._require_worker(worker_id)
+        if not isinstance(record, dict):
+            raise ValueError("offline result must be a JSON object")
+        try:
+            encoded = json.dumps(record, separators=(",", ":"), ensure_ascii=True, default=str)
+        except (TypeError, ValueError, RecursionError, OverflowError):
+            raise ValueError("offline result is not serializable") from None
+        if len(encoded.encode("utf-8")) > MAX_OFFLINE_RESULT_BYTES:
+            raise ValueError(f"offline result exceeds the permitted size ({MAX_OFFLINE_RESULT_BYTES} bytes)")
+
+        record_id = record.get("id")
+        if (
+            not isinstance(record_id, str)
+            or not OFFLINE_RESULT_ID_PATTERN.fullmatch(record_id)
+        ):
+            raise ValueError("offline result id is missing or invalid")
+        reported_worker_id = record.get("worker_id", worker_id)
+        if reported_worker_id != worker_id:
+            raise ValueError("offline result worker identity does not match the authenticated worker")
+        trigger = record.get("trigger") or OFFLINE_SCHEDULE_TRIGGER
+        if trigger != OFFLINE_SCHEDULE_TRIGGER:
+            raise ValueError(f"offline result trigger is not '{OFFLINE_SCHEDULE_TRIGGER}': {trigger}")
+        target_id = record.get("target_id")
+        if not isinstance(target_id, str) or not target_id.strip() or len(target_id) > 128:
+            raise ValueError("offline result target id is missing or invalid")
+        if not record_id.startswith(f"offline:{target_id}:") or record_id == f"offline:{target_id}:":
+            raise ValueError("offline result id does not match its target")
+        target = self.target_repository.get(target_id)
+        if target is None or target.worker_id != worker_id:
+            raise ValueError("offline result target is not assigned to the authenticated worker")
+        raw_status = record.get("status")
+        status = JobStatus.normalize(raw_status) if isinstance(raw_status, str) else ""
+        if status not in (JobStatus.SUCCEEDED, JobStatus.FAILED):
+            raise ValueError(f"offline result status is not terminal: {status or record.get('status')}")
+        executed_at_raw = record.get("executed_at")
+        if not isinstance(executed_at_raw, str):
+            raise ValueError("offline result executed_at is missing or invalid")
+        try:
+            executed_at = datetime.fromisoformat(str(executed_at_raw).replace("Z", "+00:00"))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("offline result executed_at is missing or invalid") from None
+        if executed_at.tzinfo is not None:
+            executed_at = executed_at.astimezone(timezone.utc).replace(tzinfo=None)
+        result_summary = record.get("result_summary") if isinstance(record.get("result_summary"), dict) else {}
+        incoming_log_lines = record.get("log_lines") if isinstance(record.get("log_lines"), list) else []
+
+        existing = self.job_repository.get(record_id)
+        if existing is not None:
+            logger.info(
+                "Offline result %s was already stored; acknowledged as duplicate",
+                record_id,
+            )
+            return {"ok": True, "acknowledged": True, "duplicate": True, "job_id": existing.id}
+
+        placeholder = JobRecord(worker_id=worker_id, command="backup.run", target_id=target_id)
+        bounded_log_lines = self._bounded_job_log_entries(placeholder, incoming_log_lines)[0]
+        job = JobRecord(
+            worker_id=worker_id,
+            command="backup.run",
+            payload={"trigger": OFFLINE_SCHEDULE_TRIGGER},
+            requested_by="worker",
+            target_id=target_id,
+            trigger=OFFLINE_SCHEDULE_TRIGGER,
+            id=record_id,
+            status=status,
+            result_summary=result_summary,
+            log_lines=bounded_log_lines,
+            log_timestamps=None,
+            submitted_at=executed_at,
+            started_at=executed_at,
+            finished_at=executed_at,
+        )
+        saved = self.job_repository.save(job)
+        self._publish_job_event(saved)
+        logger.info(
+            "Offline scheduled result stored: job=%s target=%s worker=%s status=%s",
+            saved.id,
+            saved.target_id,
+            worker_id,
+            saved.status,
+        )
+        if saved.status == JobStatus.FAILED:
+            self._schedule_failed_backup_notifications(saved)
+        return {"ok": True, "acknowledged": True, "duplicate": False, "job_id": saved.id}
 
     def get_worker(self, worker_id: str) -> WorkerRecord:
         return self._worker_view(self._require_worker(worker_id))
@@ -1331,12 +1692,30 @@ class ControlPlaneService:
         trigger: str = "manual",
         backup_mode: Optional[str] = None,
     ) -> JobRecord:
+        with self._schedule_claim_lock:
+            return self._dispatch_backup_for_target_locked(target_id, requested_by, trigger, backup_mode)
+
+    def _dispatch_backup_for_target_locked(
+        self, target_id: str, requested_by: str, trigger: str, backup_mode: Optional[str]
+    ) -> JobRecord:
         target = self._require_target(target_id)
         if (
             not target.enabled
             and str(trigger or "").strip().lower() in self.SCHEDULED_BACKUP_TRIGGERS
         ):
             raise ValueError(f"target '{target_id}' is disabled and cannot be dispatched")
+        if str(trigger or "").strip().lower() in self.SCHEDULED_BACKUP_TRIGGERS:
+            owner = self._schedule_claim_owner(target)
+            if owner:
+                logger.warning(
+                    "Scheduled backup for target %s is owned by worker %s; control-plane dispatching is suppressed",
+                    target.id,
+                    owner,
+                )
+                raise ValueError(
+                    f"scheduled backup for target '{target.id}' is suppressed: the schedule is "
+                    f"owned by worker '{owner}' and executes the cron offline"
+                )
         payload = self._build_backup_payload(target, backup_mode=backup_mode)
         return self.dispatch_job(
             worker_id=target.worker_id,
@@ -1351,12 +1730,7 @@ class ControlPlaneService:
         # Reconcile first so an awaiting-confirmation job that passed its 24h
         # unknown-outcome deadline does not block scheduled backups forever.
         self._reconcile_expired_jobs()
-        return any(
-            job.target_id == target_id
-            and job.command == "backup.run"
-            and JobStatus.normalize(job.status) in (JobStatus.PENDING, JobStatus.IN_PROGRESS)
-            for job in self.job_repository.list()
-        )
+        return self.job_repository.has_active_backup_for_target(target_id)
 
     def has_active_snapshot_sync_for_target(self, target_id: str, worker_id: Optional[str] = None) -> bool:
         self._reconcile_expired_jobs()

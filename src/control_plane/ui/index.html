@@ -3062,7 +3062,6 @@ docker compose up -d
 
     const TARGET_STATS_MODES = ["raw-data", "blobs-per-file"];
     const TARGET_STATS_POLL_INTERVAL_MS = 2000;
-    const TARGET_STATS_POLL_MAX_MS = 90000;
     const TARGET_STATS_FIELD_LABELS = {
       total_size: "Tamaño total",
       total_uncompressed_size: "Tamaño sin comprimir",
@@ -3261,11 +3260,6 @@ docker compose up -d
           request.pollTimer = setInterval(poll, TARGET_STATS_POLL_INTERVAL_MS);
         };
         request.cancelWait = () => settle(reject, new DOMException("Aborted", "AbortError"));
-        request.deadlineTimer = setTimeout(() => {
-          const timeout = new Error("La consulta de estadísticas tardó demasiado.");
-          timeout.code = "target-stats-poll-timeout";
-          settle(reject, timeout);
-        }, TARGET_STATS_POLL_MAX_MS);
         if (!request.jobId) {
           settle(reject, new Error("La respuesta de stats-sync no incluyó un job."));
           return;

@@ -16,6 +16,7 @@ the complete output of a successful exit code. The snapshot JSON parser then
 fails on a half-delivered JSON line while the exit status stays 0.
 """
 
+import json
 import threading
 import unittest
 from unittest.mock import Mock, patch
@@ -81,6 +82,67 @@ class _RaisingSnapshotStream:
         pass
 
 
+_FRAME_SIZE = 16384
+
+
+def _snapshots_json(num_snapshots: int) -> tuple[str, list]:
+    """Compact metadata JSON large enough to span several 16 KiB Docker
+    stream frames, carrying legitimate date/timestamp-looking string values
+    that must survive byte-for-byte (they are restic snapshot data, not log
+    stream timestamps)."""
+    snapshots = [
+        {
+            "id": "abcdef123456789000000000000000000000000000000000000000000000%04d" % index,
+            "short_id": "abcdef1234567890%04d" % index,
+            "time": "2024-05-05T10:00:%02d.123456789Z" % (index % 60),
+            "submitted": "2024-01-01T00:00:00Z",
+            "hostname": "host-%04d" % index,
+            "paths": ["/data/volume-%04d" % index],
+            "tags": ["daily"],
+            "note": "2024-12-31T23:59:59.999999999Z 2025-01-01",
+        }
+        for index in range(num_snapshots)
+    ]
+    return json.dumps(snapshots, separators=(",", ":")), snapshots
+
+
+def _docker_like_snippets(json_text: str, timestamps: bool) -> list:
+    """Docker daemon stream behavior: with ``timestamps=True`` every partial
+    record frame of a large single-line output carries its own RFC3339Nano
+    prefix (the daemon tags each read chunk, not each logical line); with
+    ``timestamps=False`` the raw bytes pass through untouched."""
+    raw = json_text.encode("utf-8")
+    prefix = b"2024-05-05T10:00:00.123456789Z " if timestamps else b""
+    return [
+        prefix + raw[offset : offset + _FRAME_SIZE]
+        for offset in range(0, len(raw), _FRAME_SIZE)
+    ]
+
+
+class _DockerFramingSnapshotContainer:
+    """Fake container whose ``logs`` honours the requested ``timestamps``
+    exactly like the Docker Engine API does, emulating 16 KiB partial frames
+    of a single compact JSON line."""
+
+    def __init__(self, json_text: str):
+        self._json_text = json_text
+        self.stream_calls: list = []
+
+    def wait(self, *args, **kwargs):
+        return {"StatusCode": 0}
+
+    def logs(self, **kwargs):
+        self.stream_calls.append(dict(kwargs))
+        if kwargs.get("stream"):
+            return iter(_docker_like_snippets(self._json_text, bool(kwargs.get("timestamps"))))
+        return "\n".join(
+            snippet for snippet in _docker_like_snippets(self._json_text, False)
+        ).encode("utf-8")
+
+    def remove(self, **kwargs):
+        pass
+
+
 class SnapshotStreamRegressionTests(unittest.TestCase):
     def setUp(self):
         # The execution-log capture integration is out of scope for these
@@ -140,24 +202,62 @@ class SnapshotStreamRegressionTests(unittest.TestCase):
         self.assertEqual(result.get("logs"), _COMPLETE_JSON_LINE)
 
     def test_complete_stream_still_parses_snapshots(self):
-        """Preserved shared behavior: a stream that finishes on its own keeps
-        the streamed result, with timestamps metadata and no forced close."""
-        container = Mock()
-        container.wait.return_value = {"StatusCode": 0}
-        container.logs.return_value = iter(
-            [b'2024-05-05T10:00:00.123456789Z ' + _COMPLETE_JSON_LINE.encode("utf-8")]
-        )
+        """Deliberately timestamp-free metadata: snapshot metadata commands are
+        requested without stream timestamps at the source (Docker tags every
+        partial frame of a large single-line JSON document, which corrupts
+        machine-readable output). The fake honours the request like the real
+        daemon: no prefix arrives, the JSON parses, no timestamp metadata is
+        fabricated, and no forced close happens."""
+        json_text, snapshots = _snapshots_json(1)
+        container = _DockerFramingSnapshotContainer(json_text)
         runtime = self.runtime(container)
 
         result = runtime.list_restic_snapshots("runtime", {"command": "restic snapshots --json"})
 
+        stream_calls = [call for call in container.stream_calls if call.get("stream")]
+        self.assertTrue(stream_calls)
+        self.assertIs(stream_calls[0]["timestamps"], False)
         self.assertTrue(result["success"], result)
-        self.assertEqual(
-            result.get("snapshots"),
-            [{"id": _SNAPSHOT_ID, "short_id": _SNAPSHOT_ID}],
+        self.assertEqual(result.get("snapshots"), snapshots)
+        self.assertNotIn("log_timestamps", result)
+        self.assertEqual(result.get("logs"), json_text)
+
+    def test_framed_partial_records_with_requested_timestamps_never_corrupt_metadata(self):
+        """RED regression: the runtime must not request stream timestamps for
+        snapshot metadata output. Docker tags every 16 KiB partial frame of
+        large single-line JSON, the streamer strips only logical-line-start
+        prefixes, and the embedded intermediate prefixes corrupt the parsed
+        JSON (production: parse failure at offset 65633 with exit 0). The
+        source must therefore request no timestamp injection at all: the JSON
+        stays byte-for-byte, every field is preserved, and no capture alert
+        or timestamp metadata appears."""
+        json_text, snapshots = _snapshots_json(600)
+        self.assertGreaterEqual(len(json_text), 5 * _FRAME_SIZE)
+        container = _DockerFramingSnapshotContainer(json_text)
+        runtime = self.runtime(container)
+
+        result = runtime.list_restic_snapshots(
+            "runtime", {"command": "restic snapshots --json"}
         )
-        self.assertEqual(result.get("log_timestamps"), ["2024-05-05T10:00:00.123456789Z"])
-        self.assertEqual(result.get("logs"), _COMPLETE_JSON_LINE)
+
+        stream_calls = [call for call in container.stream_calls if call.get("stream")]
+        self.assertTrue(stream_calls)
+        # Source-level fix: no timestamp injection is requested for metadata.
+        self.assertIs(stream_calls[0]["timestamps"], False)
+        self.assertTrue(result["success"], result)
+        self.assertNotEqual(
+            result.get("error"),
+            "failed to parse restic snapshots JSON",
+            result,
+        )
+        self.assertEqual(result["status_code"], 0)
+        # Every field of every snapshot survives exactly.
+        self.assertEqual(result.get("snapshots"), snapshots)
+        # The compact JSON document is delivered unmodified, with no injected
+        # RFC3339Nano prefixes anywhere inside it.
+        self.assertEqual(result.get("logs"), json_text)
+        # Deliberately timestamp-free: no fabricated parallel metadata.
+        self.assertNotIn("log_timestamps", result)
 
     def test_broken_stream_still_falls_back_to_complete_logs(self):
         """Preserved shared behavior: a stream that raises mid-read (existing

@@ -864,6 +864,7 @@ class DockerRuntimeAdapter(RuntimePort):
         limit: int,
         output_callback: Callable[[str], None] | None,
         on_activity: Callable[[], None] | None = None,
+        timestamps: bool = True,
     ) -> tuple[Dict[str, Any], threading.Thread]:
         state: Dict[str, Any] = {
             "started": False,
@@ -873,6 +874,11 @@ class DockerRuntimeAdapter(RuntimePort):
             "log_timestamps": [],
             "stream": None,
         }
+        # When timestamps were not requested at the source, the daemon never
+        # prefixes records: skip prefix detection entirely so legitimate
+        # timestamp-looking values inside machine-readable output survive
+        # byte-for-byte.
+        requested_timestamps = bool(timestamps)
 
         def consume() -> None:
             pending = ""
@@ -941,7 +947,7 @@ class DockerRuntimeAdapter(RuntimePort):
                 for part in data.splitlines(keepends=True):
                     terminated = part.endswith(("\n", "\r"))
                     content = part
-                    if at_line_start:
+                    if at_line_start and requested_timestamps:
                         match = timestamp_pattern.match(part)
                         if match:
                             current_line_timestamp = None if multiline_secret else match.group(1)
@@ -991,7 +997,13 @@ class DockerRuntimeAdapter(RuntimePort):
                     at_line_start = True
 
             try:
-                stream = container.logs(stdout=True, stderr=True, timestamps=True, stream=True, follow=True)
+                stream = container.logs(
+                    stdout=True,
+                    stderr=True,
+                    timestamps=timestamps,
+                    stream=True,
+                    follow=True,
+                )
                 state["stream"] = stream
                 state["started"] = True
                 for chunk in self._iter_output_chunks(stream):
@@ -2158,6 +2170,13 @@ class DockerRuntimeAdapter(RuntimePort):
                 output_limit,
                 output_callback,
                 on_activity=watchdog.record_activity,
+                # Snapshot metadata output is machine-readable: Docker tags
+                # every partial record frame of a large single-line JSON
+                # document with an RFC3339Nano prefix, so requesting stream
+                # timestamps corrupts the parsed payload (the strip only sees
+                # logical-line-start prefixes). Prevent the injection at the
+                # source instead of stripping dates from complete JSON.
+                timestamps=not self._is_snapshot_metadata_command(command),
             )
             result, stop_reason = self._wait_for_container(container, watchdog)
             container_exited = stop_reason is None

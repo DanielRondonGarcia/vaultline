@@ -44,6 +44,32 @@ class TargetStatsWaitUiTest(unittest.TestCase):
 
     def _extract(self, pattern, label):
         return _extract(self.source, pattern, label)
+
+    # ------------------------------------------------------------------
+    # Long-running guidance: explicit truth that the calculation may take
+    # minutes and that closing the window does not cancel the background
+    # calculation.
+    # ------------------------------------------------------------------
+
+    def test_long_running_guidance_copy_explains_minutes_and_close_and_return(self):
+        for marker in (
+            "El cálculo de estadísticas puede tardar varios minutos.",
+            "Puedes cerrar esta ventana y volver más tarde",
+            "el cálculo continúa en segundo plano sin cancelarse",
+        ):
+            self.assertIn(marker, self.source)
+
+    def test_refresh_notice_mentions_several_minutes_and_returning_later(self):
+        refresh_block = re.search(
+            r"async function refreshTargetStats\(existingRequest = null\) \{.*?\n    \}",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(refresh_block)
+        self.assertIn("Calculando raw-data y blobs-per-file con Restic", refresh_block.group(0))
+        self.assertIn('label: "Actualizando"', refresh_block.group(0))
+        self.assertIn("puedes cerrar esta ventana y volver más tarde sin cancelar el cálculo", refresh_block.group(0))
+
     # ------------------------------------------------------------------
     # No frontend deadline: the UI observes the existing background job
     # while the modal is open, until a terminal status or a network
@@ -322,3 +348,131 @@ process.stdout.write("terminal failure still is an error");
 '''
         result = _run_node(script)
         self.assertEqual(result.stdout, "terminal failure still is an error")
+
+    # ------------------------------------------------------------------
+    # Notice rendering: real errors keep the alert styling.
+    # ------------------------------------------------------------------
+
+    def test_notice_markup_renders_error_alert_and_loading_status(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        markup = self._extract(
+            r"function targetStatsNoticeMarkup\(notice\) \{.*?\n    \}",
+            "targetStatsNoticeMarkup",
+        )
+        script = r'''
+const escapeHtml = value => String(value);
+''' + markup + r'''
+const error = targetStatsNoticeMarkup({ kind: "error", label: "Error", message: "boom" });
+if (!error.includes('role="alert"')) throw new Error("real failures lost the alert role");
+if (!error.includes('data-state="error"')) throw new Error("real failures lost the error state");
+const loading = targetStatsNoticeMarkup({ kind: "loading", label: "Cargando", message: "m" });
+if (!loading.includes('data-state="loading"')) throw new Error("loading notice state changed unexpectedly");
+process.stdout.write("notice rendering passed");
+'''
+        result = _run_node(script)
+        self.assertEqual(result.stdout, "notice rendering passed")
+
+    # ------------------------------------------------------------------
+    # Closing the modal stops only the local observation; the background
+    # calculation is never cancelled through the API.
+    # ------------------------------------------------------------------
+
+    def test_closing_the_modal_makes_no_backend_call_and_stops_local_observation(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        close = self._extract(
+            r"function closeTargetStatsModal\(\) \{.*?\n    \}",
+            "closeTargetStatsModal",
+        )
+        script = f'''
+let aborts = 0;
+let cancelWaits = 0;
+let focused = false;
+let monitored = 0;
+let closedAtClose = null;
+const stopTargetStatsMonitoring = request => {{ monitored += 1; if (request.pollTimer) request.pollTimer = null; if (request.deadlineTimer) request.deadlineTimer = null; }};
+let targetStatsState = null;
+const apiCalls = [];
+const apiGet = async (...args) => {{ apiCalls.push(args); return {{}}; }};
+const apiPost = async (...args) => {{ apiCalls.push(args); return {{}}; }};
+const apiDelete = async (...args) => {{ apiCalls.push(args); return {{}}; }};
+const document = {{ contains: () => true }};
+''' + close + f'''
+const request = {{
+  targetId: "t-1",
+  controller: {{ signal: {{ aborted: false }}, abort() {{ aborts += 1; }} }},
+  cancelWait() {{ cancelWaits += 1; closedAtClose = targetStatsState && targetStatsState.closed; }},
+  pollTimer: "pending",
+  deadlineTimer: "pending",
+}};
+const overlay = {{
+  classList: {{ remove() {{}} }},
+  innerHTML: "",
+  onclick: null,
+  onkeydown: null,
+}};
+targetStatsState = {{ closed: false, request, overlay, returnFocus: {{ focus() {{ focused = true; }} }} }};
+closeTargetStatsModal();
+if (!closedAtClose) throw new Error("closing did not flag the state as closed");
+if (targetStatsState !== null) throw new Error("closing did not clear the module state");
+if (aborts !== 1) throw new Error("closing did not abort the local wait");
+if (cancelWaits !== 1) throw new Error("closing did not cancel the local wait promise");
+if (monitored !== 1) throw new Error("closing did not stop the local poll monitoring");
+if (request.pollTimer !== null || request.deadlineTimer !== null) throw new Error("closing left local timers alive");
+if (apiCalls.length) throw new Error(`closing made a backend call (would cancel the background job): ${{JSON.stringify(apiCalls)}}`);
+if (!focused) throw new Error("closing did not restore focus");
+process.stdout.write("close passed");
+'''
+        result = _run_node(script)
+        self.assertEqual(result.stdout, "close passed")
+
+    # ------------------------------------------------------------------
+    # Loading state keeps the long-running guidance visible.
+    # ------------------------------------------------------------------
+
+    def test_loading_body_shows_long_running_guidance(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        hint = _extract(self.source, r"const TARGET_STATS_LONG_WAIT_HINT = `.*?`;", "hint")
+        markup = self._extract(
+            r"function targetStatsNoticeMarkup\(notice\) \{.*?\n    \}",
+            "targetStatsNoticeMarkup",
+        )
+        body_fn = self._extract(
+            r"function renderTargetStatsBody\(\) \{.*?\n    \}",
+            "renderTargetStatsBody",
+        )
+        script = f'''
+const TARGET_STATS_MODES = ["raw-data", "blobs-per-file"];
+const escapeHtml = value => String(value);
+const fmtDate = value => "No disponible";
+const normalizeTargetStatsRecord = () => null;
+const renderTargetStatsMode = () => "";
+const targetStatsCanUpdate = () => true;
+''' + hint + "\n" + markup + "\n" + body_fn + f'''
+let bodyEl = {{ ariaBusy: null, innerHTML: "", setAttribute(name, value) {{ if (name === "aria-busy") this.ariaBusy = value; }} }};
+let refreshEl = {{ hidden: true, disabled: true, ariaBusy: null, textContent: "", setAttribute(name, value) {{ if (name === "aria-busy") this.ariaBusy = value; }} }};
+let targetStatsState = {{
+  overlay: {{ querySelector: selector => selector === "#targetStatsBody" ? bodyEl : (selector === "#targetStatsRefresh" ? refreshEl : null) }},
+  loading: true,
+  notice: {{ kind: "loading", label: "Actualizando", message: "Calculando..." }},
+  liveState: "En vivo",
+}};
+renderTargetStatsBody();
+for (const marker of [
+  "puede tardar varios minutos",
+  "cerrar esta ventana y volver más tarde",
+  "continúa en segundo plano sin cancelarse",
+]) {{
+  if (!bodyEl.innerHTML.includes(marker)) throw new Error(`long-running guidance missing: ${{marker}}`);
+}}
+if (bodyEl.ariaBusy !== "true") throw new Error("loading body lost its busy state");
+process.stdout.write("loading guidance passed");
+'''
+        result = _run_node(script)
+        self.assertEqual(result.stdout, "loading guidance passed")
+
+
+if __name__ == "__main__":
+    unittest.main()

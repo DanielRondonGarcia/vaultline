@@ -3075,6 +3075,7 @@ docker compose up -d
       unique_size_percent: "Tamaño único (%)",
     };
     const TARGET_STATS_SIZE_FIELDS = new Set(["total_size", "total_uncompressed_size", "unique_size"]);
+    const TARGET_STATS_LONG_WAIT_HINT = `El cálculo de estadísticas puede tardar varios minutos. Puedes cerrar esta ventana y volver más tarde; el cálculo continúa en segundo plano sin cancelarse.`;
     let targetStatsState = null;
 
     function targetStatsCanUpdate() {
@@ -3163,7 +3164,7 @@ docker compose up -d
       const help = `<div id="targetStatsHelp" class="helper">Consulta primero el registro persistido. El cálculo solo se ejecuta al no existir cache o al elegir Actualizar.</div>`;
       if (current.loading) {
         body.setAttribute("aria-busy", "true");
-        body.innerHTML = `${help}${targetStatsNoticeMarkup(current.notice || { kind: "loading", label: "Cargando", message: "Consultando estadísticas persistidas..." })}<div id="targetStatsLiveState" class="snapshot-status" data-state="loading" role="status" aria-live="polite">${escapeHtml(current.liveState || "Conectando...")}</div><div class="target-stats-skeleton" aria-hidden="true">${[1, 2, 3, 4].map(() => "<div></div>").join("")}</div>`;
+        body.innerHTML = `${help}${targetStatsNoticeMarkup(current.notice || { kind: "loading", label: "Cargando", message: "Consultando estadísticas persistidas..." })}<div class="helper">${escapeHtml(TARGET_STATS_LONG_WAIT_HINT)}</div><div id="targetStatsLiveState" class="snapshot-status" data-state="loading" role="status" aria-live="polite">${escapeHtml(current.liveState || "Conectando...")}</div><div class="target-stats-skeleton" aria-hidden="true">${[1, 2, 3, 4].map(() => "<div></div>").join("")}</div>`;
         return;
       }
       body.setAttribute("aria-busy", "false");
@@ -3351,7 +3352,7 @@ docker compose up -d
       if (!isCurrentTargetStatsRequest(request)) return;
       current.loading = true;
       current.syncing = true;
-      current.notice = { kind: "loading", label: "Actualizando", message: "Calculando raw-data y blobs-per-file con Restic..." };
+      current.notice = { kind: "loading", label: "Actualizando", message: "Calculando raw-data y blobs-per-file con Restic. Esto puede tardar varios minutos; puedes cerrar esta ventana y volver más tarde sin cancelar el cálculo." };
       currentTargetStatsLiveState("Conectando...");
       renderTargetStatsBody();
       try {

@@ -6,6 +6,7 @@ import os
 import posixpath
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -1571,7 +1572,10 @@ class DockerRuntimeAdapter(RuntimePort):
 
         def _write_frame() -> None:
             try:
-                sendall = getattr(stream, "sendall", None)
+                # Docker's Unix HTTP upgrade returns SocketIO opened as 'rb'.
+                # Send through its socket, retaining the wrapper until finally.
+                transport = stream._sock if isinstance(stream, socket.SocketIO) else stream
+                sendall = getattr(transport, "sendall", None)
                 if callable(sendall):
                     sendall(recipe_frame)
                 else:

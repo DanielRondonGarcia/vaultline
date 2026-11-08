@@ -1,6 +1,9 @@
 """Contract tests for the Docker SDK capture stdin handoff."""
 
+import socket
 import unittest
+
+from src.worker_agent.infrastructure.security.execution_log_recipe_stream import encode_recipe_frame
 
 from src.worker_agent.infrastructure.adapters.docker_runtime import DockerRuntimeAdapter
 
@@ -39,6 +42,29 @@ class DockerCaptureSocketContractTests(unittest.TestCase):
         DockerRuntimeAdapter._stream_recipe_frame_to_capture_container(container, frame)
         self.assertEqual({"stdin": 1, "stream": 1}, container.params)
         self.assertEqual(frame, bytes(container.stream.data))
+        self.assertTrue(container.stream.closed)
+
+    def test_read_only_socketio_delivers_recipe_and_closes_wrapper(self):
+        sender, receiver = socket.socketpair()
+        self.addCleanup(sender.close)
+        self.addCleanup(receiver.close)
+        receiver.settimeout(2)
+        reader = sender.makefile("rb")
+        self.addCleanup(reader.close)
+        container = _DockerSdkContainer()
+        container.stream = reader.raw
+        self.assertFalse(container.stream.writable())
+        frame = encode_recipe_frame(["synthetic-secret"])
+
+        DockerRuntimeAdapter._stream_recipe_frame_to_capture_container(container, frame)
+
+        received = bytearray()
+        while len(received) < len(frame):
+            chunk = receiver.recv(len(frame) - len(received))
+            self.assertTrue(chunk, "socket closed before the complete frame arrived")
+            received.extend(chunk)
+        self.assertEqual(frame, bytes(received))
+        self.assertEqual({"stdin": 1, "stream": 1}, container.params)
         self.assertTrue(container.stream.closed)
 
     def test_socket_with_sendall_receives_complete_frame(self):

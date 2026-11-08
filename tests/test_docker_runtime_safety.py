@@ -2833,9 +2833,28 @@ class DockerExecutionLogCaptureTests(unittest.TestCase):
         container.remove.assert_called_once_with(force=True)
 
 
+def _metadata_snapshots_json(num_snapshots: int) -> bytes:
+    """Compact metadata JSON carrying legitimate timestamp-looking values."""
+    return json.dumps(
+        [
+            {
+                "id": "abcdef123456789000000000000000000000000000000000000000000000%03d" % index,
+                "short_id": "abcdef123456789%03d" % index,
+                "time": "2024-05-05T10:00:%02d.123456789Z" % (index % 60),
+                "hostname": "host-%03d" % index,
+                "paths": ["/data/volume-%03d" % index],
+            }
+            for index in range(num_snapshots)
+        ],
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 class DockerLogTimestampCaptureTests(unittest.TestCase):
     """S2/T2: Docker streaming lines expose real source timestamps as parallel
-    metadata; prefixes are stripped from the text contract and never fabricated."""
+    metadata; prefixes are stripped from the text contract and never fabricated.
+    Snapshot metadata output is deliberately timestamp-free: its timestamps are
+    requested away at the source because the daemon tags every partial frame."""
 
     def setUp(self):
         capture = patch.object(DockerRuntimeAdapter, "_start_execution_log_capture", return_value=None)
@@ -2912,18 +2931,33 @@ class DockerLogTimestampCaptureTests(unittest.TestCase):
         self.assertEqual(result["log_timestamps"], ["2024-05-05T10:00:00Z"])
 
     def test_timestamp_capture_keeps_restic_json_parsing_working(self):
-        container = self.streaming_container(
-            [b'2024-05-05T10:00:00Z [{"id": "abcdef1234567890", "short_id": "abcdef1234567890"}]\n']
-        )
+        """Deliberately timestamp-free metadata: snapshot metadata JSON is
+        machine-readable, so the runtime requests the stream without
+        timestamps at the source (Docker tags every partial frame of a large
+        single-line document). The fake honours the request exactly like the
+        real daemon: JSON parses and no timestamp metadata is fabricated."""
+        snapshots = json.loads(_metadata_snapshots_json(40))
+        json_text = _metadata_snapshots_json(40)
+        container = Mock()
+        container.wait.return_value = {"StatusCode": 0}
+
+        def framing_logs(**kwargs):
+            prefix = b"2024-05-05T10:00:00.123456789Z " if kwargs.get("timestamps") else b""
+            if kwargs.get("stream"):
+                return iter([prefix + json_text])
+            return prefix + json_text
+
+        container.logs.side_effect = framing_logs
         runtime = self.runtime(container)
 
         result = runtime.list_restic_snapshots("runtime", {"command": "restic snapshots --json"})
 
+        stream_call = container.logs.call_args_list[0]
+        self.assertIs(stream_call.kwargs["timestamps"], False)
         self.assertTrue(result["success"], result)
-        self.assertEqual(
-            result["snapshots"],
-            [{"id": "abcdef1234567890", "short_id": "abcdef1234567890"}],
-        )
+        self.assertEqual(result["snapshots"], snapshots)
+        self.assertNotIn("log_timestamps", result)
+        self.assertEqual(result["logs"], json_text.decode("utf-8"))
 
     def test_docker_streaming_emits_line_aligned_callback_metadata(self):
         container = self.streaming_container([

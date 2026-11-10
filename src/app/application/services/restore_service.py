@@ -202,7 +202,11 @@ class RestoreService:
             f"Select restore source: {candidate.source}",
             f"Target path: {self.restore_config.target_path}",
             f"Restore layout: {self.restore_config.layout}",
-            "Replace target contents before restore (no merge)",
+            (
+                "Replace target contents before restore (no merge)"
+                if self.restore_config.force_overwrite
+                else "Preserve existing target contents; restore only missing files"
+            ),
             f"Restore strategy: {candidate.strategy}",
         ]
         if (self.restore_config.layout or "auto") in ("auto", "backup-dir"):
@@ -273,13 +277,6 @@ class RestoreService:
         if self._is_native_restore() and self.restore_config.stop_containers:
             return self._failure("native restore must not stop containers", plan.planned_actions, category="unsupported_native_stop_containers")
 
-        if not self.restore_config.force_overwrite:
-            return self._failure(
-                "Actual restore replaces target contents and requires RESTORE_FORCE_OVERWRITE=true. "
-                "Run with RESTORE_DRY_RUN=true to preview or set force only after verifying the target.",
-                plan.planned_actions
-            )
-
         policy = self._restore_policy
         capability = self._capability_gate(policy)
         if capability.get("state") not in {"ready", "not_requested"}:
@@ -292,7 +289,13 @@ class RestoreService:
             )
 
         started_at = time.time()
-        logger.warning("FORCE OVERWRITE enabled: target contents will be replaced before restore")
+        if self.restore_config.force_overwrite:
+            logger.warning("FORCE OVERWRITE enabled: target contents will be replaced before restore")
+        else:
+            logger.info(
+                "Preserve restore enabled: existing files, directories, and metadata are kept; "
+                "only missing snapshot items are restored"
+            )
         candidate = RestoreCandidate(plan.source or "", self.restore_config.backup_strategy)
         stopped_containers: List[str] = []
         downloaded_path: Optional[str] = None
@@ -344,7 +347,10 @@ class RestoreService:
         if restart_error:
             result.category = "restart_failed"
         if not hasattr(result, "destructive_state"):
-            result.destructive_state = "unknown" if not result.success else "complete"
+            if not result.success:
+                result.destructive_state = "unknown"
+            else:
+                result.destructive_state = "none" if not self.restore_config.force_overwrite else "complete"
         result.partial = result.destructive_state in {"partial", "unknown"}
         if not hasattr(result, "normalization"):
             result.normalization = {"state": "unknown" if not result.success else "preserved", "changed": False, "unsupported_metadata": []}
@@ -354,7 +360,7 @@ class RestoreService:
         result.source = plan.source
         result.target_path = self.restore_config.target_path
         result.dry_run = False
-        result.force_overwrite = True
+        result.force_overwrite = bool(self.restore_config.force_overwrite)
         result.affected_containers = plan.affected_containers
         result.planned_actions = (plan.planned_actions or []) + (result.planned_actions or [])
         for action in result.planned_actions or []:

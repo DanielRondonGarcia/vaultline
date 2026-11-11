@@ -5233,8 +5233,17 @@ docker compose up -d
       invalidateSnapshotRequest(false);
       const overlay = state.overlay;
       const isNativeTarget = String(state.target.runtime_type || "docker").toLowerCase() === "native";
-      const nativeRestoreDestination = isNativeTarget
-        ? `<fieldset class="restore-snapshot-group"><legend>Destino en el host</legend><div class="field"><label for="rsRestoreTargetPath">Ruta destino</label><input id="rsRestoreTargetPath" name="restore_target_path" autocomplete="off" spellcheck="false" translate="no" placeholder="/restore/app o C:\\Restore\\app" required /><div class="helper">Obligatorio para targets nativos. Puede coincidir con una ruta origen; el reemplazo exige confirmación explícita y la opción de reemplazar archivos existentes.</div></div></fieldset>`
+      const configuredNativeSources = isNativeTarget && Array.isArray(state.target.filesystem_paths)
+        ? state.target.filesystem_paths.filter(path => typeof path === "string" && path.trim()).map(path => path.trim())
+        : [];
+      const nativeSources = configuredNativeSources.filter(path => !path.replace(/\\/g, "/").startsWith("//"));
+      const nativeSourceLimitation = nativeSources.length !== configuredNativeSources.length
+        ? "La restauración directa en origen no está disponible para rutas UNC; puedes usar otro destino."
+        : "";
+      const nativeOriginalOptions = nativeSources.length > 1
+        ? `<option value="">Elige la ruta original…</option>${nativeSources.map(path => `<option value="${escapeHtml(path)}" translate="no">${escapeHtml(path)}</option>`).join("")}`
+        : nativeSources.length ? `<option value="${escapeHtml(nativeSources[0])}" translate="no">${escapeHtml(nativeSources[0])}</option>` : "";
+      const nativeRestoreDestination = isNativeTarget ? `<fieldset class="restore-snapshot-group restore-destination-group"><legend>Destino en el host</legend><div class="field"><label for="rsRestoreDestination">Ruta de restauración</label><select id="rsRestoreDestination" name="restore_destination" autocomplete="off"><option value="custom" selected>Otra ruta (restaurar en una carpeta nueva)</option>${nativeSources.length ? `<option value="original">Restaurar en la ruta original</option>` : ""}</select><div class="helper">Por defecto se restaura en una carpeta distinta para revisar el resultado. ${nativeSourceLimitation} ${nativeSources.length > 1 ? "Hay varias rutas configuradas en este target; elige cuál corresponde a este snapshot." : "También puedes restaurar directo sobre una de las rutas originales configuradas."}</div></div>${nativeSources.length ? `<div class="field" id="rsRestoreOriginalGroup" hidden><label for="rsRestoreOriginalPath">Ruta original configurada</label><select id="rsRestoreOriginalPath" autocomplete="off" translate="no">${nativeOriginalOptions}</select><div class="helper">El valor se envía exactamente como está configurado en el target.</div></div>` : ""}<div class="field" id="rsRestoreCustomGroup"><label for="rsRestoreTargetPath">Ruta destino</label><input id="rsRestoreTargetPath" name="restore_target_path" autocomplete="off" spellcheck="false" translate="no" placeholder="/restore/app o C:\\Restore\\app" required /><div class="helper">Restaurar sobre la ruta original solo exige confirmación si eliges reemplazar archivos existentes.</div></div></fieldset>`
         : "";
       const restoreServiceControls = isNativeTarget ? "" : `
                <fieldset class="restore-snapshot-group">
@@ -5278,9 +5287,9 @@ docker compose up -d
             <div class="restore-snap-info" aria-label="Resumen del snapshot"><div class="field-row"><div class="field"><div class="field-label">Target</div><div class="info-value">${escapeHtml(state.target.name)}</div></div><div class="field"><div class="field-label">Snapshot</div><div class="info-value mono" translate="no">${escapeHtml(snapshotId)}</div></div></div>${dateStr ? `<div class="field"><div class="field-label">Fecha del snapshot</div><div class="info-value">${escapeHtml(dateStr)}</div></div>` : ""}</div>
             <form id="rsForm" class="restore-snapshot-form">
               ${nativeRestoreDestination}
-              <fieldset class="restore-snapshot-group restore-destructive-group">
+              <fieldset class="restore-snapshot-group restore-destructive-group" id="rsOverwriteGroup">
                 <legend>Archivos existentes</legend>
-                <div class="field"><label for="rsOverwrite">Durante la restauración</label><select id="rsOverwrite" name="restore_overwrite" autocomplete="off"><option value="false">Conservar archivos existentes</option><option value="true">Reemplazar archivos existentes</option></select><div class="helper">Reemplazar puede eliminar cambios hechos después del snapshot.</div></div>
+                <div class="field"><label for="rsOverwrite">Durante la restauración</label><select id="rsOverwrite" name="restore_overwrite" autocomplete="off"><option value="false" selected>Conservar archivos existentes</option><option value="true">⚠ Reemplazar archivos existentes</option></select><div class="helper">Con «Conservar» se restauran solo los archivos que faltan; no se borra ni se sobrescribe nada y no exige confirmación destructiva.</div><div id="rsRestoreWarning" class="restore-warning restore-warning-destructive" role="alert" hidden><strong>Acción destructiva:</strong> el reemplazo borra todo el contenido del destino antes de restaurar y puede eliminar archivos que no están en el snapshot, incluso si se crearon antes del snapshot. Verifica el target antes de continuar.</div></div>
               </fieldset>
               ${restoreServiceControls}
               <fieldset class="restore-snapshot-group restore-ownership-group">
@@ -5289,9 +5298,8 @@ docker compose up -d
                 <label class="restore-choice" for="rsOwnershipMap"><input id="rsOwnershipMap" name="restore_ownership_mode" type="radio" value="map" aria-controls="${ownershipEditorId}" aria-expanded="false" /><span><strong>Aplicar permisos manuales</strong><small>Usa valores UID:GID numéricos definidos por ti. No se infieren ni se copian desde el backup.</small></span></label>
                 ${mappingEditor}
               </fieldset>
-              <div id="rsOwnershipStatus" class="snapshot-status restore-snapshot-status" data-state="blocked" role="status" aria-live="polite" aria-atomic="true" tabindex="-1">Para continuar, valida la configuración y confirma que aceptas reemplazar los datos.</div>
-              <label class="restore-snapshot-confirmation" for="rsOwnershipConfirm"><input id="rsOwnershipConfirm" name="restore_confirmation" type="checkbox" aria-describedby="rsOwnershipStatus rsRestoreWarning" /><span>Confirmo que revisé las opciones y acepto reemplazar los datos del target.</span></label>
-              <div id="rsRestoreWarning" class="restore-warning" role="alert"><strong>Acción destructiva:</strong> esta restauración reemplaza los datos del target y puede sobrescribir archivos existentes. Verifica el target antes de continuar.</div>
+              <div id="rsOwnershipStatus" class="snapshot-status restore-snapshot-status" data-state="blocked" role="status" aria-live="polite" aria-atomic="true" tabindex="-1">Para continuar, valida la configuración y completa la confirmación requerida.</div>
+              <label class="restore-snapshot-confirmation" for="rsOwnershipConfirm" id="rsOwnershipConfirmRow"><input id="rsOwnershipConfirm" name="restore_confirmation" type="checkbox" aria-describedby="rsOwnershipStatus rsRestoreWarning" /><span id="rsOwnershipConfirmText">Confirmo que revisé las opciones y acepto reemplazar los datos del target.</span></label>
             </form>
           </div>
            <div class="modal-footer"><button type="button" class="btn" id="rsCancel">Cancelar</button><button type="submit" form="rsForm" class="btn primary" id="rsConfirm" aria-describedby="rsOwnershipStatus rsRestoreWarning" disabled>Restaurar snapshot</button></div>
@@ -5302,6 +5310,16 @@ docker compose up -d
        const ownershipStatus = overlay.querySelector("#rsOwnershipStatus");
        const confirmation = overlay.querySelector("#rsOwnershipConfirm");
        const restoreButton = overlay.querySelector("#rsConfirm");
+       const overwriteSelect = overlay.querySelector("#rsOverwrite");
+       const overwriteGroup = overlay.querySelector("#rsOverwriteGroup");
+       const restoreWarning = overlay.querySelector("#rsRestoreWarning");
+       const confirmationRow = overlay.querySelector("#rsOwnershipConfirmRow");
+       const confirmationText = overlay.querySelector("#rsOwnershipConfirmText");
+       const destinationSelect = overlay.querySelector("#rsRestoreDestination");
+       const originalPathSelect = overlay.querySelector("#rsRestoreOriginalPath");
+       const originalDestinationGroup = overlay.querySelector("#rsRestoreOriginalGroup");
+       const customDestinationGroup = overlay.querySelector("#rsRestoreCustomGroup");
+       const restoreTargetInput = overlay.querySelector("#rsRestoreTargetPath");
       const selectedOwnershipMode = () => modeInputs.find(input => input.checked)?.value || "preserve";
       const clearMappingErrors = () => mappingInputs.forEach(input => {
         input.removeAttribute("aria-invalid");
@@ -5353,8 +5371,31 @@ docker compose up -d
          ownershipStatus.dataset.state = stateName;
          ownershipStatus.textContent = message;
        };
+       const overwriteDestructive = () => overwriteSelect?.value === "true";
+       const confirmationRequired = () => overwriteDestructive() || selectedOwnershipMode() === "map";
+       const confirmationLabelText = () => {
+         if (overwriteDestructive() && selectedOwnershipMode() === "map") return "Confirmo que acepto vaciar el destino, reemplazar los archivos existentes (se puede eliminar lo que no está en el snapshot) y aplicar los permisos manuales solo a los archivos que se restauren.";
+         if (overwriteDestructive()) return "Confirmo que acepto vaciar el destino y reemplazar los archivos existentes del target, incluso los que no están en el snapshot.";
+         return "Confirmo que revisé los valores UID:GID y acepto aplicar los permisos manuales solo a los archivos que se restauren; los archivos existentes conservados no cambian de permisos.";
+       };
+       const syncDestructiveState = () => {
+         if (overwriteGroup) overwriteGroup.dataset.destructive = String(overwriteDestructive());
+         if (restoreWarning) restoreWarning.hidden = !overwriteDestructive();
+         if (confirmationRow) confirmationRow.hidden = !confirmationRequired();
+         if (confirmation) confirmation.setAttribute("aria-required", String(confirmationRequired()));
+         if (confirmationText) confirmationText.textContent = confirmationLabelText();
+       };
+       const syncRestoreDestination = () => {
+         if (!destinationSelect) return;
+         const useOriginal = destinationSelect.value === "original";
+         if (originalDestinationGroup) originalDestinationGroup.hidden = !useOriginal;
+         if (customDestinationGroup) customDestinationGroup.hidden = useOriginal;
+         if (restoreTargetInput) restoreTargetInput.required = !useOriginal;
+       };
+       const resetStoredConsent = () => { if (confirmation) confirmation.checked = false; };
+       const resetConsentAndResync = () => { resetStoredConsent(); syncDestructiveState(); preview(); };
        const syncRestoreButton = policy => {
-         const ready = Boolean(policy) && Boolean(confirmation?.checked);
+         const ready = Boolean(policy) && (!confirmationRequired() || Boolean(confirmation?.checked));
          if (restoreButton) restoreButton.disabled = !ready;
          return ready;
        };
@@ -5367,7 +5408,7 @@ docker compose up -d
              ? policy.mode === "preserve"
                ? "Configuración válida. Se conservarán los permisos del backup."
                : `Configuración válida. Se aplicarán permisos manuales a ${mappingCount === 1 ? "1 volumen" : `${mappingCount} volúmenes`}.`
-             : "Para continuar, valida la configuración y confirma que aceptas reemplazar los datos.");
+             : "Para continuar, valida la configuración y completa la confirmación requerida.");
            return policy;
          } catch (error) {
            syncRestoreButton(null);
@@ -5400,12 +5441,18 @@ docker compose up -d
         if (advanced) advanced.open = isManual;
         const mapInput = document.getElementById("rsOwnershipMap");
         if (mapInput) mapInput.setAttribute("aria-expanded", String(isManual));
+        resetStoredConsent();
+        syncDestructiveState();
         syncAdvancedOwnershipMode();
         preview();
       };
        modeInputs.forEach(input => input.addEventListener("change", updateOwnershipEditor));
-       mappingInputs.forEach(input => input.addEventListener("input", preview));
-       if (advancedInput) advancedInput.addEventListener("input", preview);
+       overwriteSelect?.addEventListener("change", resetConsentAndResync);
+       destinationSelect?.addEventListener("change", () => { syncRestoreDestination(); resetConsentAndResync(); });
+       originalPathSelect?.addEventListener("change", resetConsentAndResync);
+       restoreTargetInput?.addEventListener("input", resetConsentAndResync);
+       mappingInputs.forEach(input => input.addEventListener("input", resetConsentAndResync));
+       if (advancedInput) advancedInput.addEventListener("input", resetConsentAndResync);
        if (confirmation) confirmation.addEventListener("change", preview);
       const backToExplorer = () => renderSnapshotModalFrame();
       document.getElementById("rsClose").addEventListener("click", backToExplorer);
@@ -5420,24 +5467,36 @@ docker compose up -d
           return;
         }
          confirmation.removeAttribute("aria-invalid");
-         if (!confirmation.checked) {
+         if (confirmationRequired() && !confirmation.checked) {
            confirmation.setAttribute("aria-invalid", "true");
            syncRestoreButton(policy);
-           setOwnershipStatus("blocked", "La configuración es válida, pero debes confirmar que aceptas reemplazar los datos para continuar.");
+           setOwnershipStatus("blocked", "La configuración es válida, pero debes marcar la casilla de confirmación para continuar.");
            confirmation.focus();
            return;
          }
          if (!restoreButton || restoreButton.disabled) {
-           setOwnershipStatus("blocked", "Valida la configuración y confirma que aceptas reemplazar los datos para continuar.");
+           setOwnershipStatus("blocked", "Valida la configuración y completa la confirmación requerida para continuar.");
            return;
          }
-        policy.confirmation = "confirmed";
-        const forceOverwrite = document.getElementById("rsOverwrite").value === "true";
+        if (confirmation.checked) policy.confirmation = "confirmed";
+        const forceOverwrite = overwriteSelect?.value === "true";
          const stopContainers = !isNativeTarget && document.getElementById("rsMode")?.value === "cold";
-        const restoreTargetPath = document.getElementById("rsRestoreTargetPath")?.value.trim();
+        let restoreTargetPath = "";
+        if (isNativeTarget) {
+          if (destinationSelect?.value === "original") {
+            restoreTargetPath = originalPathSelect ? originalPathSelect.value : "";
+            if (!restoreTargetPath) {
+              setOwnershipStatus("blocked", "Elige la ruta original configurada que corresponde a este snapshot.");
+              if (originalPathSelect) originalPathSelect.focus();
+              return;
+            }
+          } else {
+            restoreTargetPath = restoreTargetInput ? restoreTargetInput.value.trim() : "";
+          }
+        }
         if (isNativeTarget && !restoreTargetPath) {
           setOwnershipStatus("blocked", "Escribe una ruta destino del host para restaurar este target nativo.");
-          document.getElementById("rsRestoreTargetPath")?.focus();
+          restoreTargetInput?.focus();
           return;
         }
         const request = {
@@ -5458,6 +5517,7 @@ docker compose up -d
           setOwnershipStatus("blocked", `No se pudo iniciar la restauración: ${error.message}`);
         });
       });
+      syncRestoreDestination();
       updateOwnershipEditor();
       const cancel = document.getElementById("rsCancel");
       if (cancel && document.contains(cancel)) cancel.focus();

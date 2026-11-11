@@ -1,6 +1,11 @@
 """Policy-level coverage for portable restore ownership."""
 
+import os
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from src.app.application.ports.ports import RestoreOwnershipPort
 from src.app.domain.models import RestoreConfig, RestoreResult
@@ -12,6 +17,7 @@ from src.app.domain.restore_ownership import (
     resolve_restore_ownership,
     stable_compose_volume_key,
 )
+from src.app.infrastructure.adapters.backup_strategy import OwnershipNormalizationError, normalize_ownership
 
 
 DATA_KEY = stable_compose_volume_key("app", "data")
@@ -119,6 +125,90 @@ class RestoreOwnershipTests(unittest.TestCase):
         self.assertFalse(hasattr(RestoreResult(timestamp=None, duration=0, success=True), "restore_ownership"))
         self.assertTrue(hasattr(RestoreOwnershipPort, "resolve_policy"))
         self.assertFalse(hasattr(RestoreOwnershipPort, "plan"))
+
+
+class RestoreOwnershipPreserveMappingTests(unittest.TestCase):
+    """S5: in preserve mode the confirmed ownership mapping may only normalize
+    entries the restore created; preserved files and directories must never be
+    chowned recursively."""
+
+    def _workspace(self):
+        workspace = Path(tempfile.mkdtemp(prefix="restore-ownership-preserve-"))
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        target = workspace / "target"
+        target.mkdir()
+        return workspace, target
+
+    @staticmethod
+    def _map_policy():
+        return RestoreOwnershipPolicy.from_dict(
+            {"schema_version": 1, "mode": "map", "mappings": {DATA_KEY: "1000:1000"}, "confirmation": "confirmed"}
+        )
+
+    def test_preserve_mapping_normalizes_only_created_paths(self):
+        _workspace, target = self._workspace()
+        preserved = target / "preserved.txt"
+        preserved.write_text("keep", encoding="utf-8")
+        created = target / "created.txt"
+        created.write_text("restore", encoding="utf-8")
+        chowns = []
+
+        with patch("os.lchown", lambda path, uid, gid: chowns.append((str(path), uid, gid)), create=True):
+            report = normalize_ownership(
+                RestoreConfig(target_path=str(target)), self._map_policy(), created_paths=[created]
+            )
+
+        self.assertEqual(report["state"], "complete")
+        self.assertEqual(report["changed_count"], 1)
+        self.assertEqual(chowns, [(str(created), 1000, 1000)])
+
+    def test_preserve_mapping_without_created_paths_preserves_everything(self):
+        _workspace, target = self._workspace()
+        existing = target / "preserved.txt"
+        existing.write_text("keep", encoding="utf-8")
+        chowns = []
+
+        with patch("os.lchown", lambda path, uid, gid: chowns.append((str(path), uid, gid)), create=True):
+            report = normalize_ownership(
+                RestoreConfig(target_path=str(target)), self._map_policy(), created_paths=[]
+            )
+
+        self.assertEqual(report["state"], "preserved")
+        self.assertEqual(chowns, [])
+
+    def test_preserve_mapping_fails_closed_for_restored_paths_outside_scopes(self):
+        workspace, target = self._workspace()
+        outside = workspace / "elsewhere"
+        outside.mkdir()
+        created_outside = outside / "created.txt"
+        created_outside.write_text("restore", encoding="utf-8")
+        chowns = []
+
+        with patch("os.lchown", lambda path, uid, gid: chowns.append((str(path), uid, gid)), create=True):
+            with self.assertRaises(OwnershipNormalizationError) as raised:
+                normalize_ownership(
+                    RestoreConfig(target_path=str(target)), self._map_policy(), created_paths=[created_outside]
+                )
+
+        self.assertEqual(raised.exception.report["category"], "unknown_volume_scope")
+        self.assertEqual(chowns, [])
+
+    def test_preserve_mapping_never_chowns_a_created_symlink(self):
+        _workspace, target = self._workspace()
+        created = target / "created-link"
+        try:
+            os.symlink("preserved.txt", created)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable in this environment")
+        chowns = []
+
+        with patch("os.lchown", lambda path, uid, gid: chowns.append((str(path), uid, gid)), create=True):
+            report = normalize_ownership(
+                RestoreConfig(target_path=str(target)), self._map_policy(), created_paths=[created]
+            )
+
+        self.assertEqual(chowns, [])
+        self.assertFalse(report["changed"])
 
 
 if __name__ == "__main__":

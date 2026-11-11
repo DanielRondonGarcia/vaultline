@@ -834,6 +834,13 @@ details.form-section[open] > .form-body { border-top: 1px solid var(--border); p
 .restore-snap-info .info-value { font-size: 14px; font-weight: 600; margin-top: 2px; }
 .restore-snap-info .info-value.mono { font-family: var(--font-mono, monospace); font-size: 13px; }
 .restore-warning { padding: 12px 16px; background: #fef3c7; border: 1px solid #fcd34d; border-radius: var(--radius); color: #92400e; font-size: 13px; margin-top: 8px; }
+.restore-warning-destructive { background: color-mix(in srgb, var(--destructive) 10%, var(--card)); border-color: color-mix(in srgb, var(--destructive) 45%, var(--border)); color: var(--destructive); }
+.restore-snapshot-modal #rsRestoreWarning[hidden], .restore-snapshot-modal #rsOwnershipConfirmRow[hidden], .restore-snapshot-modal #rsRestoreOriginalGroup[hidden], .restore-snapshot-modal #rsRestoreCustomGroup[hidden] { display: none; }
+.restore-destructive-group[data-destructive="true"] { padding-bottom: 4px; border-left: 3px solid var(--destructive); padding-left: 10px; }
+.restore-destructive-group[data-destructive="true"] legend { color: var(--destructive); }
+.restore-destructive-group[data-destructive="true"] #rsOverwrite { border-color: color-mix(in srgb, var(--destructive) 60%, var(--border)); background: color-mix(in srgb, var(--destructive) 8%, var(--background)); }
+.restore-destination-group .field { min-width: 0; }
+.restore-destination-group select { width: 100%; }
 
 .restore-snapshot-modal { max-width: 560px; max-height: min(760px, calc(100vh - 24px)); overflow: hidden; }
 .restore-snapshot-modal .modal-body { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px 20px; gap: 12px; }

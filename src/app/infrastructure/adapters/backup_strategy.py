@@ -2,6 +2,7 @@ import subprocess
 import os
 import sys
 import json
+import errno
 import logging
 import re
 import shutil
@@ -71,6 +72,15 @@ class OwnershipNormalizationError(RuntimeError):
         super().__init__(message)
 
 
+class NativeSourceSelectionError(ValueError):
+    """Raised when the exact configured native source cannot be restored
+    through a validated restic snapshot subtree; fail closed before mutation."""
+
+    def __init__(self, message: str, category: str):
+        super().__init__(message)
+        self.category = category
+
+
 class ReadOnlyRestoreTargetError(ValueError):
     category = "readonly_target"
 
@@ -130,10 +140,38 @@ def _apply_chown(target_path: str, chown: str) -> dict[str, Any]:
     return report
 
 
-def normalize_ownership(config: RestoreConfig, policy: RestoreOwnershipPolicy) -> dict[str, Any]:
+def normalize_ownership(config: RestoreConfig, policy: RestoreOwnershipPolicy, created_paths: Optional[list[Path]] = None) -> dict[str, Any]:
     base = {"changed_count": 0, "changed": False, "unsupported_metadata": list(UNSUPPORTED_METADATA)}
     if policy.mode != "map" or (not policy.mappings and not policy.default_mapping):
         return {**base, "state": "preserved", "category": "preserved"}
+    if created_paths is not None:
+        # Preserve mode: the mapping may only normalize ownership of entries the
+        # restore just created; preserved files and directories are never chowned.
+        if not created_paths:
+            return {**base, "state": "preserved", "category": "preserved"}
+        targets = _normalization_targets(config, policy)
+        if not targets:
+            raise OwnershipNormalizationError(
+                "No stable target scope is available for ownership mapping of restored files",
+                {**base, "state": "failed", "category": "unknown_volume_scope"},
+            )
+        changed_count = 0
+        for created in created_paths:
+            if Path(created).is_symlink():
+                continue
+            match = next(
+                ((scope_path, mapping) for scope_path, mapping, _key in targets if _path_is_within(str(created), scope_path)),
+                None,
+            )
+            if match is None:
+                raise OwnershipNormalizationError(
+                    f"Restored path {created} is outside the mapped ownership scopes",
+                    {**base, "state": "failed", "category": "unknown_volume_scope", "failed_path": str(created)},
+                )
+            report = _apply_chown(str(created), match[1])
+            changed_count += report["changed_count"]
+        base["changed_count"] = changed_count
+        return {**base, "state": "complete", "category": "ok", "changed": bool(changed_count)}
     targets = _normalization_targets(config, policy)
     if not targets:
         raise OwnershipNormalizationError("No stable target scope is available for ownership mapping", {**base, "state": "failed", "category": "unknown_volume_scope"})
@@ -208,6 +246,146 @@ def _copy_directory_contents(source_dir: Path, target_dir: Path) -> None:
     for item in source_dir.iterdir():
         _replace_path(item, target_dir / item.name)
 
+_PRESERVE_ROOT_PATTERN = re.compile(r"^[A-Za-z]:\\\\?$")
+
+
+def _ensure_safe_preserve_target(target_dir: Path) -> None:
+    """Guard for the preserve restore target: never a filesystem or drive root,
+    never a symlink (existing or broken), and only a directory when it exists.
+    Preserve mode never clears, so this guard must reject before any write."""
+    absolute = os.path.abspath(str(target_dir))
+    if absolute == os.path.abspath(os.sep) or _PRESERVE_ROOT_PATTERN.fullmatch(absolute):
+        raise ValueError("Refusing to restore into a filesystem root")
+    if os.path.lexists(absolute):
+        target_stat = os.lstat(absolute)
+        if stat.S_ISLNK(target_stat.st_mode):
+            raise ValueError(f"Refusing to restore through a symlink target: {target_dir}")
+        if not stat.S_ISDIR(target_stat.st_mode):
+            raise ValueError(f"Preserve restore target must be a directory: {target_dir}")
+
+
+def _copy_missing_file_exclusively(source: Path, destination: Path) -> int:
+    """Create the destination exclusively (O_CREAT | O_EXCL, with O_NOFOLLOW where
+    supported); an existing file, symlink, or competitor-created entry is left
+    untouched and reported as preserved. Copies content and restores the source's
+    timestamps and permission bits for the created entry only. Returns 1 when the
+    file was created, 0 when an existing entry won the race."""
+    if os.name == "nt":
+        # os.O_NOFOLLOW is unavailable on Windows; lstat narrows the broken-symlink
+        # window, and O_EXCL below covers plain existing entries.
+        try:
+            os.lstat(str(destination))
+            return 0
+        except FileNotFoundError:
+            pass
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(
+            str(destination), os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o666
+        )
+    except FileExistsError:
+        return 0
+    except OSError as exc:
+        if exc.errno in (errno.EEXIST, errno.ELOOP):
+            return 0
+        raise
+    with os.fdopen(descriptor, "wb") as handle:
+        with open(str(source), "rb") as source_handle:
+            shutil.copyfileobj(source_handle, handle)
+    shutil.copystat(str(source), str(destination), follow_symlinks=False)
+    return 1
+
+def _restore_missing_only(
+    source_dir: Path,
+    target_dir: Path,
+    actions: Optional[list[str]] = None,
+    created_paths: Optional[list[Path]] = None,
+    *,
+    _covered: bool = False,
+) -> tuple[int, int]:
+    """Copy only items that do not exist under target_dir, without following or
+    replacing existing entries (including broken symlinks and file/dir collisions).
+    Every creation uses exclusive primitives (O_EXCL file creation, exclusive
+    mkdir, symlink creation that fails on existing entries), so a competitor that
+    wins the check/create race is preserved instead of overwritten. Recurses into
+    matching pairs of existing directories so missing files inside them are
+    restored. created_paths records only the topmost created roots (ownership
+    normalization walks each created subtree itself)."""
+    if created_paths is None:
+        created_paths = []
+    if actions is None:
+        actions = []
+    if not _covered:
+        _ensure_safe_preserve_target(target_dir)
+        if not os.path.lexists(str(target_dir)):
+            os.makedirs(str(target_dir))
+            root_stat = os.lstat(str(target_dir))
+            if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+                raise ValueError(f"Preserve restore target must be a directory: {target_dir}")
+            created_paths.append(target_dir)
+    restored_count = 0
+    kept_count = 0
+    for item in sorted(source_dir.iterdir()):
+        destination = target_dir / item.name
+        item_is_dir = item.is_dir() and not item.is_symlink()
+        destination_is_plain_dir = False
+        try:
+            destination_stat = os.lstat(str(destination))
+            destination_is_plain_dir = (
+                stat.S_ISDIR(destination_stat.st_mode)
+                and not stat.S_ISLNK(destination_stat.st_mode)
+            )
+        except FileNotFoundError:
+            destination_is_plain_dir = False
+        if destination_is_plain_dir and item_is_dir:
+            restored, kept = _restore_missing_only(
+                item, destination, actions, created_paths, _covered=_covered
+            )
+            restored_count += restored
+            kept_count += kept
+            continue
+        if os.path.lexists(str(destination)):
+            kept_count += 1
+            logger.debug("Preserving existing target entry untouched: %s", destination)
+            continue
+        if item.is_symlink():
+            target_is_directory = stat.S_ISDIR(os.lstat(item).st_mode)
+            try:
+                os.symlink(os.readlink(item), destination, target_is_directory=target_is_directory)
+            except FileExistsError:
+                kept_count += 1
+                continue
+            if not _covered:
+                created_paths.append(destination)
+            restored_count += 1
+            logger.info("Restored missing entry: %s", destination)
+        elif item_is_dir:
+            try:
+                os.mkdir(str(destination))
+            except FileExistsError:
+                kept_count += 1
+                continue
+            if not _covered:
+                created_paths.append(destination)
+            restored, kept = _restore_missing_only(
+                item, destination, actions, created_paths, _covered=True
+            )
+            # Directory metadata (timestamps, permissions) is applied after the
+            # children exist; existing entries were never touched.
+            shutil.copystat(str(item), str(destination), follow_symlinks=False)
+            restored_count += 1
+            kept_count += kept
+            logger.info("Restored missing entry: %s", destination)
+        else:
+            if _copy_missing_file_exclusively(item, destination) == 0:
+                kept_count += 1
+                continue
+            if not _covered:
+                created_paths.append(destination)
+            restored_count += 1
+            logger.info("Restored missing entry: %s", destination)
+    return restored_count, kept_count
+
 def _resolve_backup_root(restore_root: str) -> Path:
     root = Path(restore_root)
     backup_root = root / "backup"
@@ -223,6 +401,73 @@ def _path_is_within(path: str | Path, root: str | Path) -> bool:
         return os.path.commonpath((normalized_path, normalized_root)) == normalized_root
     except (TypeError, ValueError):
         return False
+
+
+_WINDOWS_SOURCE_SHAPE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _canonical_native_path(value: str) -> tuple[str, str]:
+    """OS-appropriate comparison key for a configured native path (Windows paths
+    are compared case-insensitively, POSIX paths case-sensitively)."""
+    text = str(value).strip()
+    flavor = "windows" if (_WINDOWS_SOURCE_SHAPE.match(text) or text.startswith("\\\\")) else "posix"
+    comparable = re.sub(r"/{2,}", "/", text.replace("\\", "/"))
+    if flavor == "windows":
+        comparable = comparable.casefold()
+    return flavor, comparable.rstrip("/")
+
+
+def _native_snapshot_subtree(source: str) -> str:
+    """Convert a configured native source into the restic snapshot subtree path.
+    Windows drives: C:\\\\foo -> /C/foo (confirmed against restic 0.18.1 on Windows).
+    POSIX sources are stored verbatim. UNC sources have no confirmed representation
+    and fail closed instead of restoring a wrong subtree."""
+    text = str(source).strip()
+    comparable = text.replace("\\", "/")
+    if comparable.startswith("//"):
+        raise NativeSourceSelectionError(
+            f"restic snapshot subtree for UNC source {source} is not supported; "
+            "refusing to substitute a subtree for the original-path restore",
+            "native_subtree_unsupported",
+        )
+    if _WINDOWS_SOURCE_SHAPE.match(text):
+        collapsed = re.sub(r"/{2,}", "/", comparable).rstrip("/")
+        drive, _, remainder = collapsed.partition(":")
+        return "/" + drive + (("/" + remainder.lstrip("/")) if remainder.strip("/") else "")
+    collapsed = re.sub(r"/{2,}", "/", comparable).rstrip("/")
+    if not collapsed.startswith("/"):
+        raise NativeSourceSelectionError(
+            f"configured native source {source} is not an absolute path; "
+            "original-path restore must be validated, refusing to substitute a subtree",
+            "native_subtree_unsupported",
+        )
+    return collapsed
+
+
+def _select_native_source_subtree(config: RestoreConfig) -> Optional[tuple[str, str]]:
+    """Return (configured_source, snapshot_subtree) when config.target_path exactly
+    equals one configured filesystem_paths entry (OS-appropriate case comparison),
+    else None. Original-path restore restores only that source's subtree and is a
+    native-runtime behavior: a Docker config that happens to carry sources must
+    keep the existing full-tree layout."""
+    runtime_type = str(getattr(config, "runtime_type", "") or "").strip().lower()
+    if runtime_type != "native":
+        return None
+    configured = tuple(getattr(config, "filesystem_paths", ()) or ())
+    if not configured:
+        return None
+    target_text = str(getattr(config, "target_path", "") or "").strip()
+    if not target_text:
+        return None
+    target_flavor, target_canonical = _canonical_native_path(target_text)
+    for source in configured:
+        if not isinstance(source, str) or not source.strip():
+            continue
+        flavor, canonical = _canonical_native_path(source)
+        if flavor != target_flavor or canonical != target_canonical:
+            continue
+        return source.strip(), _native_snapshot_subtree(source)
+    return None
 
 
 def _read_only_paths(config: RestoreConfig) -> tuple[str, ...]:
@@ -246,9 +491,21 @@ def _ensure_direct_restore_target_is_writable(config: RestoreConfig) -> None:
                 f"Direct restore target is read-only: {config.target_path}; refusing to clear or write"
             )
 
-def _restore_backup_dir_layout(restore_root: str, config: RestoreConfig, actions: list[str]) -> None:
+def _restore_backup_dir_layout(
+    restore_root: str,
+    config: RestoreConfig,
+    actions: list[str],
+    *,
+    preserve_only: bool = False,
+    created_paths: Optional[list[Path]] = None,
+) -> None:
+    if created_paths is None:
+        created_paths = []
     target_root = Path(config.target_path)
+    target_root_existed = target_root.exists()
     target_root.mkdir(parents=True, exist_ok=True)
+    if preserve_only and not target_root_existed:
+        created_paths.append(target_root)
     source_root = _resolve_backup_root(restore_root)
     logger.info(f"Resolved backup source root: {source_root}")
 
@@ -274,13 +531,52 @@ def _restore_backup_dir_layout(restore_root: str, config: RestoreConfig, actions
             actions.append(message)
             logger.warning(message)
             continue
+
+        source_entry = source_root / child.name
+        if preserve_only:
+            if not source_entry.exists():
+                logger.warning(f"No matching source entry for: {child.name}")
+                missing_entries.append(child.name)
+                continue
+            if target_entry.exists() or target_entry.is_symlink():
+                if (
+                    target_entry.is_dir()
+                    and not target_entry.is_symlink()
+                    and source_entry.is_dir()
+                    and not source_entry.is_symlink()
+                ):
+                    restored, kept = _restore_missing_only(source_entry, target_entry, actions, created_paths)
+                    restored_entries.append(child.name)
+                    if restored:
+                        actions.append(
+                            f"Restored {restored} missing entries within existing mount {target_entry}; "
+                            f"kept {kept} existing entries unchanged"
+                        )
+                else:
+                    message = f"Preserved existing target entry: {target_entry}"
+                    actions.append(message)
+                    logger.info(message)
+                continue
+            if source_entry.is_dir() and not source_entry.is_symlink():
+                logger.info(f"Copying directory {source_entry} -> {target_entry}")
+                shutil.copytree(source_entry, target_entry, symlinks=True)
+            elif source_entry.is_symlink():
+                target_is_directory = stat.S_ISDIR(os.lstat(source_entry).st_mode)
+                os.symlink(os.readlink(source_entry), target_entry, target_is_directory=target_is_directory)
+            else:
+                logger.info(f"Copying file {source_entry} -> {target_entry}")
+                shutil.copy2(source_entry, target_entry, follow_symlinks=False)
+            created_paths.append(target_entry)
+            restored_entries.append(child.name)
+            logger.info(f"Restored entry: {child.name}")
+            continue
+
         logger.info(f"Clearing target entry: {target_entry}")
         if target_entry.is_dir() and not target_entry.is_symlink():
             _clear_target_contents(str(target_entry))
         elif target_entry.exists() or target_entry.is_symlink():
             target_entry.unlink()
 
-        source_entry = source_root / child.name
         if not source_entry.exists():
             logger.warning(f"No matching source entry for: {child.name}")
             missing_entries.append(child.name)
@@ -548,12 +844,18 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
 
     def restore(self, source_path: str, config: RestoreConfig) -> RestoreResult:
         timestamp = datetime.now()
-        actions = ["Replace target contents before restic restore"]
+        preserve_only = not bool(config.force_overwrite)
+        actions = (
+            ["Preserve existing target contents; restore only missing snapshot items"]
+            if preserve_only
+            else ["Replace target contents before restic restore"]
+        )
         env = os.environ.copy()
         temp_dir = None
         policy = RestoreOwnershipPolicy()
         normalization = {"state": "not_started", "unsupported_metadata": list(UNSUPPORTED_METADATA)}
         destructive_state = "none"
+        created_paths: list[Path] = []
         repository = config.restic_repository or os.environ.get("RESTIC_REPOSITORY")
         password = config.restic_password or os.environ.get("RESTIC_PASSWORD")
         if repository:
@@ -563,33 +865,63 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
 
         try:
             _ensure_direct_restore_target_is_writable(config)
+            if preserve_only:
+                _ensure_safe_preserve_target(Path(config.target_path))
             restic = _require_executable("restic") or "restic"
             env = restic_subprocess_environment(env)
             policy = _ownership_policy(config)
             snapshot = source_path or config.source or "latest"
+            restore_spec = snapshot
+            selection = _select_native_source_subtree(config)
+            if selection is not None:
+                selected_source, subtree = selection
+                self._inspect_native_subtree(restic, env, snapshot, subtree)
+                restore_spec = f"{snapshot}:{subtree}"
+                message = f"Original-path restore selected configured source subtree: {subtree}"
+                actions.append(message)
+                logger.info(message)
+                sys.stderr.flush()
+
             if _should_use_backup_dir_layout(config):
                 temp_dir = tempfile.mkdtemp(prefix="restore-restic-")
-                logger.info(f"Restoring restic snapshot {snapshot} into temp dir: {temp_dir}")
+                logger.info(f"Restoring restic snapshot {restore_spec} into temp dir: {temp_dir}")
                 sys.stderr.flush()
-                command = restic_command_with_backend_options([restic, "restore", snapshot, "--target", temp_dir], env)
+                command = restic_command_with_backend_options([restic, "restore", restore_spec, "--target", temp_dir], env)
                 subprocess.run(command, env=env, check=True)
-                actions.append(f"Restore restic snapshot into temporary workspace: {snapshot}")
+                actions.append(f"Restore restic snapshot into temporary workspace: {restore_spec}")
                 logger.info("Restic restore complete, copying entries to target volumes")
                 sys.stderr.flush()
-                if Path(config.target_path).exists() and any(Path(config.target_path).iterdir()):
-                    destructive_state = "partial"
-                _restore_backup_dir_layout(temp_dir, config, actions)
+                if preserve_only:
+                    _restore_backup_dir_layout(temp_dir, config, actions, preserve_only=True, created_paths=created_paths)
+                else:
+                    if Path(config.target_path).exists() and any(Path(config.target_path).iterdir()):
+                        destructive_state = "partial"
+                    _restore_backup_dir_layout(temp_dir, config, actions)
+            elif preserve_only:
+                temp_dir = tempfile.mkdtemp(prefix="restore-restic-")
+                logger.info(f"Staging restic snapshot {restore_spec} into temp dir: {temp_dir}")
+                sys.stderr.flush()
+                command = restic_command_with_backend_options([restic, "restore", restore_spec, "--target", temp_dir], env)
+                subprocess.run(command, env=env, check=True)
+                actions.append(f"Staged restic snapshot content in a temporary workspace: {restore_spec}")
+                restored, kept = _restore_missing_only(Path(temp_dir), Path(config.target_path), actions, created_paths)
+                actions.append(
+                    f"Restored {restored} missing snapshot entries under {config.target_path}; "
+                    f"kept {kept} existing entries unchanged"
+                )
             else:
                 logger.info(f"Clearing target contents at {config.target_path}")
                 destructive_state = "partial"
                 _clear_target_contents(config.target_path)
-                logger.info(f"Restoring restic snapshot {snapshot} directly to {config.target_path}")
+                logger.info(f"Restoring restic snapshot {restore_spec} directly to {config.target_path}")
                 sys.stderr.flush()
-                command = restic_command_with_backend_options([restic, "restore", snapshot, "--target", config.target_path], env)
+                command = restic_command_with_backend_options([restic, "restore", restore_spec, "--target", config.target_path], env)
                 subprocess.run(command, env=env, check=True)
-                actions.append(f"Restore restic snapshot: {snapshot}")
+                actions.append(f"Restore restic snapshot: {restore_spec}")
 
-            normalization = normalize_ownership(config, policy)
+            normalization = normalize_ownership(
+                config, policy, created_paths=created_paths if preserve_only else None
+            )
             if normalization["state"] == "preserved":
                 actions.append("Preserved snapshot ownership where supported by restic extraction")
             else:
@@ -599,14 +931,15 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             for warning in warnings:
                 logger.warning(warning)
 
-            destructive_state = "complete"
+            if not preserve_only:
+                destructive_state = "complete"
             return _attach_restore_evidence(RestoreResult(
                 timestamp=timestamp,
                 duration=0,
                 success=True,
                 target_path=config.target_path,
                 dry_run=False,
-                force_overwrite=True,
+                force_overwrite=config.force_overwrite,
                 planned_actions=actions,
                 permission_warnings=warnings
             ), policy, normalization, destructive_state, "ok")
@@ -615,7 +948,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             logger.error(f"Restic restore ownership normalization failed: {e}")
             return _attach_restore_evidence(RestoreResult(
                 timestamp=timestamp, duration=0, success=False, target_path=config.target_path,
-                dry_run=False, force_overwrite=True, planned_actions=actions, error=str(e)
+                dry_run=False, force_overwrite=config.force_overwrite, planned_actions=actions, error=str(e)
             ), policy, normalization, destructive_state or "unknown", e.category)
         except Exception as e:
             logger.error(f"Restic restore failed: {e}")
@@ -625,10 +958,164 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                 success=False,
                 target_path=config.target_path,
                 dry_run=False,
-                force_overwrite=True,
+                force_overwrite=config.force_overwrite,
                 planned_actions=actions,
                 error=str(e)
             ), policy, normalization, destructive_state, getattr(e, "category", "restore_failed"))
         finally:
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def _inspect_native_subtree(self, restic: str, env: dict[str, str], snapshot: str, subtree: str) -> str:
+        """Validate the selected snapshot subtree with `restic ls --json` BEFORE any
+        destructive action and classify it. The listing is streamed with a bounded
+        byte budget (existing restic metadata helpers) and a node is only accepted
+        when its recorded path exactly matches the selected subtree (Windows paths
+        compared case-insensitively, mirroring filesystem semantics); a child line
+        alone is never accepted. A file source is rejected, a missing subtree fails
+        closed, and malformed or over-budget output fails closed — both without
+        touching the restore target."""
+        from src.app.infrastructure.adapters.restic_metadata import (
+            MAX_STDERR_TAIL_BYTES,
+            _drain_stderr,
+            _terminate_and_reap,
+        )
+
+        command = restic_command_with_backend_options(
+            [restic, "ls", "--json", snapshot, subtree], env
+        )
+        process = None
+        stderr_thread = None
+        stderr_tail = bytearray()
+        stderr_errors: list[Exception] = []
+        matched = None
+        failure = None
+        finished = False
+        budget = self._LS_PREFLIGHT_BUDGET_BYTES
+        windows_subtree = bool(re.match(r"^/[A-Za-z]/", subtree))
+        try:
+            try:
+                process = subprocess.Popen(
+                    command,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            except OSError as exc:
+                raise self._subtree_rejection(
+                    f"restic ls could not run to verify snapshot {snapshot} at {subtree}: {exc}",
+                    "native_subtree_missing",
+                )
+            stderr_thread = threading.Thread(
+                target=_drain_stderr,
+                args=(getattr(process, "stderr", None), stderr_tail, MAX_STDERR_TAIL_BYTES, stderr_errors),
+            )
+            stderr_thread.daemon = True
+            stderr_thread.start()
+            stdout = getattr(process, "stdout", None)
+            if stdout is None:
+                failure = self._subtree_rejection(
+                    f"restic ls output for snapshot {snapshot} at {subtree} is incomplete",
+                    "native_subtree_unverified",
+                )
+            else:
+                while True:
+                    raw_line = stdout.readline(self._LS_MAX_LINE_BYTES)
+                    if raw_line in (b"", ""):
+                        finished = True
+                        break
+                    if isinstance(raw_line, str):
+                        raw_line = raw_line.encode("utf-8", errors="replace")
+                    budget -= len(raw_line)
+                    if budget < 0:
+                        failure = self._subtree_rejection(
+                            f"restic ls output for snapshot {snapshot} at {subtree} exceeded the bounded "
+                            "verification budget; refusing to restore an unverified subtree",
+                            "native_subtree_unverified",
+                        )
+                        break
+                    text = raw_line.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        continue
+                    try:
+                        payload = json.loads(text)
+                    except ValueError:
+                        failure = self._subtree_rejection(
+                            f"restic ls produced non-JSON output while verifying snapshot {snapshot} "
+                            f"at {subtree}; refusing to restore an unverified subtree",
+                            "native_subtree_unverified",
+                        )
+                        break
+                    if payload.get("struct_type") != "node":
+                        continue
+                    path = payload.get("path")
+                    if not isinstance(path, str):
+                        continue
+                    if path == subtree or (
+                        windows_subtree and path.casefold() == subtree.casefold()
+                    ):
+                        matched = payload
+                        # Stop early: the answer is known; the listing is read-only.
+                        break
+        finally:
+            if process is None:
+                pass
+            elif finished and failure is None:
+                try:
+                    process.wait(timeout=self._LS_WAIT_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    _terminate_and_reap(process)
+            else:
+                _terminate_and_reap(process)
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=5)
+            for name in ("stdout", "stderr"):
+                stream = getattr(process, name, None) if process is not None else None
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+        if failure is not None:
+            raise failure
+        if matched is not None:
+            # The early exit terminated the read-only listing; the recorded exit
+            # status no longer reflects the command's own outcome.
+            status = 0
+        else:
+            status = getattr(process, "returncode", None) if process is not None else None
+            if not isinstance(status, int):
+                status = 1
+        if status != 0:
+            from src.app.infrastructure.adapters.restic_metadata import _STDERR_SECRET
+
+            detail = _STDERR_SECRET.sub(r"\1=<redacted>", stderr_tail.decode("utf-8", errors="replace"))
+            detail = " ".join(detail.split())[:300]
+            raise self._subtree_rejection(
+                f"restic could not verify snapshot {snapshot} against the configured source at {subtree} "
+                f"(exit status {status}{': ' + detail if detail else ''})",
+                "native_subtree_missing",
+            )
+        if matched is None:
+            raise self._subtree_rejection(
+                f"restic snapshot {snapshot} does not contain the configured source at {subtree}; "
+                "refusing to restore an unverified subtree",
+                "native_subtree_missing",
+            )
+        if matched.get("type") != "dir":
+            name = matched.get("name") or subtree.rsplit("/", 1)[-1]
+            raise self._subtree_rejection(
+                f"configured native source {subtree} is a {matched.get('type') or 'file'} named {name} "
+                f"in snapshot {snapshot}; original-path restore requires a directory source",
+                "native_source_file_rejected",
+            )
+        return "dir"
+
+    @staticmethod
+    def _subtree_rejection(message: str, category: str) -> NativeSourceSelectionError:
+        return NativeSourceSelectionError(message, category)
+
+    _LS_PREFLIGHT_BUDGET_BYTES = 64 * 1024 * 1024
+    _LS_MAX_LINE_BYTES = 1024 * 1024
+    _LS_WAIT_TIMEOUT_SECONDS = 120

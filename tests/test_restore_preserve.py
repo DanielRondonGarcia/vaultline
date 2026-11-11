@@ -91,6 +91,11 @@ def use_restic_stub(nodes_by_filter=None, fill_staging=None, restore_calls=None,
     popen_stub = Mock(side_effect=popen)
     with patch.object(backup_strategy.subprocess, "run", run_stub), patch.object(
         backup_strategy.subprocess, "Popen", popen_stub
+    ), patch.object(
+        # Hosts without a real restic on PATH (CI runners) must still exercise
+        # the stubbed strategy; no real restic process can be spawned by these
+        # stubs.
+        backup_strategy, "_require_executable", return_value="restic"
     ):
         yield run_stub, popen_stub
 

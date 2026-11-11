@@ -12,6 +12,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -879,7 +880,7 @@ class NativeCustomDestinationPlacementTests(unittest.TestCase):
     def test_custom_posix_and_unc_destinations_place_subtree_content_at_target_root(self):
         for destination, source, subtree in (
             ("/restore/custom", "/srv/app", "/srv/app"),
-            (r"\\server\\share\\restore\\custom", r"D:\\Data\\App", "/D/Data/App"),
+            (r"\\server\share\restore\custom", r"D:\\Data\\App", "/D/Data/App"),
         ):
             with self.subTest(destination=destination):
                 config = self._config(destination, [source])
@@ -901,10 +902,10 @@ class NativeCustomDestinationPlacementTests(unittest.TestCase):
                 # The staged content starts at the destination root directly: the
                 # recorder sees the subtree's entries, never a component directory.
                 self.assertEqual(recorder[0][2], ["app.txt"])
-                self.assertTrue(
-                    str(recorder[0][1]).replace("\\", "/").endswith("restore/custom"),
-                    str(recorder[0][1]),
-                )
+                # Compare with collapsed separators: Windows normalizes them, POSIX
+                # hosts (CI) keep backslashes literally in the recorded path.
+                recorded = re.sub(r"/+", "/", str(recorder[0][1]).replace("\\", "/"))
+                self.assertTrue(recorded.endswith("restore/custom"), str(recorder[0][1]))
 
     def test_filesystem_root_destinations_keep_full_tree_layout(self):
         for destination, full_tree in (

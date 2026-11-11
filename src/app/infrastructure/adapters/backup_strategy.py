@@ -470,6 +470,73 @@ def _select_native_source_subtree(config: RestoreConfig) -> Optional[tuple[str, 
     return None
 
 
+_WINDOWS_DRIVE_ROOT_CANONICAL = re.compile(r"^[a-z]:$")
+
+
+def _is_native_filesystem_root_destination(target_path: str) -> bool:
+    """S6: True when the native restore destination is itself a filesystem root:
+    the POSIX root, a Windows drive root (with or without a trailing separator,
+    or a bare drive form like "L:"), or a UNC share root. Root destinations keep
+    the recorded full-tree layout because the recorded path components are the
+    destination's own layout there."""
+    text = str(target_path or "").strip()
+    if not text:
+        return False
+    flavor, canonical = _canonical_native_path(text)
+    if flavor == "posix" and not re.match(r"^[A-Za-z]:$", text):
+        # The POSIX root canonicalizes to the empty string; every other POSIX
+        # destination keeps at least one path component.
+        return canonical == ""
+    # Windows drive or UNC flavor (including a bare "L:" drive-relative form).
+    if _WINDOWS_DRIVE_ROOT_CANONICAL.fullmatch(canonical):
+        return True
+    if canonical.startswith("/"):
+        # UNC destinations canonicalize to "/server/share[...]"; a share root
+        # keeps exactly the server and the share components.
+        components = [component for component in canonical.split("/") if component]
+        return len(components) == 2
+    return False
+
+
+def _plan_native_direct_restore_specs(
+    config: RestoreConfig,
+    snapshot: str,
+    validate_subtree: Callable[[str], str],
+) -> Optional[list[str]]:
+    """S6: plan a native restore into a custom destination that is not a
+    filesystem root. Returns one `snapshot:subtree` spec per configured source,
+    each validated with the bounded `restic ls` preflight BEFORE any mutation,
+    so every source's content is extracted directly inside the destination
+    instead of recreating the recorded tree (drive-letter components included).
+    Returns None when the existing full-tree layout applies: a docker runtime, a
+    backup-dir layout, an empty target, or a filesystem-root destination (POSIX
+    root, Windows drive root, UNC share root). A native restore without
+    configured sources fails closed before any mutation."""
+    if str(getattr(config, "runtime_type", "") or "").strip().lower() != "native":
+        return None
+    if _should_use_backup_dir_layout(config):
+        return None
+    target_text = str(getattr(config, "target_path", "") or "").strip()
+    if not target_text or _is_native_filesystem_root_destination(target_text):
+        return None
+    configured = [
+        source.strip()
+        for source in getattr(config, "filesystem_paths", ()) or ()
+        if isinstance(source, str) and source.strip()
+    ]
+    if not configured:
+        raise NativeSourceSelectionError(
+            "native restore requires configured sources",
+            "native_sources_required",
+        )
+    subtrees = []
+    for source in configured:
+        subtree = _native_snapshot_subtree(source)
+        validate_subtree(subtree)
+        subtrees.append(subtree)
+    return [f"{snapshot}:{subtree}" for subtree in subtrees]
+
+
 def _read_only_paths(config: RestoreConfig) -> tuple[str, ...]:
     paths = getattr(config, "read_only_paths", ()) or ()
     return tuple(path for path in paths if isinstance(path, str) and path)
@@ -871,18 +938,37 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             env = restic_subprocess_environment(env)
             policy = _ownership_policy(config)
             snapshot = source_path or config.source or "latest"
-            restore_spec = snapshot
+            restore_specs = [snapshot]
             selection = _select_native_source_subtree(config)
             if selection is not None:
                 selected_source, subtree = selection
                 self._inspect_native_subtree(restic, env, snapshot, subtree)
-                restore_spec = f"{snapshot}:{subtree}"
+                restore_specs = [f"{snapshot}:{subtree}"]
                 message = f"Original-path restore selected configured source subtree: {subtree}"
                 actions.append(message)
                 logger.info(message)
                 sys.stderr.flush()
+            else:
+                direct_specs = _plan_native_direct_restore_specs(
+                    config,
+                    snapshot,
+                    lambda subtree: self._inspect_native_subtree(restic, env, snapshot, subtree),
+                )
+                if direct_specs is not None:
+                    restore_specs = direct_specs
+                    subtrees = ", ".join(spec.split(":", 1)[1] for spec in direct_specs)
+                    message = (
+                        f"Custom native destination: restoring configured source subtrees "
+                        f"directly into {config.target_path}: {subtrees}"
+                    )
+                    actions.append(message)
+                    logger.info(message)
+                    sys.stderr.flush()
 
             if _should_use_backup_dir_layout(config):
+                # Only the original-path selection (or the bare snapshot) reaches
+                # this layout; S6 direct placement applies to the direct layout.
+                restore_spec = restore_specs[0]
                 temp_dir = tempfile.mkdtemp(prefix="restore-restic-")
                 logger.info(f"Restoring restic snapshot {restore_spec} into temp dir: {temp_dir}")
                 sys.stderr.flush()
@@ -899,25 +985,40 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                     _restore_backup_dir_layout(temp_dir, config, actions)
             elif preserve_only:
                 temp_dir = tempfile.mkdtemp(prefix="restore-restic-")
-                logger.info(f"Staging restic snapshot {restore_spec} into temp dir: {temp_dir}")
-                sys.stderr.flush()
-                command = restic_command_with_backend_options([restic, "restore", restore_spec, "--target", temp_dir], env)
-                subprocess.run(command, env=env, check=True)
-                actions.append(f"Staged restic snapshot content in a temporary workspace: {restore_spec}")
-                restored, kept = _restore_missing_only(Path(temp_dir), Path(config.target_path), actions, created_paths)
+                restored_total = 0
+                kept_total = 0
+                for index, restore_spec in enumerate(restore_specs):
+                    if len(restore_specs) == 1:
+                        staging_dir = Path(temp_dir)
+                    else:
+                        # One staging directory per source subtree keeps each
+                        # staged restoration independent from the others.
+                        staging_dir = Path(temp_dir) / f"snapshot-{index + 1}"
+                    logger.info(f"Staging restic snapshot {restore_spec} into temp dir: {staging_dir}")
+                    sys.stderr.flush()
+                    command = restic_command_with_backend_options([restic, "restore", restore_spec, "--target", str(staging_dir)], env)
+                    subprocess.run(command, env=env, check=True)
+                    if len(restore_specs) == 1:
+                        actions.append(f"Staged restic snapshot content in a temporary workspace: {restore_spec}")
+                    else:
+                        actions.append(f"Staged restic snapshot subtree content in a temporary workspace: {restore_spec}")
+                    restored, kept = _restore_missing_only(staging_dir, Path(config.target_path), actions, created_paths)
+                    restored_total += restored
+                    kept_total += kept
                 actions.append(
-                    f"Restored {restored} missing snapshot entries under {config.target_path}; "
-                    f"kept {kept} existing entries unchanged"
+                    f"Restored {restored_total} missing snapshot entries under {config.target_path}; "
+                    f"kept {kept_total} existing entries unchanged"
                 )
             else:
                 logger.info(f"Clearing target contents at {config.target_path}")
                 destructive_state = "partial"
                 _clear_target_contents(config.target_path)
-                logger.info(f"Restoring restic snapshot {restore_spec} directly to {config.target_path}")
-                sys.stderr.flush()
-                command = restic_command_with_backend_options([restic, "restore", restore_spec, "--target", config.target_path], env)
-                subprocess.run(command, env=env, check=True)
-                actions.append(f"Restore restic snapshot: {restore_spec}")
+                for restore_spec in restore_specs:
+                    logger.info(f"Restoring restic snapshot {restore_spec} directly to {config.target_path}")
+                    sys.stderr.flush()
+                    command = restic_command_with_backend_options([restic, "restore", restore_spec, "--target", config.target_path], env)
+                    subprocess.run(command, env=env, check=True)
+                    actions.append(f"Restore restic snapshot: {restore_spec}")
 
             normalization = normalize_ownership(
                 config, policy, created_paths=created_paths if preserve_only else None

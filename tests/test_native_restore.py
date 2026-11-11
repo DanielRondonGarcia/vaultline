@@ -440,7 +440,10 @@ class NativeRestoreTests(unittest.TestCase):
         from src.app.infrastructure.adapters.backup_strategy import ResticBackupStrategy
 
         config = RestoreConfig(
-            target_path="/restore/native-target",
+            # A filesystem-root destination (S6) keeps the recorded full-tree
+            # native contract, so this executable-resolution proof needs no
+            # configured-source subtree selection.
+            target_path=r"L:\\",
             source="abcdef12",
             dry_run=False,
             force_overwrite=True,

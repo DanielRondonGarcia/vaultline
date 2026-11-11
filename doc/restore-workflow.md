@@ -28,7 +28,7 @@ La opción de conservar es la que respeta los archivos existentes: si un archivo
 
 El bloque de destino ofrece dos rutas:
 
-1. **Otra ruta (restaurar en una carpeta nueva)** — opción por defecto. Restaura el snapshot completo en la ruta que escribas; útil para revisar el resultado antes de mover nada.
+1. **Otra ruta (restaurar en una carpeta nueva)** — opción por defecto. Restaura el contenido del backup directamente dentro de la ruta que escribas (sin recrear la letra de unidad ni la ruta original); útil para revisar el resultado antes de mover nada.
 2. **Restaurar en la ruta original** — aparece solo si el target tiene rutas configuradas. Restaura directamente en una de las rutas del target.
 
 Reglas del destino:
@@ -36,8 +36,9 @@ Reglas del destino:
 - Si el target tiene **una sola ruta** configurada, la opción de ruta original la usa directamente.
 - Si el target tiene **varias rutas**, debes elegir cuál corresponde a este snapshot; la UI no restaura todas a la vez silenciosamente.
 - La ruta elegida se envía tal cual está configurada en el target (incluidas rutas de Windows con `\` o `&`). La restauración directa en origen admite directorios Linux y Windows con letra de unidad. Las fuentes que son archivos individuales o rutas UNC se rechazan antes de modificar el destino; la UI no ofrece rutas UNC como origen directo. Puedes seguir usando otro destino UNC.
-- Si envías la **misma ruta configurada del target**, el motor detecta la igualdad y restaura solo el subárbol de esa ruta. Con un destino distinto se mantiene la estructura completa del snapshot.
-- Si el target no tiene rutas configuradas, la opción de ruta original no se ofrece; siempre verás la ruta personalizada.
+- Si envías la **misma ruta configurada del target**, el motor detecta la igualdad y restaura solo el subárbol de esa ruta.
+- Con un **destino personalizado** (distinto de las rutas configuradas), el motor coloca el contenido de cada ruta configurada directamente dentro del destino, como en el flujo de contenedores: no recrea componentes del snapshot (por ejemplo, no crea una carpeta `L`). Con varias rutas configuradas se restauran todas al mismo destino, y cada fuente se valida con `restic ls` antes de modificar el destino. Solo cuando el destino es una **raíz** (la raíz POSIX `/`, una raíz de disco Windows como `L:\` o la raíz de un recurso UNC) se mantiene el árbol completo del snapshot tal cual está grabado.
+- Si el target no tiene rutas configuradas, la opción de ruta original no se ofrece; siempre verás la ruta personalizada. Restaurar en un destino personalizado **falla de forma segura antes de modificar el destino** cuando el target nativo no tiene rutas configuradas.
 
 ## Permisos de archivos
 

@@ -607,9 +607,11 @@ class OriginalPathSubtreeSelectionTests(unittest.TestCase):
             target = Path(directory) / "source"
             _fill_tree(target, {"guard.txt": "untouched"})
             config = self._config(str(target), [str(target)], force_overwrite=True)
-            with patch.object(backup_strategy.subprocess, "Popen", side_effect=OSError("cannot spawn restic")), patch.object(
-                backup_strategy, "_clear_target_contents"
-            ) as clear, patch.object(backup_strategy.subprocess, "run") as run:
+            with patch.object(backup_strategy, "_require_executable", return_value="restic"), patch.object(
+                backup_strategy.subprocess, "Popen", side_effect=OSError("cannot spawn restic")
+            ), patch.object(backup_strategy, "_clear_target_contents") as clear, patch.object(
+                backup_strategy.subprocess, "run"
+            ) as run:
                 result = ResticBackupStrategy().restore("snap", config)
             self.assertFalse(result.success)
             self.assertEqual(result.category, "native_subtree_missing")

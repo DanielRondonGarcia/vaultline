@@ -1,9 +1,11 @@
-"""Preserve-mode restore and original-path (S1, S4, S5) backend coverage.
+"""Preserve-mode restore and original-path (S1, S4, S5, S6) backend coverage.
 
 "Conservar archivos existentes" (force_overwrite=false) restores only missing
 items: existing files, directories, metadata, and symlinks are never followed,
 replaced, or deleted — including under check/create races, and only the exact
-configured native source subtree is restored on the original route (S4).
+configured native source subtree is restored on the original route (S4). A
+native custom destination receives every configured source's content directly
+inside it (S6); only filesystem-root destinations keep the full recorded tree.
 """
 
 import contextlib
@@ -98,6 +100,20 @@ def use_restic_stub(nodes_by_filter=None, fill_staging=None, restore_calls=None,
         backup_strategy, "_require_executable", return_value="restic"
     ):
         yield run_stub, popen_stub
+
+
+def _restic_restore_fill_by_spec(commands, subtree_contents, full_tree):
+    """Stub `restic restore` filler that mirrors real restic placement: a
+    `snapshot:subtree` spec extracts that subtree's content directly at the
+    restore target, while a bare snapshot spec recreates the recorded full tree
+    (drive-letter path components included)."""
+
+    def fill_staging(target: Path) -> None:
+        spec = commands[-1][2] if commands else ""
+        contents = subtree_contents.get(spec)
+        _fill_tree(target, contents if contents is not None else full_tree)
+
+    return fill_staging
 
 
 def _record_missing_only_copy(recorder):
@@ -540,25 +556,6 @@ class OriginalPathSubtreeSelectionTests(unittest.TestCase):
         self.assertEqual(popen.call_args_list, [], "no subtree listing outside native runtime")
         self.assertEqual((target / "missing.txt").read_text(encoding="utf-8"), "full-tree-content")
 
-    def test_custom_destination_keeps_full_tree_layout_without_any_selection(self):
-        workspace = _fresh_dir("restore-custom-dest-")
-        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
-        target = workspace / "target"
-        config = self._config(target, ["C:\\Data\\App", "D:\\Other"])
-
-        def fill_staging(staging: Path) -> None:
-            _fill_tree(staging, {"C/Data/App/app.txt": "full-tree"})
-
-        with use_restic_stub(fill_staging=fill_staging) as (run, popen):
-            result = ResticBackupStrategy().restore("snap", config)
-
-        self.assertTrue(result.success, result.error)
-        restore_command = next(command for command in run.call_args_list if command.args[0][1] == "restore")
-        self.assertEqual(restore_command.args[0][2], "snap")
-        ls_calls = [call.args[0] for call in popen.call_args_list if call.args[0][1] == "ls"]
-        self.assertEqual(ls_calls, [], "custom destination must not run a subtree listing")
-        self.assertEqual((target / "C" / "Data" / "App" / "app.txt").read_text(encoding="utf-8"), "full-tree")
-
     def test_missing_snapshot_subtree_fails_closed_before_mutation_in_replacement_layout(self):
         """The real configured target keeps its bytes: the clear is never invoked."""
         workspace = _fresh_dir("restore-subtree-missing-")
@@ -715,6 +712,252 @@ class OriginalPathSubtreeSelectionTests(unittest.TestCase):
         self.assertEqual(cleared, ["C:\\Data\\App"])
         self.assertEqual(result.destructive_state, "complete")
 
+
+@unittest.skipUnless(shutil.which("restic"), "restic executable is unavailable")
+class RealResticRestorePreserveIntegrationTests(unittest.TestCase):
+    """Genuine public-interface restore against a local synthetic restic repo."""
+
+
+class NativeCustomDestinationPlacementTests(unittest.TestCase):
+    """S6: a native custom destination that is not a filesystem root receives
+    the content of EVERY configured source directly at the destination root
+    (like the docker mounted-entries flow, placed inside the destination); no
+    recorded path component (drive letter included) is recreated under it. Only
+    filesystem-root destinations (POSIX root, Windows drive root, UNC share
+    root) keep the recorded full-tree layout, and a native restore without
+    configured sources fails closed before any mutation."""
+
+    def _config(self, target, sources, **kwargs):
+        defaults = dict(
+            target_path=str(target),
+            source="snap",
+            dry_run=False,
+            force_overwrite=False,
+            backup_strategy="restic",
+            runtime_type="native",
+            filesystem_paths=tuple(sources),
+            restic_repository="local:/repo",
+            restic_password="probe",
+        )
+        defaults.update(kwargs)
+        return RestoreConfig(**defaults)
+
+    @staticmethod
+    def _restore_commands(run_stub):
+        return [call.args[0] for call in run_stub.call_args_list if call.args[0][1] == "restore"]
+
+    @staticmethod
+    def _ls_subtrees(popen_stub):
+        return [call.args[0][-1] for call in popen_stub.call_args_list if call.args[0][1] == "ls"]
+
+    def test_custom_destination_extracts_source_content_directly_without_path_nesting(self):
+        workspace = _fresh_dir("restore-s6-placement-")
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        target = workspace / "destination"
+        _fill_tree(target, {"user-note.txt": "user"})
+        config = self._config(target, [r"L:\\prueba_nativa"])
+        subtree_contents = {"snap:/L/prueba_nativa": {"app.txt": "native-app", "nested/deep.txt": "deep"}}
+        full_tree = {"L/prueba_nativa/app.txt": "native-app", "L/prueba_nativa/nested/deep.txt": "deep"}
+        commands = []
+
+        with use_restic_stub(
+            nodes_by_filter={"/L/prueba_nativa": [{"name": "prueba_nativa", "type": "dir", "path": "/L/prueba_nativa"}]},
+            fill_staging=_restic_restore_fill_by_spec(commands, subtree_contents, full_tree),
+            restore_calls=commands,
+        ) as (run_stub, popen_stub):
+            result = ResticBackupStrategy().restore("snap", config)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual([command[2] for command in self._restore_commands(run_stub)], ["snap:/L/prueba_nativa"])
+        self.assertEqual(self._ls_subtrees(popen_stub), ["/L/prueba_nativa"])
+        self.assertEqual((target / "app.txt").read_text(encoding="utf-8"), "native-app")
+        self.assertEqual((target / "nested" / "deep.txt").read_text(encoding="utf-8"), "deep")
+        self.assertEqual((target / "user-note.txt").read_text(encoding="utf-8"), "user")
+        self.assertEqual(
+            sorted(item.name for item in target.iterdir()),
+            ["app.txt", "nested", "user-note.txt"],
+            "no drive-letter nor recorded path component may be recreated",
+        )
+        self.assertIn("directly", "\n".join(result.planned_actions or []))
+
+    def test_multi_source_custom_destination_places_every_source_at_root_and_keeps_existing_files(self):
+        workspace = _fresh_dir("restore-s6-multi-")
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        target = workspace / "destination"
+        _fill_tree(target, {"kept.txt": "target-kept"})
+        config = self._config(target, [r"L:\\prueba_nativa", r"D:\\Other"])
+        subtree_contents = {
+            "snap:/L/prueba_nativa": {"app.txt": "native-app"},
+            "snap:/D/Other": {"other.txt": "other-app"},
+        }
+        full_tree = {"L/prueba_nativa/app.txt": "native-app", "D/Other/other.txt": "other-app"}
+        commands = []
+
+        with use_restic_stub(
+            nodes_by_filter={
+                "/L/prueba_nativa": [{"name": "prueba_nativa", "type": "dir", "path": "/L/prueba_nativa"}],
+                "/D/Other": [{"name": "Other", "type": "dir", "path": "/D/Other"}],
+            },
+            fill_staging=_restic_restore_fill_by_spec(commands, subtree_contents, full_tree),
+            restore_calls=commands,
+        ) as (run_stub, popen_stub):
+            result = ResticBackupStrategy().restore("snap", config)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(self._ls_subtrees(popen_stub), ["/L/prueba_nativa", "/D/Other"])
+        self.assertEqual(
+            [command[2] for command in self._restore_commands(run_stub)],
+            ["snap:/L/prueba_nativa", "snap:/D/Other"],
+        )
+        self.assertEqual((target / "app.txt").read_text(encoding="utf-8"), "native-app")
+        self.assertEqual((target / "other.txt").read_text(encoding="utf-8"), "other-app")
+        self.assertEqual((target / "kept.txt").read_text(encoding="utf-8"), "target-kept")
+        self.assertEqual(sorted(item.name for item in target.iterdir()), ["app.txt", "kept.txt", "other.txt"])
+        self.assertEqual(result.destructive_state, "none")
+
+    def test_preflight_validates_every_source_before_any_mutation(self):
+        workspace = _fresh_dir("restore-s6-preflight-")
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        target = workspace / "destination"
+        _fill_tree(target, {"guard.txt": "pre-existing-guard"})
+        config = self._config(target, [r"L:\\prueba_nativa", r"D:\\Ghost"], force_overwrite=True)
+        cleared = []
+        commands = []
+
+        with use_restic_stub(
+            nodes_by_filter={"/L/prueba_nativa": [{"name": "prueba_nativa", "type": "dir", "path": "/L/prueba_nativa"}]},
+            fill_staging=_restic_restore_fill_by_spec(commands, {}, {}),
+            restore_calls=commands,
+        ) as (run_stub, popen_stub), patch.object(
+            backup_strategy, "_clear_target_contents", lambda target_path: cleared.append(str(target_path))
+        ):
+            result = ResticBackupStrategy().restore("snap", config)
+
+        self.assertFalse(result.success)
+        self.assertIn("does not contain", result.error)
+        self.assertEqual(self._ls_subtrees(popen_stub), ["/L/prueba_nativa", "/D/Ghost"])
+        self.assertEqual(cleared, [], "preflight failure must precede the replace-mode clear")
+        self.assertEqual(self._restore_commands(run_stub), [], "no restore may run after a failed preflight")
+        self.assertEqual((target / "guard.txt").read_text(encoding="utf-8"), "pre-existing-guard")
+
+    def test_replace_mode_custom_destination_clears_once_and_restores_each_subtree_into_target(self):
+        workspace = _fresh_dir("restore-s6-replace-")
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        target = workspace / "destination"
+        config = self._config(target, [r"L:\\prueba_nativa", r"D:\\Other"], force_overwrite=True)
+        subtree_contents = {
+            "snap:/L/prueba_nativa": {"app.txt": "native-app"},
+            "snap:/D/Other": {"other.txt": "other-app"},
+        }
+        full_tree = {"L/prueba_nativa/app.txt": "native-app", "D/Other/other.txt": "other-app"}
+        commands = []
+        cleared = []
+
+        with use_restic_stub(
+            nodes_by_filter={
+                "/L/prueba_nativa": [{"name": "prueba_nativa", "type": "dir", "path": "/L/prueba_nativa"}],
+                "/D/Other": [{"name": "Other", "type": "dir", "path": "/D/Other"}],
+            },
+            fill_staging=_restic_restore_fill_by_spec(commands, subtree_contents, full_tree),
+            restore_calls=commands,
+        ) as (run_stub, popen_stub), patch.object(
+            backup_strategy, "_clear_target_contents", lambda target_path: cleared.append(str(target_path))
+        ):
+            result = ResticBackupStrategy().restore("snap", config)
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(cleared, [str(config.target_path)], "the target is cleared exactly once before every subtree restore")
+        restore_commands = self._restore_commands(run_stub)
+        self.assertEqual([command[2] for command in restore_commands], ["snap:/L/prueba_nativa", "snap:/D/Other"])
+        for command in restore_commands:
+            self.assertEqual(command[command.index("--target") + 1], str(config.target_path))
+        self.assertEqual((target / "app.txt").read_text(encoding="utf-8"), "native-app")
+        self.assertEqual((target / "other.txt").read_text(encoding="utf-8"), "other-app")
+        self.assertEqual(sorted(item.name for item in target.iterdir()), ["app.txt", "other.txt"])
+        self.assertEqual(result.destructive_state, "complete")
+
+    def test_custom_posix_and_unc_destinations_place_subtree_content_at_target_root(self):
+        for destination, source, subtree in (
+            ("/restore/custom", "/srv/app", "/srv/app"),
+            (r"\\server\\share\\restore\\custom", r"D:\\Data\\App", "/D/Data/App"),
+        ):
+            with self.subTest(destination=destination):
+                config = self._config(destination, [source])
+                recorder = []
+                subtree_contents = {f"snap:{subtree}": {"app.txt": "native-app"}}
+                full_tree = {"component/root.txt": "full-tree"}  # bare-snapshot placement never matches subtree extraction
+                commands = []
+
+                with use_restic_stub(
+                    nodes_by_filter={subtree: [{"name": subtree.rsplit("/", 1)[-1], "type": "dir", "path": subtree}]},
+                    fill_staging=_restic_restore_fill_by_spec(commands, subtree_contents, full_tree),
+                    restore_calls=commands,
+                ) as (run_stub, popen_stub), _record_missing_only_copy(recorder):
+                    result = ResticBackupStrategy().restore("snap", config)
+
+                self.assertTrue(result.success, result.error)
+                self.assertEqual([command[2] for command in self._restore_commands(run_stub)], [f"snap:{subtree}"])
+                self.assertEqual(self._ls_subtrees(popen_stub), [subtree])
+                # The staged content starts at the destination root directly: the
+                # recorder sees the subtree's entries, never a component directory.
+                self.assertEqual(recorder[0][2], ["app.txt"])
+                self.assertTrue(
+                    str(recorder[0][1]).replace("\\", "/").endswith("restore/custom"),
+                    str(recorder[0][1]),
+                )
+
+    def test_filesystem_root_destinations_keep_full_tree_layout(self):
+        for destination, full_tree in (
+            (r"L:\\", {"L/prueba_nativa/app.txt": "native-app", "L/prueba_nativa/docs/beta.txt": "beta"}),
+            ("/", {"srv/app/app.txt": "native-app"}),
+            (r"\\server\\share", {"server/share/prueba_nativa/app.txt": "native-app"}),
+        ):
+            with self.subTest(destination=destination):
+                config = self._config(destination, [r"L:\\prueba_nativa"], force_overwrite=True)
+                commands = []
+                cleared = []
+                placed = []
+
+                def fill_staging(recorded_target: Path, full_tree=full_tree):
+                    # Root destinations point at real filesystem roots; the stub
+                    # records the placement instead of writing there.
+                    placed.append(sorted(full_tree))
+
+                with use_restic_stub(fill_staging=fill_staging, restore_calls=commands) as (run_stub, popen_stub), patch.object(
+                    backup_strategy, "_clear_target_contents", lambda target_path: cleared.append(str(target_path))
+                ), patch.object(backup_strategy, "_sqlite_warnings", return_value=[]):
+                    result = ResticBackupStrategy().restore("snap", config)
+
+                self.assertTrue(result.success, result.error)
+                restore_commands = self._restore_commands(run_stub)
+                self.assertEqual([command[2] for command in restore_commands], ["snap"], "the recorded full-tree layout stays as-is")
+                for command in restore_commands:
+                    self.assertEqual(command[command.index("--target") + 1], str(config.target_path))
+                self.assertEqual(self._ls_subtrees(popen_stub), [], "root destinations need no subtree validation")
+                self.assertEqual(placed, [sorted(full_tree)])
+                self.assertEqual(cleared, [str(config.target_path)])
+                self.assertEqual(result.destructive_state, "complete")
+
+    def test_native_restore_without_configured_sources_fails_before_mutation(self):
+        workspace = _fresh_dir("restore-s6-no-sources-")
+        self.addCleanup(shutil.rmtree, workspace, ignore_errors=True)
+        target = workspace / "destination"
+        _fill_tree(target, {"guard.txt": "pre-existing-guard"})
+        config = self._config(target, [], force_overwrite=True)
+        cleared = []
+
+        with use_restic_stub() as (run_stub, popen_stub), patch.object(
+            backup_strategy, "_clear_target_contents", lambda target_path: cleared.append(str(target_path))
+        ):
+            result = ResticBackupStrategy().restore("snap", config)
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.category, "native_sources_required")
+        self.assertIn("configured sources", result.error)
+        self.assertEqual(cleared, [])
+        self.assertEqual(self._restore_commands(run_stub), [])
+        self.assertEqual(self._ls_subtrees(popen_stub), [])
+        self.assertEqual((target / "guard.txt").read_text(encoding="utf-8"), "pre-existing-guard")
 
 @unittest.skipUnless(shutil.which("restic"), "restic executable is unavailable")
 class RealResticRestorePreserveIntegrationTests(unittest.TestCase):
@@ -888,6 +1131,69 @@ class RealResticRestorePreserveIntegrationTests(unittest.TestCase):
         self.assertEqual((self.src / "alpha.txt").read_text(encoding="utf-8"), "alpha-v2")
         self.assertEqual((self.src / "gone.txt").read_text(encoding="utf-8"), "gone")
         self.assertEqual((self.src / "added-by-user.txt").read_text(encoding="utf-8"), "user")
+
+    def _custom_destination_service_config(self, target: Path, force_overwrite: bool, sources: tuple[str, ...]):
+        return RestoreConfig(
+            target_path=str(target),
+            dry_run=False,
+            force_overwrite=force_overwrite,
+            stop_containers=False,
+            backup_strategy="restic",
+            runtime_type="native",
+            filesystem_paths=sources,
+            restic_repository=f"local:{self.repo.resolve()}",
+            restic_password="probe",
+        )
+
+    def test_custom_destination_direct_preserve_places_snapshot_content_at_destination_root(self):
+        self._init_and_backup()
+        destination = self.workspace / "custom-out"
+        destination.mkdir()
+        (destination / "user-file.txt").write_text("user", encoding="utf-8")
+        (self.src / "alpha.txt").write_text("alpha-v2", encoding="utf-8")
+        (self.src / "gone.txt").unlink()
+
+        config = self._custom_destination_service_config(
+            destination, force_overwrite=False, sources=(str(self.src),)
+        )
+        result = self._service(config).execute_restore()
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.destructive_state, "none")
+        # Every snapshot item is placed directly at the destination: no recorded
+        # path component (drive letter included) is recreated underneath it.
+        self.assertEqual(sorted(item.name for item in destination.iterdir()), ["alpha.txt", "docs", "gone.txt", "user-file.txt"])
+        self.assertEqual((destination / "alpha.txt").read_text(encoding="utf-8"), "alpha-v1")
+        self.assertEqual((destination / "docs" / "beta.txt").read_text(encoding="utf-8"), "beta")
+        self.assertEqual((destination / "gone.txt").read_text(encoding="utf-8"), "gone")
+        self.assertEqual((destination / "user-file.txt").read_text(encoding="utf-8"), "user")
+
+    def test_custom_destination_direct_multi_source_places_both_contents_at_destination_root(self):
+        self._init_and_backup()
+        sibling = self.workspace / "sibling-custom"
+        _fill_tree(sibling, {"sibling.txt": "sibling-marker"})
+        self._backup_paths([str(self.src), str(sibling)])
+        (self.src / "gone.txt").unlink()
+        destination = self.workspace / "custom-out-multi"
+        destination.mkdir()
+        (destination / "user-file.txt").write_text("user", encoding="utf-8")
+
+        config = self._custom_destination_service_config(
+            destination, force_overwrite=False, sources=(str(self.src), str(sibling))
+        )
+        result = self._service(config).execute_restore()
+
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.destructive_state, "none")
+        self.assertEqual(
+            sorted(item.name for item in destination.iterdir()),
+            ["alpha.txt", "docs", "gone.txt", "sibling.txt", "user-file.txt"],
+        )
+        self.assertEqual((destination / "alpha.txt").read_text(encoding="utf-8"), "alpha-v1")
+        self.assertEqual((destination / "sibling.txt").read_text(encoding="utf-8"), "sibling-marker")
+        self.assertEqual((destination / "gone.txt").read_text(encoding="utf-8"), "gone")
+        self.assertEqual((destination / "user-file.txt").read_text(encoding="utf-8"), "user")
+        self.assertTrue((sibling / "sibling.txt").exists(), "the sibling source directory itself is untouched")
 
 if __name__ == "__main__":
     unittest.main()

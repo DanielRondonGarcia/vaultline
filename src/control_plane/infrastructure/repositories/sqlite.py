@@ -1,3 +1,4 @@
+import brotli
 import hmac
 import json
 import logging
@@ -60,6 +61,100 @@ logger = logging.getLogger(__name__)
 
 
 LEASE_DIAGNOSTIC_CODE = "worker_lease_expired"
+
+# T1 S1 job log archival: terminal jobs older than the policy cutoff keep
+# their log text (lines plus paired timestamps) in one Brotli blob instead
+# of the raw log_lines_json column. The raw column keeps its historical
+# TEXT NOT NULL shape and stores the '[]' sentinel while the archive is in
+# place; no automatic runtime conversion happens in T1, the caller decides.
+JOB_LOG_ARCHIVE_FORMAT = "job-log-brotli-v1"
+JOB_LOG_ARCHIVE_SENTINEL = "[]"
+JOB_LOG_ARCHIVE_BROTLI_QUALITY = 4
+
+
+def _job_log_archive_eligible(
+    *,
+    status: Any,
+    log_lines: Any,
+    finished_at: Any,
+    cutoff: Any,
+    result_summary: Any,
+) -> bool:
+    """Whether a job may archive its logs at the given cutoff (T2 reuses this).
+
+    Only terminal succeeded/failed/canceled outcomes (legacy 'cancelled'
+    spelling included through normalize) finished at or before the cutoff;
+    never jobs still active or awaiting confirmation, and never synthetic
+    lease-expiry failures, because those stay late-write capable and may
+    still receive the worker's real terminal report.
+    """
+    if JobStatus.normalize(status) not in (
+        JobStatus.SUCCEEDED,
+        JobStatus.FAILED,
+        JobStatus.CANCELED,
+    ):
+        return False
+    if not isinstance(log_lines, list) or not log_lines:
+        return False
+    if isinstance(result_summary, dict) and result_summary.get("diagnostic_code") == LEASE_DIAGNOSTIC_CODE:
+        return False
+    finished = _dt(finished_at) if finished_at is not None else None
+    if finished is None:
+        return False
+    if finished.tzinfo:
+        finished = finished.astimezone(timezone.utc).replace(tzinfo=None)
+    if cutoff.tzinfo:
+        cutoff = cutoff.astimezone(timezone.utc).replace(tzinfo=None)
+    return finished <= cutoff
+
+
+def _encode_job_log_archive(log_lines: List[str], log_timestamps: Optional[List[Optional[str]]]) -> Optional[bytes]:
+    """Serialize one job's logs plus aligned timestamps into a Brotli blob.
+
+    The recoverable framing is a versioned JSON envelope holding the lines
+    JSON and the timestamps JSON as strings, compressed with Brotli text
+    mode at the fixed quality; no positional parsing and no duplicated raw
+    copies of the lines are stored. Returns None when compression is not
+    possible so the caller keeps the existing bytes untouched.
+    """
+    timestamps = log_timestamps
+    if not (isinstance(timestamps, list) and len(timestamps) == len(log_lines)):
+        timestamps = [None] * len(log_lines)
+    try:
+        envelope = {
+            "format": JOB_LOG_ARCHIVE_FORMAT,
+            "lines_json": json.dumps(log_lines),
+            "timestamps_json": json.dumps(timestamps) if any(timestamps) else None,
+        }
+        return brotli.compress(
+            json.dumps(envelope).encode("utf-8"),
+            quality=JOB_LOG_ARCHIVE_BROTLI_QUALITY,
+            mode=brotli.MODE_TEXT,
+        )
+    except Exception:
+        logger.warning("Brotli job log archive encoding failed; existing storage kept")
+        return None
+
+
+def _decode_job_log_archive(blob: Any) -> Tuple[List[str], Optional[List[Optional[str]]]]:
+    """Inverse of _encode_job_log_archive; unreadable data logs and empties."""
+    try:
+        envelope = json.loads(brotli.decompress(bytes(blob)))
+        if not isinstance(envelope, dict) or envelope.get("format") != JOB_LOG_ARCHIVE_FORMAT:
+            raise ValueError("unknown job log archive format")
+        lines = _json_load(envelope.get("lines_json"), None)
+        if not isinstance(lines, list) or any(not isinstance(line, str) for line in lines):
+            raise ValueError("job log archive lines are not text")
+        timestamps_raw = envelope.get("timestamps_json")
+        timestamps = _json_load(timestamps_raw, None) if isinstance(timestamps_raw, str) else None
+        if not isinstance(timestamps, list) or len(timestamps) != len(lines):
+            timestamps = [None] * len(lines)
+        if not any(timestamps):
+            timestamps = None  # Same stored convention as log_timestamps_json.
+        return lines, timestamps
+    except Exception:
+        logger.warning("Unreadable Brotli job log archive; treating the job log as empty")
+        return [], None
 
 # Compact dashboard-stats projection: one row per job with only (job_id,
 # normalized status, started_at). Maintained atomically by triggers on the
@@ -449,6 +544,7 @@ class SQLiteRepositoryBase:
                 "INTEGER NOT NULL DEFAULT 4194304",
             )
             self._ensure_column(connection, "jobs", "log_timestamps_json", "TEXT")
+            self._ensure_column(connection, "jobs", "job_log_brotli", "BLOB")
             self._ensure_column(connection, "targets", "cron_expression", "TEXT")
             self._ensure_column(connection, "targets", "live_access_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "targets", "path_storage", "TEXT")
@@ -818,9 +914,9 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 INSERT OR REPLACE INTO jobs (
                     id, worker_id, command, payload_json, requested_by, target_id, trigger, status,
                     owner_worker_id, lease_token, lease_issued_at, lease_expires_at, attempt_count,
-                    result_summary_json, log_lines_json, log_timestamps_json,
+                    result_summary_json, log_lines_json, log_timestamps_json, job_log_brotli,
                     submitted_at, started_at, finished_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -841,6 +937,10 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     json.dumps(job.log_timestamps)
                     if isinstance(job.log_timestamps, list) and len(job.log_timestamps) == len(job.log_lines)
                     else None,
+                    # save() is the authoritative full-record replace: any stored
+                    # Brotli archive is replaced by these raw log columns, so a
+                    # stale archive is never kept beside a rewritten raw log.
+                    None,
                     job.submitted_at.isoformat(),
                     job.started_at.isoformat() if job.started_at else None,
                     job.finished_at.isoformat() if job.finished_at else None,
@@ -859,6 +959,99 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
         with self._connect() as connection:
             rows = connection.execute("SELECT * FROM jobs ORDER BY submitted_at DESC").fetchall()
         return [self._row_to_job(row) for row in rows]
+
+    def archive_job_log(self, job_id: str, cutoff: datetime) -> int:
+        """Archive one finished job's logs as Brotli (T1 S1), returning bytes saved.
+
+        The Brotli payload is produced outside the SQLite write lock; the
+        final write is a single compare-and-swap against the observed log
+        strings, status, finish time and updated_at, so a later progress or
+        terminal write is never dropped. On any failed validation the stored
+        bytes stay untouched and the return is 0 (including "not smaller":
+        an archive is only kept when it actually saves bytes).
+        """
+        with self._connect() as connection:
+            snapshot = connection.execute(
+                """
+                SELECT status, log_lines_json, log_timestamps_json, finished_at,
+                       result_summary_json, updated_at
+                FROM jobs
+                WHERE id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        if snapshot is None:
+            return 0
+        log_lines_json = snapshot["log_lines_json"]
+        timestamps_json = snapshot["log_timestamps_json"]
+        # The '[]' sentinel is either an already-archived row or an empty log:
+        # both are ineligible, and empty text cannot ever save bytes.
+        if not isinstance(log_lines_json, str) or not log_lines_json or log_lines_json == JOB_LOG_ARCHIVE_SENTINEL:
+            return 0
+        try:
+            log_lines = _json_load(log_lines_json, None)
+            log_timestamps = _json_load(timestamps_json, None) if timestamps_json is not None else None
+            result_summary = _json_load(snapshot["result_summary_json"], None)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0
+        if not _job_log_archive_eligible(
+            status=snapshot["status"],
+            log_lines=log_lines,
+            finished_at=snapshot["finished_at"],
+            cutoff=cutoff,
+            result_summary=result_summary,
+        ):
+            return 0
+        timestamps = (
+            log_timestamps
+            if isinstance(log_timestamps, list) and len(log_timestamps) == len(log_lines)
+            else [None] * len(log_lines)
+        )
+        archive = _encode_job_log_archive(log_lines, timestamps)
+        if archive is None:
+            return 0
+        try:
+            raw_chars = (
+                len(log_lines_json.encode("utf-8"))
+                + (len(timestamps_json.encode("utf-8")) if isinstance(timestamps_json, str) else 0)
+            )
+            saved = raw_chars - len(archive)
+        except (TypeError, ValueError):
+            return 0
+        if saved <= 0:
+            return 0
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                updated = connection.execute(
+                    """
+                    UPDATE jobs
+                    SET log_lines_json = ?, log_timestamps_json = NULL, job_log_brotli = ?
+                    WHERE id = ? AND status = ?
+                      AND log_lines_json IS ?
+                      AND log_timestamps_json IS ?
+                      AND finished_at IS ?
+                      AND updated_at IS ?
+                    """,
+                    (
+                        JOB_LOG_ARCHIVE_SENTINEL,
+                        archive,
+                        job_id,
+                        snapshot["status"],
+                        log_lines_json,
+                        timestamps_json if timestamps_json is not None else None,
+                        snapshot["finished_at"],
+                        snapshot["updated_at"],
+                    ),
+                )
+                connection.commit()
+                return saved if updated.rowcount == 1 else 0
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
 
     def has_active_backup_for_target(self, target_id: str) -> bool:
         with self._connect() as connection:
@@ -1588,6 +1781,17 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
 
     @staticmethod
     def _row_to_job(row: sqlite3.Row) -> JobRecord:
+        keys = row.keys()
+        archive_blob = row["job_log_brotli"] if "job_log_brotli" in keys else None
+        log_lines_json = row["log_lines_json"]
+        if (
+            archive_blob is not None
+            and (log_lines_json is None or log_lines_json in ("", JOB_LOG_ARCHIVE_SENTINEL))
+        ):
+            log_lines, log_timestamps = _decode_job_log_archive(archive_blob)
+        else:
+            log_lines = _json_load(log_lines_json, [])
+            log_timestamps = _json_load(row["log_timestamps_json"], None)
         return JobRecord(
             id=row["id"],
             worker_id=row["worker_id"],
@@ -1603,8 +1807,8 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             lease_expires_at=_dt(row["lease_expires_at"]),
             attempt_count=row["attempt_count"] or 0,
             result_summary=_json_load(row["result_summary_json"], None),
-            log_lines=_json_load(row["log_lines_json"], []),
-            log_timestamps=_json_load(row["log_timestamps_json"], None),
+            log_lines=log_lines,
+            log_timestamps=log_timestamps,
             submitted_at=_dt(row["submitted_at"]) or datetime.utcnow(),
             started_at=_dt(row["started_at"]),
             finished_at=_dt(row["finished_at"]),

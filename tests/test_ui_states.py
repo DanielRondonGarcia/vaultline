@@ -114,6 +114,53 @@ class SnapshotExplorerUiStateTests(unittest.TestCase):
         cls.css = UI_CSS_PATH.read_text(encoding="utf-8")
         cls.app_css = UI_APP_CSS_PATH.read_text(encoding="utf-8")
 
+    def test_settings_view_exposes_job_log_maintenance_controls_and_alert_state(self):
+        for marker in (
+            'id="settingsJobLogMaintenanceEnabled"',
+            'id="settingsJobLogMaintenanceArchiveDays"',
+            'id="settingsJobLogMaintenanceRetentionDays"',
+            'id="settingsJobLogMaintenanceQuotaGiB"',
+            "data-job-log-policy-alert",
+            "data-job-log-policy-usage",
+            "job_log_maintenance_enabled",
+            "job_log_archive_after_days",
+            "job_log_retention_days",
+            "job_log_quota_gib",
+            "job_log_quota_gib: quotaGiB === \"\" ? null : quotaGiB",
+            "job_log_archive_after_days: archiveDays",
+            "job_log_retention_days: retentionDays",
+            "El día de archivo debe ser menor que el día de retención",
+            "El día de archivo debe ser un número entero entre 1 y 3650",
+            "comprimidos con Brotli",
+            "Sin cuota",
+            "state.settings.job_log_maintenance_enabled ?? false",
+            "state.settings.job_log_archive_after_days ?? 30",
+            "state.settings.job_log_retention_days ?? 90",
+            "const maintenance = state.settings.job_log_maintenance || {};",
+            "Cuota de logs activada",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.source)
+
+    def test_job_log_view_distinguishes_removed_by_policy_from_empty(self):
+        target_renderer = re.search(
+            r"function renderTargetJobLogsInto\(job, root\) \{.*?\n    \}",
+            self.source,
+            re.S,
+        )
+        accordion_renderer = re.search(
+            r"function renderJobLogsInto\(job, container\) \{.*?\n    \}",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(target_renderer)
+        self.assertIsNotNone(accordion_renderer)
+        for marker in (target_renderer.group(0), accordion_renderer.group(0)):
+            with self.subTest(renderer=marker[:60]):
+                self.assertIn("job.log_removed_by_policy", marker)
+                self.assertIn("eliminado por la politica de retencion", marker)
+                self.assertIn("Sin logs", marker)
+
     def test_worker_commands_modal_removes_http_warning_and_keeps_renewal_compose_markers(self):
         self.assertNotIn("HTTP no es confidencial", self.source)
         for marker in (

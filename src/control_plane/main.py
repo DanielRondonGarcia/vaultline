@@ -43,6 +43,8 @@ from src.control_plane.application.services.scheduler_service import (
     SCHEDULER_TIMEZONE_ENV,
     SchedulerService,
 )
+from src.control_plane.application.services.job_log_maintenance import JobLogMaintenanceService
+from src.control_plane.application.services.control_plane_service import SETTINGS_UNSET
 from src.control_plane.domain.models import JobStatus
 from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryDashboardReadSnapshotRepository,
@@ -454,6 +456,7 @@ class ControlPlaneApplication:
     live_lane: "LiveWorkerLane | None" = None
     filesystem_size_estimates: dict | None = None
     dashboard_read_service: "DashboardReadService | None" = None
+    job_log_maintenance: "JobLogMaintenanceService | None" = None
 
 
 class ControlPlaneHTTPServer(ThreadingHTTPServer):
@@ -558,6 +561,11 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
         server = getattr(self, "server", None)
         application = getattr(server, "application", None)
         return getattr(application, "scheduler", None)
+
+    def _job_log_maintenance_lane(self):
+        server = getattr(self, "server", None)
+        application = getattr(server, "application", None)
+        return getattr(application, "job_log_maintenance", None)
 
     def _target_jsonable(self, target):
         return build_target_view(target, self._control_plane_service(), self._scheduler())
@@ -883,10 +891,15 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/settings":
                 if not self._require_auth(ROLE_ADMIN, head_only=head_only, api_mode=True):
                     return
-                settings = self._control_plane_service().get_settings()
+                svc = self._control_plane_service()
+                settings = svc.get_settings()
                 payload = _to_jsonable(settings or {})
                 scheduler = self._scheduler()
                 payload["scheduler_timezone"] = scheduler.timezone_name if scheduler else DEFAULT_SCHEDULER_TIMEZONE
+                # T2 S3 alert surface: measured usage, recent quota
+                # breach/eviction events and lane metrics (no secrets, no log text).
+                maintenance = self._job_log_maintenance_lane()
+                payload["job_log_maintenance"] = svc.job_log_maintenance_status(maintenance=maintenance)
                 return self._write_json(200, payload, head_only=head_only)
             if path == "/api/v1/settings/rclone-remote":
                 if not self._require_auth(ROLE_ADMIN, head_only=head_only, api_mode=True):
@@ -1679,6 +1692,14 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     snapshot_explorer_listing_max_output_bytes=body.get(
                         "snapshot_explorer_listing_max_output_bytes"
                     ),
+                    job_log_maintenance_enabled=body.get("job_log_maintenance_enabled"),
+                    job_log_archive_after_days=body.get("job_log_archive_after_days"),
+                    job_log_retention_days=body.get("job_log_retention_days"),
+                    # An omitted PATCH key keeps the stored quota; an explicit
+                    # JSON null disables the job-log quota.
+                    job_log_quota_gib=(
+                        body["job_log_quota_gib"] if "job_log_quota_gib" in body else SETTINGS_UNSET
+                    ),
                 )
                 return self._write_json(200, _to_jsonable(settings))
             if len(parts) == 4 and parts[:3] == ["api", "v1", "secrets"]:
@@ -2347,6 +2368,7 @@ def build_application() -> ControlPlaneApplication:
         )
         read_model_interval = 5.0
     dashboard_read_service = _build_dashboard_read_service(control_plane_service, scheduler, read_model_interval)
+    job_log_maintenance = JobLogMaintenanceService(control_plane_service)
     app = ControlPlaneApplication(
         auth_service=AuthService.from_runtime(),
         control_plane_service=control_plane_service,
@@ -2355,6 +2377,7 @@ def build_application() -> ControlPlaneApplication:
         live_file_service=LiveFileService(),
         live_lane=LiveWorkerLane(),
         dashboard_read_service=dashboard_read_service,
+        job_log_maintenance=job_log_maintenance,
     )
     return app
 
@@ -2369,11 +2392,15 @@ def run_control_plane(
 
     The dashboard read-model lane starts (hydrated snapshots already loaded)
     together with an asynchronous first refresh of the targets key and the
-    default stats offset, before serving; the finally block stops the lane and
-    the backup scheduler without changing any cron evaluation semantics.
+    default stats offset, before serving; the finally block stops the lane,
+    the job-log maintenance lane and the backup scheduler without changing
+    any cron evaluation semantics. The job-log lane stays idle until job-log
+    maintenance is enabled in Global Settings.
     """
     if application.scheduler is not None:
         application.scheduler.start()
+    if application.job_log_maintenance is not None:
+        application.job_log_maintenance.start()
     if application.tls_manager is not None:
         server = ControlPlaneHTTPSServer(
             (host, port),
@@ -2398,6 +2425,8 @@ def run_control_plane(
     finally:
         if read_service is not None:
             read_service.stop()
+        if application.job_log_maintenance is not None:
+            application.job_log_maintenance.stop()
         if application.scheduler is not None:
             application.scheduler.stop()
         server.server_close()

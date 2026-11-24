@@ -6078,7 +6078,13 @@ docker compose up -d
       const lines = job.log_lines || [];
       if (!lines.length) {
         const terminal = isTerminalJobStatus(job.status);
-        container.innerHTML = `<div class="log-line info">${terminal ? "Sin logs disponibles para esta ejecucion." : "Esperando logs del worker..."}</div>`;
+        container.innerHTML = `<div class="log-line info">${
+          job.log_removed_by_policy
+            ? "Log de esta ejecución eliminado por la politica de retencion (mantenimiento de logs)."
+            : terminal
+              ? "Sin logs disponibles para esta ejecucion."
+              : "Esperando logs del worker..."
+        }</div>`;
         return;
       }
       renderJobLogLinesInto(container, lines, job.id, (line, timestampMarkup = "") => {
@@ -7290,7 +7296,11 @@ docker compose up -d
       renderJobDetailSummary(job, container.closest(".log-panel"));
       const lines = job.log_lines || [];
       if (lines.length === 0) {
-        container.innerHTML = `<div class="log-line info">Sin logs disponibles</div>`;
+        container.innerHTML = `<div class="log-line info">${
+          job.log_removed_by_policy
+            ? "Log de esta ejecución eliminado por la politica de retencion (mantenimiento de logs)."
+            : "Sin logs disponibles"
+        }</div>`;
         return;
       }
       renderJobLogLinesInto(container, lines, job.id, (line, timestampMarkup = "") => {
@@ -9133,6 +9143,41 @@ docker compose up -d
               <div id="settingsSnapshotListingMaxOutputError" role="alert" aria-live="polite" style="margin-top:6px; color:var(--destructive); font-size:12px;"></div>
             </div>
           </div>
+          <div class="settings-card">
+            <div class="settings-card-header">
+              <span class="settings-icon">🗄️</span>
+              <div>
+                <h3>Mantenimiento de logs de jobs</h3>
+                <div class="settings-card-sub">Cuota y retencion de logs (SQLite)</div>
+              </div>
+            </div>
+            <div id="jobLogPolicyAlert" data-job-log-policy-alert style="margin:10px 0;"></div>
+            <div id="jobLogPolicyUsage" data-job-log-policy-usage class="helper"></div>
+            <div class="helper">Mantenimiento desactivado por defecto. Al activarlo: los logs terminados mas viejos que <strong>X dias de archivo</strong> se guardan comprimidos con Brotli (sin perdida), los logs terminados mas viejos que <strong>Y dias de retencion</strong> se eliminan, y una cuota opcional en GiB evicta primero los logs terminados mas antiguos. Los jobs, resumenes, snapshots y backups nunca se eliminan. Haz un <strong>backup de la base de datos antes de activar</strong>: el borrado es irreversible y la version anterior de la UI no podra leer los logs archivados. Sin VACUUM automatico: el espacio se reutiliza, el archivo SQLite no se encoge.</div>
+            <div class="field full" style="margin-top:12px;">
+              <label for="settingsJobLogMaintenanceEnabled">
+                <input id="settingsJobLogMaintenanceEnabled" type="checkbox" style="width:auto; margin-right:8px;" ${state.settings.job_log_maintenance_enabled ?? false ? "checked" : ""} aria-describedby="settingsJobLogMaintenanceHelp" />
+                Activar mantenimiento automatico de logs</label>
+              <div id="settingsJobLogMaintenanceHelp" class="helper">Opt-in explicito: al activarlo se aplican el archivo, la retencion y la cuota configurados.</div>
+            </div>
+            <div class="settings-grid" style="margin-top:8px;">
+              <div class="field">
+                <label for="settingsJobLogMaintenanceArchiveDays">Dias de archivo (comprimir con Brotli)</label>
+                <input id="settingsJobLogMaintenanceArchiveDays" type="number" min="1" max="3650" step="1" value="${state.settings.job_log_archive_after_days ?? 30}" required />
+                <div class="helper">Entero entre 1 y 3650. Los logs de jobs terminados con mas de esta edad se comprimen (por defecto 30).</div>
+              </div>
+              <div class="field">
+                <label for="settingsJobLogMaintenanceRetentionDays">Dias de retencion (eliminar logs)</label>
+                <input id="settingsJobLogMaintenanceRetentionDays" type="number" min="1" max="3650" step="1" value="${state.settings.job_log_retention_days ?? 90}" required />
+                <div class="helper">Entero mayor que los dias de archivo (por defecto 90). Los logs mas viejos se eliminan por politica.</div>
+              </div>
+              <div class="field">
+                <label for="settingsJobLogMaintenanceQuotaGiB">Cuota de logs (GiB, opcional)</label>
+                <input id="settingsJobLogMaintenanceQuotaGiB" type="number" min="1" max="1024" step="1" placeholder="Sin cuota" value="${state.settings.job_log_quota_gib ?? ""}" />
+                <div class="helper">Cuota sobre la suma de payloads de logs de jobs (metadatos, no el archivo SQLite). Al superarla se avisa y se eliminan primero los logs terminados mas antiguos. Vacio = sin cuota.</div>
+              </div>
+            </div>
+          </div>
           </section>
 
           <div class="settings-actions" id="settingsFormActions">
@@ -9213,6 +9258,59 @@ docker compose up -d
         }
         listingLimitInput.setAttribute("aria-invalid", "false");
         listingLimitError.textContent = "";
+        const maintenanceEnabled = document.getElementById("settingsJobLogMaintenanceEnabled").checked;
+        const archiveInput = document.getElementById("settingsJobLogMaintenanceArchiveDays");
+        const retentionInput = document.getElementById("settingsJobLogMaintenanceRetentionDays");
+        const quotaInput = document.getElementById("settingsJobLogMaintenanceQuotaGiB");
+        const archiveDays = Number(archiveInput.value);
+        const retentionDays = Number(retentionInput.value);
+        const quotaGiB = quotaInput.value.trim() === "" ? null : Number(quotaInput.value);
+        if (!Number.isInteger(archiveDays) || archiveDays < 1 || archiveDays > 3650) {
+          const message = "El día de archivo debe ser un número entero entre 1 y 3650.";
+          archiveInput.setAttribute("aria-invalid", "true");
+          showFeedback(message, "error");
+          focusSettingsControl("settingsTabControlPlane", "settingsJobLogMaintenanceArchiveDays");
+          return;
+        }
+        archiveInput.setAttribute("aria-invalid", "false");
+        if (!Number.isInteger(retentionDays) || retentionDays < 1 || retentionDays > 3650) {
+          const message = "El día de retención debe ser un número entero entre 1 y 3650.";
+          retentionInput.setAttribute("aria-invalid", "true");
+          showFeedback(message, "error");
+          focusSettingsControl("settingsTabControlPlane", "settingsJobLogMaintenanceRetentionDays");
+          return;
+        }
+        retentionInput.setAttribute("aria-invalid", "false");
+        if (archiveDays >= retentionDays) {
+          const message = "El día de archivo debe ser menor que el día de retención.";
+          archiveInput.setAttribute("aria-invalid", "true");
+          showFeedback(message, "error");
+          focusSettingsControl("settingsTabControlPlane", "settingsJobLogMaintenanceArchiveDays");
+          return;
+        }
+        archiveInput.setAttribute("aria-invalid", "false");
+        if (quotaGiB !== null && (!Number.isInteger(quotaGiB) || quotaGiB < 1 || quotaGiB > 1024)) {
+          const message = "La cuota de logs debe ser un número entero entre 1 y 1024 GiB, o quedar vacía.";
+          quotaInput.setAttribute("aria-invalid", "true");
+          showFeedback(message, "error");
+          focusSettingsControl("settingsTabControlPlane", "settingsJobLogMaintenanceQuotaGiB");
+          return;
+        }
+        if (quotaInput) quotaInput.setAttribute("aria-invalid", "false");
+        const maintenance = state.settings.job_log_maintenance || {};
+        const policyAlert = document.getElementById("jobLogPolicyAlert");
+        if (policyAlert) {
+          if (maintenance.supported === false) {
+            policyAlert.innerHTML = `<div class="helper" style="color:var(--muted-foreground);">${escapeHtml(maintenance.message || "Mantenimiento de logs no disponible para este backend.")}</div>`;
+          } else if (maintenance.quota_breached) {
+            const usageText = maintenance.usage ? `Uso medido: ${Math.round((maintenance.usage.measured_bytes / (1024 * 1024 * 1024)) * 100) / 100} GiB.` : "";
+            policyAlert.innerHTML = `<div style="padding:10px 12px; border-radius:var(--radius); background:color-mix(in srgb, var(--destructive) 10%, var(--background)); border:1px solid color-mix(in srgb, var(--destructive) 30%, transparent); color:var(--destructive); font-size:13px; font-weight:600;">⚠ Cuota de logs activada o superada recientemente. ${usageText} La cuota se mantiene visible aunque la eviction automatica haya reducido el uso por debajo de ella.</div>`;
+          } else if (maintenance.usage) {
+            const gigabytes = Math.round((maintenance.usage.measured_bytes / (1024 * 1024 * 1024)) * 100) / 100;
+            const completeness = maintenance.usage.complete ? "" : " (algunos logs historicos se contabilizan conforme corre el mantenimiento)";
+            policyAlert.innerHTML = `<div class="helper">Logs de jobs medidos: <strong>${gigabytes} GiB</strong>${completeness}${maintenance.quota_gib ? ` de una cuota de ${maintenance.quota_gib} GiB.` : "."}</div>`;
+          }
+        }
         await withBtnLoading(e.submitter, async () => {
           await apiPatch("/api/v1/settings", {
             restic_repository_base: repoBase,
@@ -9221,6 +9319,10 @@ docker compose up -d
             global_cron_expression: globalCron,
             control_plane_public_url: publicUrl,
             snapshot_explorer_listing_max_output_bytes: listingLimitMiB * 1024 * 1024,
+            job_log_maintenance_enabled: maintenanceEnabled,
+            job_log_archive_after_days: archiveDays,
+            job_log_retention_days: retentionDays,
+            job_log_quota_gib: quotaGiB === "" ? null : quotaGiB,
           });
           await refreshAll();
           showFeedback("Guardado exitosamente.", "success");

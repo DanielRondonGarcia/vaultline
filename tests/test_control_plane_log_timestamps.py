@@ -440,6 +440,12 @@ class ControlPlaneLogTimestampTests(unittest.TestCase):
             try:
                 columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
                 if "log_timestamps_json" in columns:
+                    # The T2 log-size triggers reference the column, so the
+                    # simulated legacy downgrade removes them first; opening
+                    # the repository again recreates them against the
+                    # migrated schema.
+                    connection.execute("DROP TRIGGER IF EXISTS trg_job_log_sizes_update")
+                    connection.execute("DROP TRIGGER IF EXISTS trg_job_log_sizes_insert")
                     connection.execute("ALTER TABLE jobs DROP COLUMN log_timestamps_json")
                 connection.commit()
             finally:
@@ -458,6 +464,44 @@ class ControlPlaneLogTimestampTests(unittest.TestCase):
             self.assertIsNone(job.log_timestamps)
             self.assertEqual(migrated.get_schema_version(), 1)
             self.assertEqual(migrated.get("legacy-job").log_lines, ["old line"])
+
+    def test_removed_marker_roundtrips_through_save_and_get(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = f"{directory}/control-plane.db"
+            repository = SQLiteJobRepository(database_path)
+            job = repository.save(JobRecord(
+                worker_id="worker-a", command="backup.run", id="removed-job",
+                status=JobStatus.SUCCEEDED, log_lines=["old line"],
+                finished_at=utcnow() - timedelta(days=120),
+            ))
+            self.assertFalse(job.job_log_removed)
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute(
+                    "UPDATE jobs SET log_lines_json = '[]', log_timestamps_json = NULL, "
+                    "job_log_brotli = NULL, job_log_removed = 1 WHERE id = ?",
+                    ("removed-job",),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            removed = repository.get("removed-job")
+            self.assertTrue(removed.job_log_removed)
+            self.assertEqual(removed.log_lines, [])
+            # The full-record replace path persists the observed marker value.
+            removed.updated_at = utcnow()
+            repository.save(removed)
+            self.assertTrue(repository.get("removed-job").job_log_removed)
+            self.assertEqual(memory_job_marker(), False)
+
+
+def memory_job_marker():
+    """In-memory records carry the same marker field with a False default."""
+    from src.control_plane.infrastructure.repositories.in_memory import InMemoryJobRepository
+
+    in_memory = InMemoryJobRepository()
+    job = in_memory.save(JobRecord(worker_id="worker-a", command="backup.run"))
+    return job.job_log_removed
 
 
 if __name__ == "__main__":

@@ -71,6 +71,63 @@ JOB_LOG_ARCHIVE_FORMAT = "job-log-brotli-v1"
 JOB_LOG_ARCHIVE_SENTINEL = "[]"
 JOB_LOG_ARCHIVE_BROTLI_QUALITY = 4
 
+# T2 S1-S3 job log lifecycle compact metadata: one small row per job with
+# only the stored log byte size (raw columns plus the Brotli archive when
+# present). Maintained atomically by triggers on the jobs table so every
+# INSERT/replace path is covered; job-log policy usage queries aggregate
+# ONLY this table, never the wide rows or their payload text. Legacy rows
+# recorded before the triggers existed stay unaccounted until the bounded
+# keyset backfill pass runs while maintenance is enabled.
+JOB_LOG_SIZES_TABLE = "job_log_sizes"
+JOB_LOG_SIZES_BACKFILL_META_KEY = "job_log_sizes_backfill_done"
+JOB_LOG_POLICY_EVENTS_META_KEY = "job_log_policy_events"
+JOB_LOG_POLICY_EVENT_LIMIT = 20
+
+# B1: policy selection is a COVERING path over the compact metadata only.
+# Wide jobs rows (log payloads living in overflow chains) made the batch-0
+# jobs-join selection cost ~0.47 s at 400 rows x 2 MiB logs while tiny log
+# rows stayed under 0.01 s; on a 24 GiB database that ran inside every
+# BEGIN IMMEDIATE batch, so the selection now projects all needed state
+# (terminal/payload/archived/removed flags, finish time) into the compact
+# metadata via triggers and selects/orders only through the policy index.
+# The wide jobs rows are touched again only per SELECTED candidate (bounded
+# by the batch limit) for the diagnostic recheck and the writer CAS.
+JOB_LOG_POLICY_INDEX_NAME = "idx_job_log_sizes_policy"
+# B2: the stored quota is read inside the eviction transaction and converted
+# with this fixed 1 GiB = 2**30 factor (tests scale it down).
+JOB_LOG_QUOTA_GIB_TO_BYTES = 1024 ** 3
+
+
+def job_log_policy_candidates_sql(
+    *,
+    with_cutoff: bool,
+    require_unarchived: bool = False,
+    exclude_count: int = 0,
+) -> str:
+    """Covering candidate selection over compact metadata (deterministic)."""
+    clauses = [
+        "payload_present = 1",
+        "terminal = 1",
+        "removed = 0",
+    ]
+    if with_cutoff:
+        clauses.append("finished_at <= :cutoff")
+    if require_unarchived:
+        clauses.append("archived = 0")
+    if exclude_count > 0:
+        placeholders = ", ".join("?" for _ in range(exclude_count))
+        clauses.append(f"job_id NOT IN ({placeholders})")
+    where = " AND ".join(clauses)
+    return (
+        f"SELECT job_id FROM {JOB_LOG_SIZES_TABLE} WHERE {where} "
+        "ORDER BY finished_at ASC, job_id ASC LIMIT :limit"
+    )
+
+# Terminal outcomes recognized by the compact metadata projection; the
+# legacy 'cancelled' spelling stays eligible (trigger + backfill only read
+# status, never the wide payload columns).
+JOB_LOG_ELIGIBLE_STATUSES_SQL = "('succeeded', 'failed', 'canceled', 'cancelled')"
+
 
 def _job_log_archive_eligible(
     *,
@@ -543,8 +600,28 @@ class SQLiteRepositoryBase:
                 "snapshot_explorer_listing_max_output_bytes",
                 "INTEGER NOT NULL DEFAULT 4194304",
             )
+            self._ensure_column(
+                connection,
+                "settings",
+                "job_log_maintenance_enabled",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            self._ensure_column(
+                connection,
+                "settings",
+                "job_log_archive_after_days",
+                f"INTEGER NOT NULL DEFAULT {SettingsRecord.DEFAULT_JOB_LOG_ARCHIVE_AFTER_DAYS}",
+            )
+            self._ensure_column(
+                connection,
+                "settings",
+                "job_log_retention_days",
+                f"INTEGER NOT NULL DEFAULT {SettingsRecord.DEFAULT_JOB_LOG_RETENTION_DAYS}",
+            )
+            self._ensure_column(connection, "settings", "job_log_quota_gib", "INTEGER")
             self._ensure_column(connection, "jobs", "log_timestamps_json", "TEXT")
             self._ensure_column(connection, "jobs", "job_log_brotli", "BLOB")
+            self._ensure_column(connection, "jobs", "job_log_removed", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "targets", "cron_expression", "TEXT")
             self._ensure_column(connection, "targets", "live_access_enabled", "INTEGER NOT NULL DEFAULT 0")
             self._ensure_column(connection, "targets", "path_storage", "TEXT")
@@ -596,6 +673,73 @@ class SQLiteRepositoryBase:
                 "WHERE job_id = OLD.id; END",
             ):
                 connection.execute(trigger_sql)
+            connection.execute(
+                f"CREATE TABLE IF NOT EXISTS {JOB_LOG_SIZES_TABLE} ("
+                "job_id TEXT PRIMARY KEY, log_bytes INTEGER NOT NULL, "
+                "finished_at TEXT, terminal INTEGER, payload_present INTEGER, "
+                "archived INTEGER, removed INTEGER)"
+            )
+            # B1: compact covering index for policy selection; small rows only,
+            # no wide column in the index and no expensive startup build over
+            # jobs payloads.
+            for compact_column, column_sql in (
+                ("finished_at", "TEXT"),
+                ("terminal", "INTEGER"),
+                ("payload_present", "INTEGER"),
+                ("archived", "INTEGER"),
+                ("removed", "INTEGER"),
+            ):
+                self._ensure_column(connection, JOB_LOG_SIZES_TABLE, compact_column, column_sql)
+            connection.execute(
+                f"CREATE INDEX IF NOT EXISTS {JOB_LOG_POLICY_INDEX_NAME} "
+                f"ON {JOB_LOG_SIZES_TABLE} "
+                "(payload_present, terminal, removed, finished_at, job_id)"
+            )
+            job_log_terminal_expr = (
+                f"CASE WHEN NEW.status IN {JOB_LOG_ELIGIBLE_STATUSES_SQL} THEN 1 ELSE 0 END"
+            )
+            job_log_payload_expr = (
+                "CASE WHEN NEW.job_log_brotli IS NOT NULL THEN 1 "
+                "WHEN NEW.log_lines_json IS NULL OR NEW.log_lines_json IN ('', '[]') "
+                "THEN 0 ELSE 1 END"
+            )
+            job_log_columns = (
+                "(job_id, log_bytes, finished_at, terminal, payload_present, archived, removed)"
+            )
+            job_log_values = (
+                "(NEW.id, "
+                + "length(CAST(NEW.log_lines_json AS BLOB))"
+                + " + COALESCE(length(CAST(NEW.log_timestamps_json AS BLOB)), 0)"
+                + " + COALESCE(length(NEW.job_log_brotli), 0)"
+                + ", NEW.finished_at, " + job_log_terminal_expr
+                + ", " + job_log_payload_expr
+                + ", CASE WHEN NEW.job_log_brotli IS NOT NULL THEN 1 ELSE 0 END, "
+                + "COALESCE(NEW.job_log_removed, 0))"
+            )
+            for size_trigger_sql in (
+                "CREATE TRIGGER IF NOT EXISTS trg_job_log_sizes_insert "
+                f"AFTER INSERT ON jobs BEGIN INSERT OR REPLACE INTO {JOB_LOG_SIZES_TABLE} "
+                + job_log_columns + " VALUES " + job_log_values + "; END",
+                "CREATE TRIGGER IF NOT EXISTS trg_job_log_sizes_update "
+                f"AFTER UPDATE OF log_lines_json, log_timestamps_json, job_log_brotli, "
+                "job_log_removed, status, finished_at ON jobs "
+                f"BEGIN INSERT OR REPLACE INTO {JOB_LOG_SIZES_TABLE} "
+                + job_log_columns + " VALUES " + job_log_values + "; END",
+                "CREATE TRIGGER IF NOT EXISTS trg_job_log_sizes_delete "
+                f"AFTER DELETE ON jobs BEGIN DELETE FROM {JOB_LOG_SIZES_TABLE} WHERE job_id = OLD.id; END",
+            ):
+                connection.execute(size_trigger_sql)
+            # B1: a batch-0 marker must not claim completeness while any
+            # compact row lacks the projected flags; the check is a scan of
+            # the compact metadata table only (small rows, no payload deref).
+            stale_flags = connection.execute(
+                f"SELECT 1 FROM {JOB_LOG_SIZES_TABLE} WHERE terminal IS NULL LIMIT 1"
+            ).fetchone()
+            if stale_flags:
+                connection.execute(
+                    "DELETE FROM schema_meta WHERE key = ?",
+                    (JOB_LOG_SIZES_BACKFILL_META_KEY,),
+                )
             self._backfill_job_stats_facts_once(connection)
             connection.execute(
                 "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
@@ -915,8 +1059,8 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     id, worker_id, command, payload_json, requested_by, target_id, trigger, status,
                     owner_worker_id, lease_token, lease_issued_at, lease_expires_at, attempt_count,
                     result_summary_json, log_lines_json, log_timestamps_json, job_log_brotli,
-                    submitted_at, started_at, finished_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    job_log_removed, submitted_at, started_at, finished_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -941,6 +1085,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     # Brotli archive is replaced by these raw log columns, so a
                     # stale archive is never kept beside a rewritten raw log.
                     None,
+                    1 if getattr(job, "job_log_removed", False) else 0,
                     job.submitted_at.isoformat(),
                     job.started_at.isoformat() if job.started_at else None,
                     job.finished_at.isoformat() if job.finished_at else None,
@@ -1047,6 +1192,465 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                 )
                 connection.commit()
                 return saved if updated.rowcount == 1 else 0
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    # ------------------------------------------------------------------
+    # T2 S1-S3 job log lifecycle: bounded policy operations. Only this
+    # SQLite-backed repository implements them; the in-memory backend does
+    # not, so maintenance is reported as unsupported there. Every write is
+    # an atomic predicate update inside one short BEGIN IMMEDIATE
+    # transaction; a failure leaves the stored log bytes untouched.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _log_backfill_row(connection, after_id: Any = "", limit: int = 1) -> Tuple[List[str], bool]:
+        """One bounded keyset batch of compact metadata rows needing refresh.
+
+        Missing compact rows and batch-0 rows without the projected policy
+        flags are both refreshed here. Only the selected (bounded) batch has
+        its wide columns touched; the policy-selection path never does. The
+        raw log payload text is never decoded and never leaves the database.
+        The batch is complete when fewer than `limit` pending rows were found
+        from the keyset position.
+        """
+        rows = connection.execute(
+            f"""
+            SELECT j.id,
+                   length(CAST(j.log_lines_json AS BLOB))
+                   + COALESCE(length(CAST(j.log_timestamps_json AS BLOB)), 0)
+                   + COALESCE(length(j.job_log_brotli), 0) AS log_bytes,
+                   j.finished_at AS finished_at,
+                   CASE WHEN j.status IN {JOB_LOG_ELIGIBLE_STATUSES_SQL} THEN 1 ELSE 0 END AS terminal,
+                   CASE WHEN j.job_log_brotli IS NOT NULL THEN 1
+                        WHEN j.log_lines_json IS NULL OR j.log_lines_json IN ('', '[]')
+                        THEN 0 ELSE 1 END AS payload_present,
+                   CASE WHEN j.job_log_brotli IS NOT NULL THEN 1 ELSE 0 END AS archived,
+                   COALESCE(j.job_log_removed, 0) AS removed
+            FROM jobs j LEFT JOIN {JOB_LOG_SIZES_TABLE} s ON s.job_id = j.id
+            WHERE (s.job_id IS NULL OR s.terminal IS NULL) AND j.id > ?
+            ORDER BY j.id ASC
+            LIMIT ?
+            """,
+            (after_id, limit),
+        ).fetchall()
+        for row in rows:
+            connection.execute(
+                f"INSERT OR REPLACE INTO {JOB_LOG_SIZES_TABLE} "
+                "(job_id, log_bytes, finished_at, terminal, payload_present, archived, removed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    row["id"],
+                    row["log_bytes"],
+                    row["finished_at"],
+                    row["terminal"],
+                    row["payload_present"],
+                    row["archived"],
+                    row["removed"],
+                ),
+            )
+        last_id = rows[-1]["id"] if rows else after_id
+        followup = connection.execute(
+            f"""
+            SELECT 1
+            FROM jobs j LEFT JOIN {JOB_LOG_SIZES_TABLE} s ON s.job_id = j.id
+            WHERE (s.job_id IS NULL OR s.terminal IS NULL) AND j.id > ? LIMIT 1
+            """,
+            (last_id,),
+        ).fetchone()
+        return [row["id"] for row in rows], followup is None
+
+    def backfill_job_log_sizes(self, batch_size: int = 25) -> Dict[str, Any]:
+        """Refresh a bounded keyset batch of legacy compact-metadata rows.
+
+        Covers both missing size rows and batch-0 rows whose projected policy
+        flags were never set. Runs only while job-log maintenance is enabled.
+        When a pass finds nothing left from the keyset position, the
+        completion marker is written and usage is considered complete.
+        """
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                marker = connection.execute(
+                    "SELECT value FROM schema_meta WHERE key = ?", (JOB_LOG_SIZES_BACKFILL_META_KEY,)
+                ).fetchone()
+                if marker:
+                    connection.commit()
+                    return {"backfilled": 0, "complete": True}
+                backfilled, complete = self._log_backfill_row(
+                    connection, after_id="", limit=batch_size
+                )
+                if complete:
+                    connection.execute(
+                        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                        (JOB_LOG_SIZES_BACKFILL_META_KEY, utcnow().isoformat()),
+                    )
+                connection.commit()
+                return {"backfilled": len(backfilled), "complete": complete}
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def job_log_usage(self) -> Dict[str, Any]:
+        """Measured job-log payload usage from the compact sizes metadata.
+
+        The total is a hard lower bound of the real usage while the backfill
+        completion marker is absent, so exceedance against a quota is always
+        proven, never estimated. Legacy unaccounted rows are lazily filled by
+        bounded backfill batches, never by a startup full-table scan.
+        """
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT COALESCE(SUM(log_bytes), 0) AS measured, COUNT(*) AS accounted "
+                f"FROM {JOB_LOG_SIZES_TABLE}"
+            ).fetchone()
+            marker = connection.execute(
+                "SELECT 1 FROM schema_meta WHERE key = ?", (JOB_LOG_SIZES_BACKFILL_META_KEY,)
+            ).fetchone()
+        return {
+            "measured_bytes": int(row["measured"]),
+            "accounted_rows": int(row["accounted"]),
+            "complete": marker is not None,
+        }
+
+    @staticmethod
+    def _selected_candidate_ids_locked(
+        connection,
+        *,
+        with_cutoff: bool,
+        cutoff_text: Optional[str] = None,
+        require_unarchived: bool = False,
+        limit: int = 1,
+        exclude_ids: Optional[List[str]] = None,
+    ) -> List[str]:
+        """Bounded oldest-finished candidate ids from compact metadata ONLY.
+
+        Covering (B1): the selection reads the policy index over the compact
+        metadata; the wide jobs rows are never dereferenced here. Eligibility
+        mirrors _job_log_archive_eligible minus the diagnostic guard: terminal
+        outcomes (legacy 'cancelled' spelling included via the trigger), a
+        stored finish time, present payload, never already-removed rows. The
+        synthetic lease-expiry guard is rechecked per SELECTED row below, so
+        result_summary_json is never scanned for every wide row.
+        """
+        excluded = list(dict.fromkeys(exclude_ids or ()))
+        sql = job_log_policy_candidates_sql(
+            with_cutoff=with_cutoff,
+            require_unarchived=require_unarchived,
+            exclude_count=len(excluded),
+        )
+        parameters: List[Any] = ([cutoff_text] if with_cutoff else []) + excluded + [max(1, limit)]
+        rows = connection.execute(sql, parameters).fetchall()
+        return [row["job_id"] for row in rows]
+
+    @staticmethod
+    def _policy_removal_locked(
+        connection,
+        job_id: str,
+        *,
+        cutoff_text: Optional[str] = None,
+    ) -> Tuple[str, int]:
+        """Recheck one selected candidate and remove its payload via CAS.
+
+        Bounded per-row touching: only the row currently under consideration
+        is read, and only here. The recheck revalidates the live policy state
+        (terminal status, stored finish time inside the cutoff, the synthetic
+        lease-expiry diagnostic guard and payload presence) before the atomic
+        write predicate, so a concurrent change leaves the stored bytes
+        untouched. Returns ("removed"|"skipped", freed_bytes); freed bytes
+        come from the observed compact size, never from a payload re-scan.
+        """
+        row = connection.execute(
+            """
+            SELECT status, finished_at, result_summary_json,
+                   log_lines_json, log_timestamps_json, job_log_brotli,
+                   COALESCE(job_log_removed, 0) AS removed
+            FROM jobs WHERE id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None or row["removed"]:
+            return ("skipped", 0)
+        if row["status"] not in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELED, "cancelled"):
+            return ("skipped", 0)
+        if row["finished_at"] is None or (
+            cutoff_text is not None and str(row["finished_at"]) > str(cutoff_text)
+        ):
+            return ("skipped", 0)
+        try:
+            summary = _json_load(row["result_summary_json"], None)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            summary = None
+        if isinstance(summary, dict) and summary.get("diagnostic_code") == LEASE_DIAGNOSTIC_CODE:
+            # Late-report-capable synthetic failures keep their logs.
+            return ("skipped", 0)
+        size_row = connection.execute(
+            f"SELECT log_bytes FROM {JOB_LOG_SIZES_TABLE} WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        freed = int(size_row["log_bytes"]) if size_row else 0
+        updated = connection.execute(
+            """
+            UPDATE jobs
+            SET log_lines_json = ?, log_timestamps_json = NULL, job_log_brotli = NULL,
+                job_log_removed = 1
+            WHERE id = ? AND status IS ? AND finished_at IS ?
+              AND log_lines_json IS ? AND log_timestamps_json IS ?
+              AND job_log_brotli IS ? AND COALESCE(job_log_removed, 0) = 0
+            """,
+            (
+                JOB_LOG_ARCHIVE_SENTINEL,
+                job_id,
+                row["status"],
+                row["finished_at"],
+                row["log_lines_json"],
+                row["log_timestamps_json"],
+                row["job_log_brotli"],
+            ),
+        )
+        return ("removed", freed) if updated.rowcount == 1 else ("skipped", 0)
+
+    @staticmethod
+    def _measured_locked(connection) -> int:
+        """Current compact total, metadata only, inside the same transaction."""
+        row = connection.execute(
+            f"SELECT COALESCE(SUM(log_bytes), 0) AS measured FROM {JOB_LOG_SIZES_TABLE}"
+        ).fetchone()
+        return int(row["measured"])
+
+    def _policy_metadata_for(self, job_id: str) -> Dict[str, Any]:
+        """Compact metadata row for one job (diagnostics/tests only)."""
+        with self._connect() as connection:
+            row = connection.execute(
+                f"SELECT * FROM {JOB_LOG_SIZES_TABLE} WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        return {key: row[key] for key in row.keys()} if row is not None else {}
+
+    def expire_job_logs(
+        self,
+        cutoff: datetime,
+        limit: int = 25,
+        exclude_ids: Optional[set] = None,
+    ) -> Dict[str, Any]:
+        """Remove stored log payloads of finished jobs older than the cutoff (S2).
+
+        Job rows, result summaries, snapshots and backups are never deleted:
+        only the log columns are reset to the empty sentinel and the
+        removed-by-policy marker is set. Deterministic order (finished_at,
+        id) keeps eviction decisions reproducible from the compact policy
+        index; selection never dereferences wide jobs rows, and only the
+        bounded selected batch (at most `limit` rows) is rechecked and
+        written inside this short writer transaction. Eligible jobs beyond
+        the batch limit stay candidates for later passes; rows filtered out
+        by the per-row recheck are returned in `skipped` so the caller can
+        cool them down instead of retrying them every tick.
+        """
+        cutoff_text = str(cutoff.isoformat() if hasattr(cutoff, "isoformat") else cutoff)
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                ids = self._selected_candidate_ids_locked(
+                    connection,
+                    with_cutoff=True,
+                    cutoff_text=cutoff_text,
+                    limit=max(1, limit),
+                    exclude_ids=list(exclude_ids or ()),
+                )
+                removed: List[str] = []
+                skipped: List[str] = []
+                freed_total = 0
+                for job_id in ids:
+                    outcome, freed = self._policy_removal_locked(
+                        connection, job_id, cutoff_text=cutoff_text
+                    )
+                    if outcome == "removed":
+                        removed.append(job_id)
+                        freed_total += freed
+                    else:
+                        skipped.append(job_id)
+                connection.commit()
+                return {
+                    "expired": len(removed),
+                    "bytes_freed": freed_total,
+                    "jobs": removed,
+                    "skipped": skipped,
+                }
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def archive_job_log_candidates(
+        self,
+        cutoff: datetime,
+        limit: int = 25,
+        exclude_ids: Optional[set] = None,
+    ) -> List[str]:
+        """Bounded oldest-first candidates for lossless Brotli archival (S1).
+
+        Covering compact-metadata selection (never-archived, raw payload);
+        the actual compare-and-swap compression is delegated to
+        archive_job_log (T1), which rechecks the full eligibility incl. the
+        diagnostic guard and keeps compression outside the write lock.
+        """
+        cutoff_text = str(cutoff.isoformat() if hasattr(cutoff, "isoformat") else cutoff)
+        with self._lock:
+            connection = self._connect()
+            try:
+                excluded = list(dict.fromkeys(exclude_ids or ()))
+                ids = self._selected_candidate_ids_locked(
+                    connection,
+                    with_cutoff=True,
+                    cutoff_text=cutoff_text,
+                    require_unarchived=True,
+                    limit=max(1, limit) + len(excluded),
+                    exclude_ids=excluded,
+                )
+                return ids[: max(0, limit)]
+            finally:
+                connection.close()
+
+    def evict_job_logs_for_quota(
+        self,
+        limit: int = 25,
+        exclude_ids: Optional[set] = None,
+        *,
+        free_to_bytes: int,
+    ) -> Dict[str, Any]:
+        """Evict the oldest finished eligible logs regardless of age (S3, B2).
+
+        STRICT byte-budget eviction used only by the quota policy: the byte
+        budget is REQUIRED, the compact total is measured inside this same
+        BEGIN IMMEDIATE transaction (metadata only), and eviction only starts
+        when measured > budget (a total exactly AT the quota never deletes).
+        After every successful deletion the total is re-measured and the loop
+        stops the moment measured <= budget — a batch is never deleted as a
+        whole when the excess is smaller than one row.
+
+        The stored Global Settings quota is re-read inside the same
+        transaction (same database) and overrides the caller's possibly stale
+        threshold. If a settings row exists and its quota is cleared or
+        maintenance is disabled, no eviction is allowed. Without a settings
+        row, direct repository callers supply the byte budget. The compact
+        selection and policy index keep
+        the wide jobs rows untouched during selection; the caller keeps a
+        per-candidate cool-down (including `skipped` ids) so a row whose
+        removal predicate or recheck failed is never retried every tick or
+        starving other candidates. The batch bound (`limit` rows) still caps
+        the transaction's per-row touching.
+        """
+        if (
+            isinstance(free_to_bytes, bool)
+            or not isinstance(free_to_bytes, int)
+            or free_to_bytes < 0
+        ):
+            raise ValueError("free_to_bytes must be a non-negative integer byte budget")
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                measured = self._measured_locked(connection)
+                row = connection.execute(
+                    "SELECT * FROM settings WHERE id = 'default'"
+                ).fetchone()
+                stored_gib = (
+                    row["job_log_quota_gib"]
+                    if row is not None and "job_log_quota_gib" in row.keys()
+                    else None
+                )
+                stored_enabled = (
+                    row["job_log_maintenance_enabled"]
+                    if row is not None and "job_log_maintenance_enabled" in row.keys()
+                    else 0
+                )
+                if row is None:
+                    budget = free_to_bytes
+                elif stored_enabled == 1 and type(stored_gib) is int and stored_gib > 0:
+                    budget = stored_gib * JOB_LOG_QUOTA_GIB_TO_BYTES
+                else:
+                    budget = None
+                evicted: List[str] = []
+                skipped: List[str] = []
+                freed_total = 0
+                if budget is not None and measured > budget:
+                    ids = self._selected_candidate_ids_locked(
+                        connection,
+                        with_cutoff=False,
+                        limit=max(1, limit),
+                        exclude_ids=list(exclude_ids or ()),
+                    )
+                    for job_id in ids:
+                        outcome, freed = self._policy_removal_locked(connection, job_id)
+                        if outcome == "removed":
+                            evicted.append(job_id)
+                            freed_total += freed
+                            measured = self._measured_locked(connection)
+                            if measured <= budget:
+                                break
+                        else:
+                            skipped.append(job_id)
+                connection.commit()
+                return {
+                    "evicted": len(evicted),
+                    "bytes_freed": freed_total,
+                    "jobs": evicted,
+                    "skipped": skipped,
+                    "budget_bytes": budget,
+                    "measured_bytes": measured,
+                }
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    def job_log_policy_events(self) -> List[Dict[str, Any]]:
+        """Bounded recent policy events (quota breaches and removals)."""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = ?", (JOB_LOG_POLICY_EVENTS_META_KEY,)
+            ).fetchone()
+        try:
+            events = _json_load(row["value"], []) if row else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            events = []
+        return events if isinstance(events, list) else []
+
+    def record_job_log_policy_events(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Append bounded policy events, keeping the most recent only."""
+        if not entries:
+            return self.job_log_policy_events()
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT value FROM schema_meta WHERE key = ?",
+                    (JOB_LOG_POLICY_EVENTS_META_KEY,),
+                ).fetchone()
+                try:
+                    events = _json_load(row["value"], []) if row else []
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    events = []
+                if not isinstance(events, list):
+                    events = []
+                events.extend(entries)
+                events = events[-JOB_LOG_POLICY_EVENT_LIMIT:]
+                connection.execute(
+                    "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                    (JOB_LOG_POLICY_EVENTS_META_KEY, json.dumps(events)),
+                )
+                connection.commit()
+                return events
             except Exception:
                 connection.rollback()
                 raise
@@ -1813,6 +2417,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             started_at=_dt(row["started_at"]),
             finished_at=_dt(row["finished_at"]),
             updated_at=_dt(row["updated_at"]) or datetime.utcnow(),
+            job_log_removed=bool(row["job_log_removed"]) if "job_log_removed" in keys else False,
         )
 
 
@@ -2262,6 +2867,15 @@ class SQLiteSettingsRepository(SQLiteRepositoryBase, SettingsRepository):
             or stored_listing_limit > SettingsRecord.MAX_SNAPSHOT_EXPLORER_LISTING_MAX_OUTPUT_BYTES
         ):
             stored_listing_limit = SettingsRecord.DEFAULT_SNAPSHOT_EXPLORER_LISTING_MAX_OUTPUT_BYTES
+        stored_maintenance_days = self._stored_maintenance_days(row)
+        stored_quota_gib = row["job_log_quota_gib"] if "job_log_quota_gib" in row.keys() else None
+        if (
+            isinstance(stored_quota_gib, bool)
+            or not isinstance(stored_quota_gib, int)
+            or stored_quota_gib < SettingsRecord.MIN_JOB_LOG_QUOTA_GIB
+            or stored_quota_gib > SettingsRecord.MAX_JOB_LOG_QUOTA_GIB
+        ):
+            stored_quota_gib = None
         return SettingsRecord(
             id=row["id"],
             restic_repository_base=row["restic_repository_base"] or "",
@@ -2270,16 +2884,43 @@ class SQLiteSettingsRepository(SQLiteRepositoryBase, SettingsRepository):
             global_cron_expression=row["global_cron_expression"] if "global_cron_expression" in row.keys() else None,
             control_plane_public_url=row["control_plane_public_url"] if "control_plane_public_url" in row.keys() else "",
             snapshot_explorer_listing_max_output_bytes=stored_listing_limit,
+            job_log_maintenance_enabled=bool(row["job_log_maintenance_enabled"]) if "job_log_maintenance_enabled" in row.keys() else False,
+            job_log_archive_after_days=stored_maintenance_days[0],
+            job_log_retention_days=stored_maintenance_days[1],
+            job_log_quota_gib=stored_quota_gib,
             updated_at=_dt(row["updated_at"]) or datetime.utcnow(),
         )
+
+    @staticmethod
+    def _stored_maintenance_days(row) -> tuple:
+        """Validated (archive_days, retention_days) from the stored row."""
+        values = []
+        for column, default in (
+            ("job_log_archive_after_days", SettingsRecord.DEFAULT_JOB_LOG_ARCHIVE_AFTER_DAYS),
+            ("job_log_retention_days", SettingsRecord.DEFAULT_JOB_LOG_RETENTION_DAYS),
+        ):
+            stored = row[column] if column in row.keys() else None
+            if (
+                isinstance(stored, bool)
+                or not isinstance(stored, int)
+                or stored < SettingsRecord.MIN_JOB_LOG_MAINTENANCE_DAYS
+                or stored > SettingsRecord.MAX_JOB_LOG_MAINTENANCE_DAYS
+            ):
+                stored = default
+            values.append(stored)
+        return tuple(values)
 
     def save(self, settings: SettingsRecord) -> SettingsRecord:
         with self._lock, self._connect() as connection:
             connection.execute(
                 """
                 INSERT OR REPLACE INTO settings (
-                    id, restic_repository_base, restic_password_secret_id, rclone_conf_secret_id, global_cron_expression, control_plane_public_url, snapshot_explorer_listing_max_output_bytes, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    id, restic_repository_base, restic_password_secret_id, rclone_conf_secret_id,
+                    global_cron_expression, control_plane_public_url,
+                    snapshot_explorer_listing_max_output_bytes,
+                    job_log_maintenance_enabled, job_log_archive_after_days,
+                    job_log_retention_days, job_log_quota_gib, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     settings.id,
@@ -2289,6 +2930,10 @@ class SQLiteSettingsRepository(SQLiteRepositoryBase, SettingsRepository):
                     settings.global_cron_expression,
                     settings.control_plane_public_url,
                     settings.snapshot_explorer_listing_max_output_bytes,
+                    1 if settings.job_log_maintenance_enabled else 0,
+                    settings.job_log_archive_after_days,
+                    settings.job_log_retention_days,
+                    settings.job_log_quota_gib,
                     settings.updated_at.isoformat(),
                 ),
             )

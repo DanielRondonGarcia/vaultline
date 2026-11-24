@@ -60,6 +60,10 @@ from src.control_plane.application.services.backup_audit_report import build_bac
 from src.restic_retention import apply_target_retention_policy, build_restic_forget_command
 
 logger = logging.getLogger(__name__)
+
+# T2 S3 PATCH sentinel: omitted Global Settings keys keep the stored value,
+# while an explicit JSON null for the nullable job-log quota disables it.
+SETTINGS_UNSET = object()
 _TARGET_FIELD_UNSET = object()
 
 
@@ -3156,12 +3160,24 @@ class ControlPlaneService:
         global_cron_expression: Optional[str] = None,
         control_plane_public_url: Optional[str] = None,
         snapshot_explorer_listing_max_output_bytes: Optional[int] = None,
+        job_log_maintenance_enabled: Optional[bool] = None,
+        job_log_archive_after_days: Any = None,
+        job_log_retention_days: Any = None,
+        job_log_quota_gib: Any = SETTINGS_UNSET,
     ) -> SettingsRecord:
         if not self.settings_repository:
             raise ValueError("settings repository not configured")
         normalized_listing_limit = self._validate_snapshot_explorer_listing_max_output_bytes(
-            snapshot_explorer_listing_max_output_bytes
+            snapshot_explorer_listing_max_output_bytes,
         )
+        normalized_maintenance_enabled = self._validate_job_log_maintenance_enabled(job_log_maintenance_enabled)
+        normalized_archive_days = self._validate_job_log_maintenance_days(
+            job_log_archive_after_days, "job_log_archive_after_days"
+        )
+        normalized_retention_days = self._validate_job_log_maintenance_days(
+            job_log_retention_days, "job_log_retention_days"
+        )
+        normalized_quota_gib = self._validate_job_log_quota_gib(job_log_quota_gib)
         existing = self.settings_repository.get() or SettingsRecord()
         if restic_repository_base is not None:
             existing.restic_repository_base = restic_repository_base
@@ -3181,6 +3197,24 @@ class ControlPlaneService:
             existing.control_plane_public_url = control_plane_public_url.strip()
         if normalized_listing_limit is not None:
             existing.snapshot_explorer_listing_max_output_bytes = normalized_listing_limit
+        if normalized_maintenance_enabled is not None:
+            existing.job_log_maintenance_enabled = normalized_maintenance_enabled
+        if normalized_archive_days is not None:
+            existing.job_log_archive_after_days = normalized_archive_days
+        if normalized_retention_days is not None:
+            existing.job_log_retention_days = normalized_retention_days
+        if normalized_quota_gib is not SETTINGS_UNSET:
+            # An omitted PATCH keeps the stored quota; an explicit null value
+            # disables quota enforcement.
+            existing.job_log_quota_gib = normalized_quota_gib
+        if (
+            existing.job_log_maintenance_enabled
+            and existing.job_log_archive_after_days >= existing.job_log_retention_days
+        ):
+            raise ValueError(
+                "job_log_archive_after_days must be less than job_log_retention_days "
+                f"({existing.job_log_archive_after_days} >= {existing.job_log_retention_days})"
+            )
         existing.updated_at = utcnow()
         return self.settings_repository.save(existing)
 
@@ -4843,6 +4877,10 @@ class ControlPlaneService:
         }
         if any(log_timestamps):
             view["log_timestamps"] = log_timestamps
+        # T2 S2: a policy-removed log is distinguishable from a job that never
+        # had logs; no fake log lines are injected either way.
+        if not log_lines and getattr(job, "job_log_removed", False):
+            view["log_removed_by_policy"] = True
         return view
 
     def _publish_job_event(self, job: JobRecord) -> None:
@@ -5347,6 +5385,100 @@ class ControlPlaneService:
         ):
             return SettingsRecord.DEFAULT_SNAPSHOT_EXPLORER_LISTING_MAX_OUTPUT_BYTES
         return value
+
+    @staticmethod
+    def _validate_job_log_maintenance_enabled(value: Optional[bool]) -> Optional[bool]:
+        if value is None:
+            return None
+        if not isinstance(value, bool):
+            raise ValueError("job_log_maintenance_enabled must be a boolean")
+        return value
+
+    @staticmethod
+    def _validate_job_log_maintenance_days(value: Any, field_name: str) -> Optional[int]:
+        if value is None:
+            return None
+        minimum = SettingsRecord.MIN_JOB_LOG_MAINTENANCE_DAYS
+        maximum = SettingsRecord.MAX_JOB_LOG_MAINTENANCE_DAYS
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < minimum
+            or value > maximum
+        ):
+            raise ValueError(
+                f"{field_name} must be a positive integer between {minimum} and {maximum} days"
+            )
+        return value
+
+    @classmethod
+    def _validate_job_log_quota_gib(cls, value: Any):
+        if value is SETTINGS_UNSET:
+            return SETTINGS_UNSET
+        if value is None:
+            return None
+        minimum = SettingsRecord.MIN_JOB_LOG_QUOTA_GIB
+        maximum = SettingsRecord.MAX_JOB_LOG_QUOTA_GIB
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or value < minimum
+            or value > maximum
+        ):
+            raise ValueError(
+                f"job_log_quota_gib must be an integer between {minimum} and {maximum} GiB"
+            )
+        return value
+
+    def job_log_maintenance_status(self, maintenance=None) -> Dict[str, Any]:
+        """Measured usage and recent quota breach/eviction for Global Settings.
+
+        Used by the GET /api/v1/settings route. No secrets and no log text:
+        only byte totals, row counts, day/quota configuration, bounded policy
+        event records and lane metrics. The in-memory (nonpersistent) backend
+        reports maintenance as unsupported while the configuration still
+        round-trips.
+        """
+        settings = self.get_settings()
+        repo = self.job_repository
+        supported = all(
+            hasattr(repo, name)
+            for name in (
+                "job_log_usage",
+                "expire_job_logs",
+                "evict_job_logs_for_quota",
+                "record_job_log_policy_events",
+            )
+        )
+        payload: Dict[str, Any] = {
+            "supported": supported,
+            "backend": "sqlite" if supported else "memory",
+            "enabled": bool(settings.job_log_maintenance_enabled) if settings is not None else False,
+            "archive_after_days": getattr(settings, "job_log_archive_after_days", None) if settings is not None else None,
+            "retention_days": getattr(settings, "job_log_retention_days", None) if settings is not None else None,
+            "quota_gib": getattr(settings, "job_log_quota_gib", None) if settings is not None else None,
+            "usage": None,
+            "quota_breached": False,
+            "events": [],
+        }
+        if not supported:
+            payload["message"] = (
+                "Mantenimiento de logs no disponible para el backend en memoria: "
+                "los datos no son persistentes. La configuracion se guarda pero no se aplica."
+            )
+            return payload
+        payload["usage"] = repo.job_log_usage()
+        payload["events"] = repo.job_log_policy_events()
+        if maintenance is not None:
+            payload.update(maintenance.status())
+            payload["supported"] = supported
+        else:
+            quota_gib = payload["quota_gib"]
+            usage = payload["usage"]
+            # Strict breach (B2): exactly-at-quota is not an excess.
+            if quota_gib is not None and usage["measured_bytes"] > quota_gib * 1024 ** 3:
+                payload["quota_breached"] = True
+        return payload
 
     def _validate_snapshot_metadata_target(self, target_id: str, snapshot_id: str) -> None:
         for snapshot in self.snapshot_repository.list_by_target(target_id):

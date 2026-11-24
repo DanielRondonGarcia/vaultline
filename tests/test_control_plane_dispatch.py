@@ -271,6 +271,45 @@ class ControlPlaneDispatchTests(unittest.TestCase):
         self.assertEqual(preserved.restic_repository_base, "backup")
         self.assertEqual(preserved.snapshot_explorer_listing_max_output_bytes, 8 * 1024 * 1024)
 
+    def test_job_log_maintenance_settings_validate_and_preserve_existing_fields(self):
+        service = self.make_service()
+
+        default = service.update_settings()
+        self.assertFalse(default.job_log_maintenance_enabled)
+        self.assertEqual(default.job_log_archive_after_days, 30)
+        self.assertEqual(default.job_log_retention_days, 90)
+        self.assertIsNone(default.job_log_quota_gib)
+
+        enabled = service.update_settings(
+            restic_repository_base="rclone:kept:repo",
+            snapshot_explorer_listing_max_output_bytes=8 * 1024 * 1024,
+            job_log_maintenance_enabled=True,
+            job_log_archive_after_days=15,
+            job_log_retention_days=60,
+            job_log_quota_gib=8,
+        )
+        self.assertTrue(enabled.job_log_maintenance_enabled)
+        self.assertEqual(enabled.job_log_archive_after_days, 15)
+        self.assertEqual(enabled.job_log_retention_days, 60)
+        self.assertEqual(enabled.job_log_quota_gib, 8)
+        self.assertEqual(enabled.restic_repository_base, "rclone:kept:repo")
+        self.assertEqual(enabled.snapshot_explorer_listing_max_output_bytes, 8 * 1024 * 1024)
+
+        # The pre-existing settings fields survive a maintenance-only PATCH.
+        preserved = service.update_settings(job_log_quota_gib=None)
+        self.assertIsNone(preserved.job_log_quota_gib)
+        self.assertEqual(preserved.restic_repository_base, "rclone:kept:repo")
+        self.assertEqual(preserved.snapshot_explorer_listing_max_output_bytes, 8 * 1024 * 1024)
+        self.assertEqual(preserved.job_log_archive_after_days, 15)
+        self.assertEqual(preserved.job_log_retention_days, 60)
+
+        for invalid in (0, True, 2.5, "8"):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    service.update_settings(job_log_quota_gib=invalid)
+        with self.assertRaisesRegex(ValueError, "less than"):
+            service.update_settings(job_log_archive_after_days=60)
+
     def test_snapshot_metadata_payloads_use_listing_limit_but_dump_keeps_download_limit(self):
         service = self.make_service()
         service.update_settings(snapshot_explorer_listing_max_output_bytes=8 * 1024 * 1024)

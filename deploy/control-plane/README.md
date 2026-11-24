@@ -82,6 +82,45 @@ docker compose -f deploy/control-plane/docker-compose.yml up -d --build
 Una zona invalida impide que el Control Plane arranque para evitar ejecutar
 backups en una hora distinta de la configurada.
 
+## Mantenimiento de logs de jobs (opcional)
+
+El mantenimiento de logs esta **desactivado por defecto**; se activa en la UI
+(Settings → Control Plane → "Mantenimiento de logs de jobs"). Al activarlo:
+
+1. **Haz un backup de `control_plane.db` antes de activarlo.** La politica
+   elimina definitivamente los payloads de logs (el borrado es irreversible);
+   nunca elimina jobs, resumenes, snapshots ni backups.
+2. Los logs de jobs terminados mas viejos que "dias de archivo" (por defecto
+   30) se guardan comprimidos con Brotli (sin perdida): la lectura desde el
+   visor de logs los descomprime al vuelo. **Las versiones de la UI
+   anteriores no pueden leer logs archivados** sin restaurar su contenido
+   original en la base de datos.
+3. Los logs terminados mas viejos que "dias de retencion" (por defecto 90) se
+   eliminan por politica. La cuota opcional (GiB) mide la suma de payloads de
+   logs (metadatos, no el tamano del archivo SQLite): solo un uso
+   **estrictamente mayor** que la cuota provoca aviso y eviction (si el uso
+   llega exactamente a la cuota no se elimina nada); la eviction borra los
+   logs terminados mas antiguos (incluso de menos de 30 dias) de uno en uno,
+   reimidiendo el total compacto dentro de la misma transaccion y parando
+   en cuanto el uso vuelve a <= cuota, por lo que nunca borra un lote entero
+   si el exceso es menor que un log. La cuota vigente (y su vigencia) se
+   releen dentro de la transaccion: una cuota desactivada no puede iniciar
+   otro lote de borrado. Mientras se contabilizan los logs historicos la cuota
+   es parcial/eventual (la eviction solo arranca cuando el exceso esta
+   probado), y el aviso de cuota sigue visible aunque la eviction automatica
+   deja el uso por debajo de la cuota.
+4. No hay VACUUM automatico ni backfill de payloads completo en el arranque:
+   el espacio liberado se reutiliza, pero el archivo SQLite no se encoge; usa
+   un VACUUM manual offline si necesitas reducir el archivo.
+5. Limites de escritura explicitos: cada pasada de mantenimiento abre una
+   transaccion corta (`BEGIN IMMEDIATE`) que toca como maximo el tamano de
+   lote configurado de filas SELECCIONADAS (25 por defecto, tope 200) con el
+   busy timeout de 5 s; la seleccion de candidatos solo recorre metadatos
+   compactos (no filas anchas de jobs) y la compresion nunca ocurre dentro
+   del bloqueo de escritura. Si se desactiva el mantenimiento a media
+   pasada, la siguiente pasada no se ejecuta; las fases de expiracion y
+   compresion de la pasada en curso pueden terminar.
+
 Si el Control Plane va a estar detrás de un proxy o con un dominio, define
 también la URL pública para que los comandos del worker salgan correctos:
 

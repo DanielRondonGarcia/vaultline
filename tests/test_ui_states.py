@@ -142,6 +142,112 @@ class SnapshotExplorerUiStateTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.source)
 
+    def test_settings_view_exposes_cutoff_prune_and_quota_activation_controls(self):
+        for marker in (
+            'id="settingsJobLogPruneDate"',
+            'id="settingsJobLogMaintenanceQuotaEnabled"',
+            'data-job-log-prune-confirm',
+            'data-job-log-prune-status',
+            'apiPost("/api/v1/admin/jobs/logs/prune"',
+            'acknowledged: true',
+            'cutoff_date: cutoffDate',
+            'job_log_quota_enabled: quotaEnabled',
+            'state.settings.job_log_quota_enabled ?? false',
+            'state.settings.job_log_maintenance?.prune_state ?? null',
+            'function jobLogPruneState()',
+            "irreversible",
+            "finalizados el dia seleccionado o antes",
+            "El corte no puede ser una fecha futura",
+            "esperando la indexacion compacta",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.source)
+
+    def test_prune_status_and_confirmation_derive_from_nested_state_after_refresh(self):
+        """A2: actual JS harness — status reads the nested prune state only,
+        POST unifies the nested update keys and the payload is shaped from the
+        actual state after refresh."""
+        helpers = re.search(
+            r"    function jobLogPruneState\(\) \{.*?\n    \}\n\n    function renderJobLogPruneStatus\(\) \{.*?\n    \}\n\n    async function confirmJobLogPrune\(btn\) \{.*?\n    \}",
+            self.source,
+            re.S,
+        )
+        self.assertIsNotNone(helpers)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = helpers.group(0) + r'''
+const state = { settings: { job_log_maintenance: {
+  usage: { complete: true, accounted_rows: 12 },
+  prune_state: { status: "pending", cutoff_date: "2001-01-01", processed: 8 },
+} } };
+const escapeHtml = (value) => String(value);
+const statusEl = { innerHTML: "", textContent: "" };
+const confirmBtn = { dataset: { pruneArmed: "false" }, disabled: false };
+const input = { value: "2001-01-01" };
+const document = {
+  getElementById: (id) => (id === "jobLogPruneStatus" ? statusEl : (id === "settingsJobLogPruneDate" ? input : null)),
+  querySelector: (selector) => (selector === "[data-job-log-prune-confirm]" ? confirmBtn : null),
+};
+let posted = null;
+const apiPost = async (path, body) => {
+  posted = { path, body };
+  return { status: "complete", cutoff_date: "2001-01-01", processed: 12 };
+};
+const withBtnLoading = (btn, asyncFn, label) => asyncFn();
+const showFeedback = () => {};
+(async () => {
+  renderJobLogPruneStatus();
+  const pending = { disabled: confirmBtn.disabled, html: statusEl.innerHTML };
+  await confirmJobLogPrune(confirmBtn);
+  const armed = { armed: confirmBtn.dataset.pruneArmed, noPost: posted === null, text: statusEl.innerHTML };
+  await confirmJobLogPrune(confirmBtn);
+  const confirmed = { posted, nestedPruneState: state.settings.job_log_maintenance.prune_state,
+                      reRender: { disabled: confirmBtn.disabled, html: statusEl.innerHTML } };
+  input.value = "9999-01-01";
+  confirmBtn.dataset.pruneArmed = "false";
+  posted = null;
+  await confirmJobLogPrune(confirmBtn);
+  const futureCheck = { noPost: posted === null, text: statusEl.textContent };
+  input.value = "2001-01-01";
+  // After a refresh the actual payload replaces the derived state.
+  state.settings.job_log_maintenance = {};
+  confirmBtn.disabled = true;
+  statusEl.innerHTML = "";
+  renderJobLogPruneStatus();
+  const emptyState = { disabled: confirmBtn.disabled, html: statusEl.innerHTML };
+  process.stdout.write(JSON.stringify({ pending, armed, confirmed, futureCheck, emptyState }));
+})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+'''
+        result = subprocess.run(
+            ["node", "--input-type=commonjs", "--eval", script],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = json.loads(result.stdout)
+        self.assertTrue(output["pending"]["disabled"])
+        self.assertIn("2001-01-01", output["pending"]["html"])
+        self.assertIn("8", output["pending"]["html"])
+        self.assertEqual(output["armed"]["armed"], "true")
+        self.assertTrue(output["armed"]["noPost"])
+        self.assertIn("2001-01-01", output["armed"]["text"])
+        self.assertEqual(
+            output["confirmed"]["posted"],
+            {"path": "/api/v1/admin/jobs/logs/prune",
+             "body": {"cutoff_date": "2001-01-01", "acknowledged": True}},
+        )
+        self.assertEqual(
+            output["confirmed"]["nestedPruneState"],
+            {"status": "complete", "cutoff_date": "2001-01-01", "processed": 12},
+        )
+        self.assertFalse(output["confirmed"]["reRender"]["disabled"])
+        self.assertIn("completado", output["confirmed"]["reRender"]["html"])
+        self.assertTrue(output["futureCheck"]["noPost"])
+        self.assertIn("futura", output["futureCheck"]["text"])
+        self.assertFalse(output["emptyState"]["disabled"])
+        self.assertIn("Sin prune", output["emptyState"]["html"])
+
     def test_job_log_view_distinguishes_removed_by_policy_from_empty(self):
         target_renderer = re.search(
             r"function renderTargetJobLogsInto\(job, root\) \{.*?\n    \}",

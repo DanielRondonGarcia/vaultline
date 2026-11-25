@@ -4,6 +4,26 @@ from typing import Any, ClassVar, Dict, List, Optional
 from uuid import uuid4
 
 
+def effective_job_log_quota_enabled(settings: Optional["SettingsRecord"]) -> bool:
+    """T3 S5: whether the job-log quota may enforce deletions.
+
+    An explicit stored flag always wins; the legacy default applies only while
+    the flag has never been stored: `maintenance_enabled AND quota configured`.
+    A dormant legacy value (maintenance disabled) therefore never activates
+    silently, and toggling retention later cannot change the effective quota
+    state once the flag is explicit.
+    """
+    if settings is None:
+        return False
+    flag = getattr(settings, "job_log_quota_enabled", None)
+    if flag is None:
+        return bool(
+            getattr(settings, "job_log_maintenance_enabled", False)
+            and getattr(settings, "job_log_quota_gib", None) is not None
+        )
+    return bool(flag)
+
+
 def utcnow() -> datetime:
     return datetime.utcnow()
 
@@ -34,6 +54,10 @@ class WorkerStatus:
     ONLINE = "online"
     OFFLINE = "offline"
     DISABLED = "disabled"
+
+
+class JobLogPruneConflict(ValueError):
+    """A conflicting job-log prune is already pending (T3 S4 HTTP contract)."""
 
 
 class JobStatus:
@@ -271,6 +295,12 @@ class SettingsRecord:
     # UI; it applies to the logical job-log payload total, never the whole
     # SQLite database file.
     job_log_quota_gib: Optional[int] = None
+    # T3 S5: explicit quota activation, independent of the retention opt-in.
+    # None keeps the effective legacy default (`legacy_maintenance_enabled AND
+    # quota configured`), so dormant previously stored values never start
+    # deleting silently after an upgrade; presence-aware migration in the
+    # SQLite settings repository materializes the previously effective combo.
+    job_log_quota_enabled: Optional[bool] = None
     id: str = "default"
     updated_at: datetime = field(default_factory=utcnow)
 

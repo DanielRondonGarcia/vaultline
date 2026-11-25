@@ -2455,6 +2455,198 @@ class ControlPlaneRouteTests(unittest.TestCase):
         )
 
 
+class JobLogPruneRouteTests(unittest.TestCase):
+    """S4 HTTP path: the destructive cutoff prune is ADMIN-only, validates the
+    request strictly (JSON date plus explicit acknowledgment) and answers 409
+    for a conflicting pending prune. Rejected requests keep the stored logs
+    byte-identical — driven through the real SQLite service, no server."""
+
+    BIG_LOG = "Backup progress line for the prune route tests. " * 40
+
+    def _sqlite_service(self, directory):
+        workers = InMemoryWorkerRepository()
+        workers.save(WorkerRecord(name="worker-a", host_name="host", id="worker-a", status="online", last_seen_at=utcnow()))
+        return ControlPlaneService(
+            worker_repository=workers,
+            inventory_repository=InMemoryInventoryRepository(),
+            target_repository=InMemoryTargetRepository(),
+            job_repository=SQLiteJobRepository(f"{directory}/cp.db"),
+            storage_profile_repository=InMemoryStorageProfileRepository(),
+            secret_repository=InMemorySecretRepository(),
+            snapshot_repository=InMemorySnapshotRepository(),
+            retention_policy_repository=InMemoryRetentionPolicyRepository(),
+            target_stats_repository=InMemoryTargetStatsRepository(),
+            secret_codec=SecretCodec(Fernet.generate_key()),
+            settings_repository=InMemorySettingsRepository(),
+        )
+
+    def _seed_job(self, service):
+        return service.job_repository.save(JobRecord(
+            id="prune-job", worker_id="worker-a", command="backup.run",
+            status=JobStatus.SUCCEEDED, log_lines=[self.BIG_LOG],
+            finished_at=utcnow() - timedelta(days=120),
+        ))
+
+    def _handler(self, body, service):
+        handler = object.__new__(ControlPlaneRequestHandler)
+        handler.path = "/api/v1/admin/jobs/logs/prune"
+        raw_body = body.encode("utf-8")
+        handler.headers = {"Content-Length": str(len(raw_body))}
+        handler.rfile = io.BytesIO(raw_body)
+        handler._require_auth = Mock(return_value={"role": ROLE_ADMIN})
+        handler._write_json = Mock(return_value=None)
+        handler.server = SimpleNamespace(application=SimpleNamespace(control_plane_service=service))
+        return handler
+
+    def _stored_bytes(self, directory):
+        import sqlite3
+        connection = sqlite3.connect(f"{directory}/cp.db")
+        try:
+            return connection.execute(
+                "SELECT length(CAST(log_lines_json AS BLOB)) FROM jobs WHERE id = 'prune-job'"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+
+    def test_route_requires_admin_and_never_touches_the_service_without_it(self):
+        service = Mock()
+        handler = self._handler('{"cutoff_date":"2026-03-03","acknowledged":true}', service)
+        handler._require_auth.return_value = None
+        handler.do_POST()
+        handler._require_auth.assert_called_once_with(ROLE_ADMIN, api_mode=True)
+        service.request_job_log_prune.assert_not_called()
+
+    def test_route_accepts_confirmed_body_and_returns_202_then_200_idempotent(self):
+        service = Mock()
+        service.request_job_log_prune.return_value = {
+            "cutoff_date": "2026-03-03", "cutoff": "2026-03-04T00:00:00", "status": "pending",
+            "processed": 0, "bytes_freed": 0, "created": True,
+        }
+        handler = self._handler('{"cutoff_date":"2026-03-03","acknowledged":true}', service)
+        handler.do_POST()
+        service.request_job_log_prune.assert_called_once()
+        self.assertEqual(handler._write_json.call_args.args[0], 202)
+
+        service.request_job_log_prune.return_value = dict(service.request_job_log_prune.return_value, created=False)
+        handler = self._handler('{"cutoff_date":"2026-03-03","acknowledged":true}', service)
+        handler.do_POST()
+        self.assertEqual(handler._write_json.call_args.args[0], 200)
+
+    def test_route_maps_conflicting_pending_prune_to_409(self):
+        from src.control_plane.domain.models import JobLogPruneConflict
+        service = Mock()
+        service.request_job_log_prune.side_effect = JobLogPruneConflict(
+            "a pending job log prune with cutoff 2026-03-03 is already in progress"
+        )
+        handler = self._handler('{"cutoff_date":"2026-02-20","acknowledged":true}', service)
+        handler.do_POST()
+        self.assertEqual(handler._write_json.call_args.args[0], 409)
+        self.assertIn("2026-03-03", handler._write_json.call_args.args[1]["error"])
+
+    def test_route_rejects_malformed_shapes_before_the_service(self):
+        service = Mock()
+        for body in (
+            '{"cutoff_date":"2026-03-03"}',
+            '{"cutoff_date":"2026-03-03","acknowledged":true,"force":true}',
+            '{"cutoff_date":"2026-03-03","acknowledged":false}',
+            '"just-a-string"',
+        ):
+            with self.subTest(body=body):
+                handler = self._handler(body, service)
+                handler.do_POST()
+                self.assertEqual(handler._write_json.call_args.args[0], 400)
+                self.assertIn("error", handler._write_json.call_args.args[1])
+        service.request_job_log_prune.assert_not_called()
+
+    def test_route_rejects_invalid_dates_unacknowledged_and_boolean_cutoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self._sqlite_service(directory)
+            self._seed_job(service)
+            before = self._stored_bytes(directory)
+            # All strict-date validation lives in the service; the route maps
+            # its ValueError to 400 with the stored logs untouched.
+            for body in (
+                '{"cutoff_date":true,"acknowledged":true}',
+                '{"cutoff_date":"31/12/2025","acknowledged":true}',
+                '{"cutoff_date":"9999-01-01","acknowledged":true}',
+                '{"cutoff_date":"2026-3-3","acknowledged":true}',
+                '{"cutoff_date":"2026-03-03","acknowledged":"yes"}',
+            ):
+                with self.subTest(body=body):
+                    handler = self._handler(body, service)
+                    handler.do_POST()
+                    self.assertEqual(handler._write_json.call_args.args[0], 400)
+                    self.assertIn("error", handler._write_json.call_args.args[1])
+            self.assertEqual(self._stored_bytes(directory), before)
+
+    def test_rejected_and_conflicting_requests_keep_logs_byte_identical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self._sqlite_service(directory)
+            self._seed_job(service)
+            before = self._stored_bytes(directory)
+            self.assertGreater(before, 0)
+
+            service.job_repository.request_job_log_prune("2026-03-03", now=utcnow())
+            for body in (
+                '{"cutoff_date":"2026-02-20","acknowledged":true}',
+                '{"cutoff_date":"2026-02-20","acknowledged":false}',
+                '{"cutoff_date":true,"acknowledged":true}',
+            ):
+                handler = self._handler(body, service)
+                handler.do_POST()
+                self.assertIn(handler._write_json.call_args.args[0], (400, 409))
+            self.assertEqual(self._stored_bytes(directory), before)
+
+    def test_prune_status_route_requires_admin_and_reports_persisted_state(self):
+        service = Mock()
+        service.job_log_prune_state.return_value = {"cutoff_date": "2026-03-03", "status": "pending"}
+        handler = object.__new__(ControlPlaneRequestHandler)
+        handler.path = "/api/v1/admin/jobs/logs/prune"
+        handler.headers = {}
+        handler._require_auth = Mock(return_value=None)
+        handler._write_json = Mock(return_value=None)
+        handler.server = SimpleNamespace(application=SimpleNamespace(control_plane_service=service))
+        handler._handle_get_request(head_only=False)
+        handler._require_auth.assert_called_once_with(ROLE_ADMIN, head_only=False, api_mode=True)
+        service.job_log_prune_state.assert_not_called()
+
+        handler._require_auth = Mock(return_value={"role": ROLE_ADMIN})
+        handler._handle_get_request(head_only=False)
+        service.job_log_prune_state.assert_called_once_with()
+        self.assertEqual(handler._write_json.call_args.args[0], 200)
+
+
+class JobLogQuotaEnabledPatchTests(unittest.TestCase):
+    def _service(self):
+        workers = InMemoryWorkerRepository()
+        workers.save(WorkerRecord(name="worker-a", host_name="host", status="online", last_seen_at=utcnow()))
+        return ControlPlaneService(
+            worker_repository=workers,
+            inventory_repository=InMemoryInventoryRepository(),
+            target_repository=InMemoryTargetRepository(),
+            job_repository=InMemoryJobRepository(),
+            storage_profile_repository=InMemoryStorageProfileRepository(),
+            secret_repository=InMemorySecretRepository(),
+            snapshot_repository=InMemorySnapshotRepository(),
+            retention_policy_repository=InMemoryRetentionPolicyRepository(),
+            target_stats_repository=InMemoryTargetStatsRepository(),
+            secret_codec=SecretCodec(Fernet.generate_key()),
+            settings_repository=InMemorySettingsRepository(),
+        )
+
+    def test_settings_patch_forwards_quota_enabled_and_preserves_when_omitted(self):
+        service = self._service()
+        enabled = service.update_settings(job_log_quota_enabled=True, job_log_quota_gib=2)
+        self.assertTrue(enabled.job_log_quota_enabled)
+        self.assertEqual(enabled.job_log_quota_gib, 2)
+        omitted = service.update_settings()
+        self.assertTrue(omitted.job_log_quota_enabled)
+        self.assertEqual(omitted.job_log_quota_gib, 2)
+        cleared_flag = service.update_settings(job_log_quota_enabled=False)
+        self.assertFalse(cleared_flag.job_log_quota_enabled)
+        self.assertEqual(cleared_flag.job_log_quota_gib, 2)
+
+
 class ControlPlaneClientFallbackTests(unittest.TestCase):
     def test_worker_cancel_status_uses_signed_post_and_returns_boolean(self):
         client = ControlPlaneClient.__new__(ControlPlaneClient)

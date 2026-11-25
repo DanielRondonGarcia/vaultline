@@ -9157,25 +9157,40 @@ docker compose up -d
             <div class="field full" style="margin-top:12px;">
               <label for="settingsJobLogMaintenanceEnabled">
                 <input id="settingsJobLogMaintenanceEnabled" type="checkbox" style="width:auto; margin-right:8px;" ${state.settings.job_log_maintenance_enabled ?? false ? "checked" : ""} aria-describedby="settingsJobLogMaintenanceHelp" />
-                Activar mantenimiento automatico de logs</label>
-              <div id="settingsJobLogMaintenanceHelp" class="helper">Opt-in explicito: al activarlo se aplican el archivo, la retencion y la cuota configurados.</div>
+                Activar retencion automatica de logs</label>
+              <div id="settingsJobLogMaintenanceHelp" class="helper">Opt-in explicito: al activarlo se elimina el log de los jobs terminados mas viejos que los dias de retencion. El archivo automatico con Brotli corre igualmente cada ${state.settings.job_log_archive_after_days ?? 30} dias aunque esta casilla este desactivada; nunca elimina logs por si sola.</div>
             </div>
             <div class="settings-grid" style="margin-top:8px;">
               <div class="field">
                 <label for="settingsJobLogMaintenanceArchiveDays">Dias de archivo (comprimir con Brotli)</label>
                 <input id="settingsJobLogMaintenanceArchiveDays" type="number" min="1" max="3650" step="1" value="${state.settings.job_log_archive_after_days ?? 30}" required />
-                <div class="helper">Entero entre 1 y 3650. Los logs de jobs terminados con mas de esta edad se comprimen (por defecto 30).</div>
+                <div class="helper">Entero entre 1 y 3650. Los logs de jobs terminados con mas de esta edad se comprimen automaticamente (por defecto 30), independiente de la retencion y de la cuota.</div>
               </div>
               <div class="field">
                 <label for="settingsJobLogMaintenanceRetentionDays">Dias de retencion (eliminar logs)</label>
                 <input id="settingsJobLogMaintenanceRetentionDays" type="number" min="1" max="3650" step="1" value="${state.settings.job_log_retention_days ?? 90}" required />
-                <div class="helper">Entero mayor que los dias de archivo (por defecto 90). Los logs mas viejos se eliminan por politica.</div>
+                <div class="helper">Entero mayor que los dias de archivo (por defecto 90). Los logs mas viejos se eliminan por politica solo si la retencion esta activada.</div>
+              </div>
+              <div class="field">
+                <label for="settingsJobLogMaintenanceQuotaEnabled">
+                  <input id="settingsJobLogMaintenanceQuotaEnabled" type="checkbox" style="width:auto; margin-right:8px;" ${state.settings.job_log_quota_enabled ?? false ? "checked" : ""} />
+                  Activar cuota</label>
+                <div class="helper">Interruptor independiente: la cuota solo evicta logs si esta casilla activa (o si la configuracion antigua ya la tenia activa). Desactivar la retencion no cambia la cuota.</div>
               </div>
               <div class="field">
                 <label for="settingsJobLogMaintenanceQuotaGiB">Cuota de logs (GiB, opcional)</label>
                 <input id="settingsJobLogMaintenanceQuotaGiB" type="number" min="1" max="1024" step="1" placeholder="Sin cuota" value="${state.settings.job_log_quota_gib ?? ""}" />
                 <div class="helper">Cuota sobre la suma de payloads de logs de jobs (metadatos, no el archivo SQLite). Al superarla se avisa y se eliminan primero los logs terminados mas antiguos. Vacio = sin cuota.</div>
               </div>
+            </div>
+            <div class="field full" style="margin-top:12px;">
+              <label for="settingsJobLogPruneDate">Prune manual por fecha (elimina logs hasta una fecha)</label>
+              <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+                <input id="settingsJobLogPruneDate" type="date" style="width:auto;" max="${new Date().toISOString().slice(0, 10)}" aria-describedby="jobLogPruneStatus" />
+                <button type="button" class="btn secondary" data-job-log-prune-confirm ${state.settings.job_log_maintenance?.prune_state?.status === "pending" ? "disabled" : ""}>Prune historico</button>
+              </div>
+              <div id="jobLogPruneStatus" data-job-log-prune-status class="helper" aria-live="polite"></div>
+              <div class="helper">Elimina los cuerpos de log de los jobs finalizados el dia seleccionado o antes (UTC). Es irreversible: los jobs, resumenes y backups se conservan, pero no hay garantía de recuperacion de espacio en disco. Corre por lotes acotados con estado persistente (continua tras reiniciar) y tiene prioridad sobre el archivo, la retencion y la cuota mientras este pendiente. Un segundo clic en el boton confirma.</div>
             </div>
           </div>
           </section>
@@ -9259,6 +9274,7 @@ docker compose up -d
         listingLimitInput.setAttribute("aria-invalid", "false");
         listingLimitError.textContent = "";
         const maintenanceEnabled = document.getElementById("settingsJobLogMaintenanceEnabled").checked;
+        const quotaEnabled = document.getElementById("settingsJobLogMaintenanceQuotaEnabled").checked;
         const archiveInput = document.getElementById("settingsJobLogMaintenanceArchiveDays");
         const retentionInput = document.getElementById("settingsJobLogMaintenanceRetentionDays");
         const quotaInput = document.getElementById("settingsJobLogMaintenanceQuotaGiB");
@@ -9322,6 +9338,7 @@ docker compose up -d
             job_log_maintenance_enabled: maintenanceEnabled,
             job_log_archive_after_days: archiveDays,
             job_log_retention_days: retentionDays,
+            job_log_quota_enabled: quotaEnabled,
             job_log_quota_gib: quotaGiB === "" ? null : quotaGiB,
           });
           await refreshAll();
@@ -9332,6 +9349,72 @@ docker compose up -d
       });
       initializeSettingsSubmenus(content);
       renderNotificationChannelManager();
+      renderJobLogPruneStatus();
+      document.querySelectorAll("[data-job-log-prune-confirm]").forEach((btn) => {
+        btn.addEventListener("click", () => confirmJobLogPrune(btn));
+      });
+    }
+
+    function jobLogPruneState() {
+      return state.settings.job_log_maintenance?.prune_state ?? null;
+    }
+
+    function renderJobLogPruneStatus() {
+      const statusEl = document.getElementById("jobLogPruneStatus");
+      if (!statusEl) return;
+      const confirmBtn = document.querySelector("[data-job-log-prune-confirm]");
+      const pruneState = jobLogPruneState();
+      if (confirmBtn) confirmBtn.disabled = pruneState?.status === "pending";
+      if (!pruneState) {
+        statusEl.innerHTML = 'Sin prune manual pendiente.';
+        return;
+      }
+      if (pruneState.status === "pending") {
+        const usage = state.settings.job_log_maintenance?.usage ?? null;
+        if (usage && !usage.complete) {
+          statusEl.innerHTML = `Prune pendiente hasta el ${escapeHtml(pruneState.cutoff_date)} (UTC): esperando la indexacion compacta de los logs historicos (${usage.accounted_rows ?? 0} contabilizados); no elimina nada todavia.`;
+          return;
+        }
+        statusEl.innerHTML = `Prune pendiente hasta el ${escapeHtml(pruneState.cutoff_date)} (UTC): ${pruneState.processed} logs procesados, se continua por lotes automaticamente.`;
+        return;
+      }
+      statusEl.innerHTML = `Ultimo prune completado hasta el ${escapeHtml(pruneState.cutoff_date || "")} (UTC).`;
+    }
+
+    async function confirmJobLogPrune(btn) {
+      const input = document.getElementById("settingsJobLogPruneDate");
+      const statusEl = document.getElementById("jobLogPruneStatus");
+      const cutoffDate = input ? input.value : "";
+      if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}$/.test(cutoffDate)) {
+        if (statusEl) statusEl.textContent = "Selecciona una fecha (AAAA-MM-DD) para el prune.";
+        return;
+      }
+      const today = new Date().toISOString().slice(0, 10);
+      if (cutoffDate > today) {
+        if (statusEl) statusEl.textContent = "El corte no puede ser una fecha futura.";
+        return;
+      }
+      if (btn.dataset.pruneArmed !== "true") {
+        btn.dataset.pruneArmed = "true";
+        if (statusEl) statusEl.innerHTML = `Confirma: se eliminaran de forma <strong>irreversible</strong> los logs de los jobs finalizados el ${escapeHtml(cutoffDate)} o antes (UTC). Pulsa de nuevo para ejecutar.`;
+        setTimeout(() => { btn.dataset.pruneArmed = "false"; }, 10000);
+        return;
+      }
+      btn.dataset.pruneArmed = "false";
+      await withBtnLoading(btn, async () => {
+        const result = await apiPost("/api/v1/admin/jobs/logs/prune", {
+          cutoff_date: cutoffDate,
+          acknowledged: true,
+        });
+        // A2: the status always derives from the actual nested settings
+        // payload; the POST updates exactly the nested prune_state key.
+        const maintenance = state.settings.job_log_maintenance ?? {};
+        state.settings.job_log_maintenance = { ...maintenance, prune_state: result };
+        renderJobLogPruneStatus();
+        showFeedback("Prune aceptado: se ejecuta por lotes acotados.", "success");
+      }, "Aceptando prune...").catch((error) => {
+        if (statusEl) statusEl.textContent = `Error al aceptar el prune: ${error.message}`;
+      });
     }
 
     function renderNotificationChannelManager() {

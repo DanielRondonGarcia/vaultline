@@ -2,6 +2,7 @@ import brotli
 import hmac
 import json
 import logging
+import re
 import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,7 @@ from src.control_plane.domain.models import (
     JOB_UNCONFIRMED_AFTER_SECONDS,
     IndexStatusRecord,
     InventorySnapshot,
+    JobLogPruneConflict,
     JobRecord,
     JobStatus,
     NotificationChannelRecord,
@@ -81,6 +83,10 @@ JOB_LOG_ARCHIVE_BROTLI_QUALITY = 4
 JOB_LOG_SIZES_TABLE = "job_log_sizes"
 JOB_LOG_SIZES_BACKFILL_META_KEY = "job_log_sizes_backfill_done"
 JOB_LOG_POLICY_EVENTS_META_KEY = "job_log_policy_events"
+# T3 S4: confirmed admin cutoff prune, persisted resumable run state.
+JOB_LOG_PRUNE_STATE_META_KEY = "job_log_prune_state"
+DEFAULT_JOB_LOG_PRUNE_BATCH_SIZE = 25
+MAX_PRUNE_BATCH_ROWS = 200
 JOB_LOG_POLICY_EVENT_LIMIT = 20
 
 # B1: policy selection is a COVERING path over the compact metadata only.
@@ -619,6 +625,21 @@ class SQLiteRepositoryBase:
                 f"INTEGER NOT NULL DEFAULT {SettingsRecord.DEFAULT_JOB_LOG_RETENTION_DAYS}",
             )
             self._ensure_column(connection, "settings", "job_log_quota_gib", "INTEGER")
+            # T3 S5 presence-aware migration: only a previously ACTIVE legacy
+            # quota (maintenance enabled AND configured) becomes explicitly
+            # enabled; every other stored combination is materialized dormant
+            # so old overdue data never starts disappearing automatically.
+            quota_flag_preexisting = "job_log_quota_enabled" in {
+                row["name"] for row in connection.execute("PRAGMA table_info(settings)").fetchall()
+            }
+            self._ensure_column(connection, "settings", "job_log_quota_enabled", "INTEGER")
+            if not quota_flag_preexisting:
+                connection.execute(
+                    "UPDATE settings SET job_log_quota_enabled = "
+                    "CASE WHEN job_log_maintenance_enabled = 1 "
+                    "AND job_log_quota_gib IS NOT NULL AND job_log_quota_gib >= 1 "
+                    "THEN 1 ELSE 0 END"
+                )
             self._ensure_column(connection, "jobs", "log_timestamps_json", "TEXT")
             self._ensure_column(connection, "jobs", "job_log_brotli", "BLOB")
             self._ensure_column(connection, "jobs", "job_log_removed", "INTEGER NOT NULL DEFAULT 0")
@@ -1357,6 +1378,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
         job_id: str,
         *,
         cutoff_text: Optional[str] = None,
+        cutoff_inclusive: bool = True,
     ) -> Tuple[str, int]:
         """Recheck one selected candidate and remove its payload via CAS.
 
@@ -1381,10 +1403,18 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             return ("skipped", 0)
         if row["status"] not in (JobStatus.SUCCEEDED, JobStatus.FAILED, JobStatus.CANCELED, "cancelled"):
             return ("skipped", 0)
-        if row["finished_at"] is None or (
-            cutoff_text is not None and str(row["finished_at"]) > str(cutoff_text)
-        ):
+        if row["finished_at"] is None:
             return ("skipped", 0)
+        if cutoff_text is not None:
+            # A1: the prune uses the exclusive next midnight with a strict cut
+            # (`<`); the retention/quota phases keep the historical inclusive
+            # boundary (`<=`) so their T2 semantics never change.
+            finished_text = str(row["finished_at"])
+            if cutoff_inclusive:
+                if finished_text > cutoff_text:
+                    return ("skipped", 0)
+            elif finished_text >= cutoff_text:
+                return ("skipped", 0)
         try:
             summary = _json_load(row["result_summary_json"], None)
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -1572,9 +1602,22 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     if row is not None and "job_log_maintenance_enabled" in row.keys()
                     else 0
                 )
+                # T3 S5: the transactional recheck uses the effective quota
+                # flag; an explicit stored decision wins, and only the legacy
+                # default falls back to `maintenance_enabled AND configured`.
+                stored_flag = (
+                    row["job_log_quota_enabled"]
+                    if row is not None and "job_log_quota_enabled" in row.keys()
+                    else None
+                )
+                configured_gib = type(stored_gib) is int and stored_gib > 0
+                if stored_flag is not None:
+                    quota_active = bool(stored_flag) and configured_gib
+                else:
+                    quota_active = stored_enabled == 1 and configured_gib
                 if row is None:
                     budget = free_to_bytes
-                elif stored_enabled == 1 and type(stored_gib) is int and stored_gib > 0:
+                elif quota_active:
                     budget = stored_gib * JOB_LOG_QUOTA_GIB_TO_BYTES
                 else:
                     budget = None
@@ -1625,6 +1668,26 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             events = []
         return events if isinstance(events, list) else []
 
+    @staticmethod
+    def _append_policy_events_locked(connection, entries: List[Dict[str, Any]]) -> None:
+        """Append bounded policy events inside an open immediate transaction."""
+        row = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = ?",
+            (JOB_LOG_POLICY_EVENTS_META_KEY,),
+        ).fetchone()
+        try:
+            events = _json_load(row["value"], []) if row else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            events = []
+        if not isinstance(events, list):
+            events = []
+        events.extend(entries)
+        events = events[-JOB_LOG_POLICY_EVENT_LIMIT:]
+        connection.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+            (JOB_LOG_POLICY_EVENTS_META_KEY, json.dumps(events)),
+        )
+
     def record_job_log_policy_events(self, entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Append bounded policy events, keeping the most recent only."""
         if not entries:
@@ -1633,6 +1696,7 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
             connection = self._connect()
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                self._append_policy_events_locked(connection, entries)
                 row = connection.execute(
                     "SELECT value FROM schema_meta WHERE key = ?",
                     (JOB_LOG_POLICY_EVENTS_META_KEY,),
@@ -1641,16 +1705,265 @@ class SQLiteJobRepository(SQLiteRepositoryBase, JobRepository):
                     events = _json_load(row["value"], []) if row else []
                 except (TypeError, ValueError, json.JSONDecodeError):
                     events = []
-                if not isinstance(events, list):
-                    events = []
-                events.extend(entries)
-                events = events[-JOB_LOG_POLICY_EVENT_LIMIT:]
+                connection.commit()
+                return events if isinstance(events, list) else []
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    # ------------------------------------------------------------------
+    # T3 S4: confirmed admin cutoff prune, persisted and resumable.
+    # The run state lives in schema_meta so it survives restarts; batches use
+    # a durable ordered (finished_at, job_id) cursor over the compact policy
+    # index, one short BEGIN IMMEDIATE batch at a time, never a full scan.
+    # The cursor advances past protected synthetic rows too, so no cooldown
+    # can stall completion.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prune_state_locked(connection) -> Optional[Dict[str, Any]]:
+        row = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = ?", (JOB_LOG_PRUNE_STATE_META_KEY,)
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            state = _json_load(row["value"], None)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            state = None
+        return state if isinstance(state, dict) else None
+
+    def job_log_prune_state(self) -> Optional[Dict[str, Any]]:
+        with self._connect() as connection:
+            return self._prune_state_locked(connection)
+
+    @staticmethod
+    def _validate_prune_cutoff_date(cutoff_date: str) -> str:
+        if isinstance(cutoff_date, bool) or not isinstance(cutoff_date, str):
+            raise ValueError("cutoff_date must be a YYYY-MM-DD calendar date string")
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", cutoff_date):
+            raise ValueError("cutoff_date must be a YYYY-MM-DD calendar date string")
+        try:
+            datetime.strptime(cutoff_date, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError(
+                f"cutoff_date is not a real calendar date: {cutoff_date}"
+            ) from exc
+        return cutoff_date
+
+    def request_job_log_prune(self, cutoff_date: str, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """Accept one confirmed cutoff prune as persisted pending run state.
+
+        Idempotent for the same cutoff, a conflicting pending prune raises
+        JobLogPruneConflict. The cutoff is the exclusive next midnight (UTC):
+        log bodies of jobs finished before or on the selected date are pruned.
+        The request itself deletes nothing and returns bounded state without
+        scanning or fabricating historical counts.
+        """
+        validated = self._validate_prune_cutoff_date(cutoff_date)
+        year, month, day = (int(part) for part in validated.split("-"))
+        next_midnight = datetime(year, month, day) + timedelta(days=1)
+        now_text = (now or utcnow()).isoformat()
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                existing = self._prune_state_locked(connection)
+                if existing and existing.get("status") == "pending":
+                    if existing.get("cutoff_date") == validated:
+                        connection.commit()
+                        return {**existing, "created": False}
+                    connection.rollback()
+                    raise JobLogPruneConflict(
+                        "a pending job log prune with cutoff "
+                        f"{existing.get('cutoff_date')} is already in progress"
+                    )
+                state = {
+                    "cutoff_date": validated,
+                    "cutoff": next_midnight.isoformat(),
+                    "status": "pending",
+                    "processed": 0,
+                    "bytes_freed": 0,
+                    "cursor_finished_at": "",
+                    "cursor_job_id": "",
+                    "batch_size": DEFAULT_JOB_LOG_PRUNE_BATCH_SIZE,
+                    "requested_at": now_text,
+                    "updated_at": now_text,
+                }
                 connection.execute(
                     "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
-                    (JOB_LOG_POLICY_EVENTS_META_KEY, json.dumps(events)),
+                    (JOB_LOG_PRUNE_STATE_META_KEY, json.dumps(state)),
                 )
                 connection.commit()
-                return events
+                return {**state, "created": True}
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+    @staticmethod
+    def _prune_candidates_locked(
+        connection,
+        *,
+        cutoff_text: str,
+        cursor_finished_at: str,
+        cursor_job_id: str,
+        limit: int,
+    ) -> List[Tuple[str, str]]:
+        """Covering oldest-first (finished_at, job_id) prune selection.
+
+        A1: strict `finished_at < :cutoff` against the exclusive next-midnight
+        cutoff, so exact-midnight stored forms and the `+00:00`/microsecond
+        SQLite ISO variants are consistently excluded in both the compact
+        selection and the wide-row safety check.
+        """
+        rows = connection.execute(
+            f"""
+            SELECT job_id, finished_at FROM {JOB_LOG_SIZES_TABLE}
+            WHERE payload_present = 1 AND terminal = 1 AND removed = 0
+              AND finished_at IS NOT NULL AND finished_at < :cutoff
+              AND (finished_at > :after_finished OR (finished_at = :after_finished AND job_id > :after_job_id))
+            ORDER BY finished_at ASC, job_id ASC
+            LIMIT :limit
+            """,
+            {
+                "cutoff": cutoff_text,
+                "after_finished": cursor_finished_at,
+                "after_job_id": cursor_job_id,
+                "limit": max(1, limit),
+            },
+        ).fetchall()
+        return [(row["job_id"], row["finished_at"]) for row in rows]
+
+    def run_job_log_prune_batch(self, batch_size: Optional[int] = None, *, now: Optional[datetime] = None) -> Dict[str, Any]:
+        """Advance the persisted prune cursor by one bounded BEGIN IMMEDIATE batch.
+
+        With no pending state this is a no-op (`active` False). B1: the cursor
+        is not read or advanced until the bounded compact backfill completion
+        marker exists — the id-keyset backfill rows surface out of finish-time
+        order, so advancing a finish-time cursor over partial metadata could
+        silently skip later-discovered older rows. Completion is then written
+        when the follow-up probe finds no further matching rows past the
+        cursor, and the prune never reports a premature completion over the
+        cooldown of a protected synthetic job. Bounded note: each batch
+        touches at most `batch_size` selected rows (one recheck + one
+        predicate write each).
+        """
+        now_text = (now or utcnow()).isoformat()
+        with self._lock:
+            connection = self._connect()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                state = self._prune_state_locked(connection)
+                if not state or state.get("status") != "pending":
+                    connection.commit()
+                    return {
+                        "active": False,
+                        "complete": bool(state),
+                        "wait_for_indexing": False,
+                        "removed": [],
+                        "bytes_freed": 0,
+                        "skipped": [],
+                        "state": state,
+                    }
+                marker = connection.execute(
+                    "SELECT 1 FROM schema_meta WHERE key = ?", (JOB_LOG_SIZES_BACKFILL_META_KEY,)
+                ).fetchone()
+                if marker is None:
+                    # B1: wait for the bounded backfill to complete BEFORE
+                    # reading or advancing the finish-time cursor; nothing is
+                    # deleted and the state stays exactly as requested.
+                    connection.commit()
+                    return {
+                        "active": True,
+                        "complete": False,
+                        "wait_for_indexing": True,
+                        "removed": [],
+                        "bytes_freed": 0,
+                        "skipped": [],
+                        "state": state,
+                    }
+                limit = DEFAULT_JOB_LOG_PRUNE_BATCH_SIZE
+                if isinstance(batch_size, int) and not isinstance(batch_size, bool) and 0 < batch_size <= MAX_PRUNE_BATCH_ROWS:
+                    limit = batch_size
+                cutoff_text = str(state["cutoff"])
+                candidates = self._prune_candidates_locked(
+                    connection,
+                    cutoff_text=cutoff_text,
+                    cursor_finished_at=str(state.get("cursor_finished_at") or ""),
+                    cursor_job_id=str(state.get("cursor_job_id") or ""),
+                    limit=limit,
+                )
+                removed: List[str] = []
+                skipped: List[str] = []
+                freed_total = 0
+                last_finished_at = str(state.get("cursor_finished_at") or "")
+                last_job_id = str(state.get("cursor_job_id") or "")
+                for job_id, finished_at in candidates:
+                    outcome, freed = self._policy_removal_locked(
+                        connection,
+                        job_id,
+                        cutoff_text=cutoff_text,
+                        # A1: the prune cut is strict before the next midnight.
+                        cutoff_inclusive=False,
+                    )
+                    if outcome == "removed":
+                        removed.append(job_id)
+                        freed_total += freed
+                    else:
+                        skipped.append(job_id)
+                    last_finished_at, last_job_id = str(finished_at), str(job_id)
+                if candidates:
+                    followup = self._prune_candidates_locked(
+                        connection,
+                        cutoff_text=cutoff_text,
+                        cursor_finished_at=last_finished_at,
+                        cursor_job_id=last_job_id,
+                        limit=1,
+                    )
+                    probe_empty = not followup
+                else:
+                    probe_empty = True
+                # The backfill completion marker was verified above, so the
+                # compact metadata here is complete by definition.
+                complete = probe_empty
+                next_state = dict(state)
+                next_state.update({
+                    "processed": int(state.get("processed") or 0) + len(candidates),
+                    "bytes_freed": int(state.get("bytes_freed") or 0) + freed_total,
+                    "cursor_finished_at": last_finished_at if candidates else state.get("cursor_finished_at"),
+                    "cursor_job_id": last_job_id if candidates else state.get("cursor_job_id"),
+                    "updated_at": now_text,
+                })
+                if complete:
+                    next_state["status"] = "complete"
+                    next_state["completed_at"] = now_text
+                if removed:
+                    self._append_policy_events_locked(connection, [{
+                        "at": now_text,
+                        "kind": "logs_pruned",
+                        "cutoff_date": state["cutoff_date"],
+                        "job_count": len(removed),
+                        "bytes_freed": freed_total,
+                        "job_ids": removed[:5],
+                    }])
+                connection.execute(
+                    "INSERT OR REPLACE INTO schema_meta (key, value) VALUES (?, ?)",
+                    (JOB_LOG_PRUNE_STATE_META_KEY, json.dumps(next_state)),
+                )
+                connection.commit()
+                return {
+                    "active": True,
+                    "complete": next_state["status"] == "complete",
+                    "wait_for_indexing": False,
+                    "removed": removed,
+                    "bytes_freed": freed_total,
+                    "skipped": skipped,
+                    "state": next_state,
+                }
             except Exception:
                 connection.rollback()
                 raise
@@ -2876,6 +3189,11 @@ class SQLiteSettingsRepository(SQLiteRepositoryBase, SettingsRepository):
             or stored_quota_gib > SettingsRecord.MAX_JOB_LOG_QUOTA_GIB
         ):
             stored_quota_gib = None
+        stored_quota_enabled = row["job_log_quota_enabled"] if "job_log_quota_enabled" in row.keys() else None
+        if isinstance(stored_quota_enabled, int):
+            stored_quota_enabled = bool(stored_quota_enabled) if stored_quota_enabled in (0, 1) else None
+        elif stored_quota_enabled is not None:
+            stored_quota_enabled = None
         return SettingsRecord(
             id=row["id"],
             restic_repository_base=row["restic_repository_base"] or "",
@@ -2888,6 +3206,7 @@ class SQLiteSettingsRepository(SQLiteRepositoryBase, SettingsRepository):
             job_log_archive_after_days=stored_maintenance_days[0],
             job_log_retention_days=stored_maintenance_days[1],
             job_log_quota_gib=stored_quota_gib,
+            job_log_quota_enabled=stored_quota_enabled,
             updated_at=_dt(row["updated_at"]) or datetime.utcnow(),
         )
 
@@ -2919,8 +3238,8 @@ class SQLiteSettingsRepository(SQLiteRepositoryBase, SettingsRepository):
                     global_cron_expression, control_plane_public_url,
                     snapshot_explorer_listing_max_output_bytes,
                     job_log_maintenance_enabled, job_log_archive_after_days,
-                    job_log_retention_days, job_log_quota_gib, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    job_log_retention_days, job_log_quota_gib, job_log_quota_enabled, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     settings.id,
@@ -2934,6 +3253,7 @@ class SQLiteSettingsRepository(SQLiteRepositoryBase, SettingsRepository):
                     settings.job_log_archive_after_days,
                     settings.job_log_retention_days,
                     settings.job_log_quota_gib,
+                    None if settings.job_log_quota_enabled is None else (1 if settings.job_log_quota_enabled else 0),
                     settings.updated_at.isoformat(),
                 ),
             )

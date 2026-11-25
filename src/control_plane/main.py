@@ -45,7 +45,7 @@ from src.control_plane.application.services.scheduler_service import (
 )
 from src.control_plane.application.services.job_log_maintenance import JobLogMaintenanceService
 from src.control_plane.application.services.control_plane_service import SETTINGS_UNSET
-from src.control_plane.domain.models import JobStatus
+from src.control_plane.domain.models import JobLogPruneConflict, JobStatus
 from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryDashboardReadSnapshotRepository,
     InMemoryInventoryRepository,
@@ -769,6 +769,16 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     return self._write_json(404, {"error": "job not found"}, head_only=head_only)
                 return self._write_json(200, result, head_only=head_only)
+            if path == "/api/v1/admin/jobs/logs/prune":
+                # T3 S4: bounded persisted prune state (no historical counts,
+                # no synchronous scan) for the Global Settings date picker.
+                if not self._require_auth(ROLE_ADMIN, head_only=head_only, api_mode=True):
+                    return
+                return self._write_json(
+                    200,
+                    {"state": self._control_plane_service().job_log_prune_state()},
+                    head_only=head_only,
+                )
             if path == "/api/v1/workers":
                 if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
                     return
@@ -1144,6 +1154,30 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                             parts[4], body["target_id"], body["confirmation"]
                         ),
                     )
+            # T3 S4: confirmed admin cutoff prune for stored job log bodies.
+            # Strictly validated, explicitly acknowledged, idempotent for the
+            # same cutoff, conflicting pending prune answered with 409. The
+            # request itself deletes nothing; the resumable bounded task
+            # advances via the maintenance lane in later batches.
+            if path == "/api/v1/admin/jobs/logs/prune":
+                if not self._require_auth(ROLE_ADMIN, api_mode=True):
+                    return
+                if not isinstance(body, dict) or set(body) != {"cutoff_date", "acknowledged"}:
+                    raise ValueError("cutoff_date and acknowledged are required")
+                if body.get("acknowledged") is not True:
+                    raise ValueError(
+                        "Pruning stored job logs is irreversible: "
+                        "the request requires acknowledged=true"
+                    )
+                service = self._control_plane_service()
+                try:
+                    result = service.request_job_log_prune(body.get("cutoff_date"), acknowledge=True)
+                except JobLogPruneConflict as exc:
+                    return self._write_json(
+                        409,
+                        {"error": str(exc), "state": service.job_log_prune_state()},
+                    )
+                return self._write_json(202 if result.get("created") else 200, result)
 
             if path == "/api/v1/filesystem-size-estimates":
                 if not self._require_auth(ROLE_ADMIN, api_mode=True):
@@ -1695,6 +1729,7 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     job_log_maintenance_enabled=body.get("job_log_maintenance_enabled"),
                     job_log_archive_after_days=body.get("job_log_archive_after_days"),
                     job_log_retention_days=body.get("job_log_retention_days"),
+                    job_log_quota_enabled=body.get("job_log_quota_enabled"),
                     # An omitted PATCH key keeps the stored quota; an explicit
                     # JSON null disables the job-log quota.
                     job_log_quota_gib=(

@@ -120,6 +120,32 @@ El mantenimiento de logs esta **desactivado por defecto**; se activa en la UI
    del bloqueo de escritura. Si se desactiva el mantenimiento a media
    pasada, la siguiente pasada no se ejecuta; las fases de expiracion y
    compresion de la pasada en curso pueden terminar.
+6. El **archivo automatico con Brotli** corre independientemente del
+   interruptor de retencion y de la cuota (30 dias por defecto): arranca tras
+   un retardo de cadencia normal en el arranque (nunca en linea durante el
+   inicio) y solo comprime, nunca elimina. La retencion (paso 3) sigue siendo
+   el opt-in explicito de borrado y la cuota tiene su propio interruptor de
+   activacion; una cuota antigua dormida no comienza a eliminar sola tras la
+   actualizacion.
+7. **Prune manual por fecha (irreversible):** desde la misma tarjeta UI, un
+   admin elige una fecha pasada (UTC) y confirma; la peticion aceptada guarda
+   un estado acotado y persistente (corte, cursor ordenado, progreso) que
+   continua por lotes automaticamente, incluso tras reiniciar el proceso, y
+   tiene prioridad sobre el archivo, la retencion y la cuota mientras este
+   pendiente. Cada lote es una transaccion corta que toca como maximo el
+   tamano de lote de filas seleccionadas; la seleccion solo recorre
+   metadatos compactos y los logs historicos sin indexar se alcanzan antes
+   mediante el backfill acotado con marcador de completitud. No hace
+   escaneos sincronos ni fabrica contadores historicos; peticiones invalidas
+   o en conflicto dejan los logs byte-identicos. Mientras la indexacion
+   compacta historica sigue incompleta, el prune no lee ni avanza su cursor
+   y no elimina nada (los log descubiertos despues por el backfill en orden
+   de id jamas quedan saltados por el cursor); el estado del prune y el
+   progreso de indexacion (filas contabilizadas) se exponen en Settings y la
+   tarjeta de UI los muestra. El corte usa estrictamente
+   `finished_at < medianoche siguiente UTC`: los jobs terminados exactamente
+   en la medianoche siguiente o en variantes ISO con zona horaria quedan
+   retenidos, en ambos lados de la comparacion.
 
 Si el Control Plane va a estar detrás de un proxy o con un dominio, define
 también la URL pública para que los comandos del worker salgan correctos:

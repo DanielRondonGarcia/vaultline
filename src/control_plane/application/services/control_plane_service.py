@@ -39,6 +39,7 @@ from src.control_plane.application.services.job_event_broker import JobEventBrok
 from src.control_plane.domain.models import (
     BackupTargetRecord,
     InventorySnapshot,
+    JobLogPruneConflict,
     JobRecord,
     JobStatus,
     NotificationChannelRecord,
@@ -54,12 +55,22 @@ from src.control_plane.domain.models import (
     WorkerRecord,
     WorkerScheduleClaimRecord,
     WorkerStatus,
+    effective_job_log_quota_enabled,
     utcnow,
 )
 from src.control_plane.application.services.backup_audit_report import build_backup_audit_report, parse_audit_period
 from src.restic_retention import apply_target_retention_policy, build_restic_forget_command
 
 logger = logging.getLogger(__name__)
+
+# T3 S4: clear, fixed prune semantics shipped with every prune public state;
+# no historical counts are fabricated and nothing is scanned synchronously.
+JOB_LOG_PRUNE_SEMANTICS = (
+    "Removes the stored log bodies of jobs finished before or on the selected "
+    "date (UTC); jobs, result summaries, snapshots and backups are kept. The "
+    "removal is irreversible and freed disk space is only reclaimed as the "
+    "SQLite file is rewritten (no automatic VACUUM)."
+)
 
 # T2 S3 PATCH sentinel: omitted Global Settings keys keep the stored value,
 # while an explicit JSON null for the nullable job-log quota disables it.
@@ -3164,6 +3175,7 @@ class ControlPlaneService:
         job_log_archive_after_days: Any = None,
         job_log_retention_days: Any = None,
         job_log_quota_gib: Any = SETTINGS_UNSET,
+        job_log_quota_enabled: Optional[bool] = None,
     ) -> SettingsRecord:
         if not self.settings_repository:
             raise ValueError("settings repository not configured")
@@ -3178,6 +3190,7 @@ class ControlPlaneService:
             job_log_retention_days, "job_log_retention_days"
         )
         normalized_quota_gib = self._validate_job_log_quota_gib(job_log_quota_gib)
+        normalized_quota_enabled = self._validate_job_log_quota_enabled(job_log_quota_enabled)
         existing = self.settings_repository.get() or SettingsRecord()
         if restic_repository_base is not None:
             existing.restic_repository_base = restic_repository_base
@@ -3207,6 +3220,10 @@ class ControlPlaneService:
             # An omitted PATCH keeps the stored quota; an explicit null value
             # disables quota enforcement.
             existing.job_log_quota_gib = normalized_quota_gib
+        if normalized_quota_enabled is not None:
+            # T3 S5: an omitted PATCH key never unsets the explicit quota flag,
+            # so a later retention toggle preserves the prior quota state.
+            existing.job_log_quota_enabled = normalized_quota_enabled
         if (
             existing.job_log_maintenance_enabled
             and existing.job_log_archive_after_days >= existing.job_log_retention_days
@@ -5412,6 +5429,14 @@ class ControlPlaneService:
         return value
 
     @classmethod
+    def _validate_job_log_quota_enabled(cls, value: Any):
+        if value is None:
+            return None
+        if value is SETTINGS_UNSET or isinstance(value, bool) is False:
+            raise ValueError("job_log_quota_enabled must be a boolean")
+        return bool(value)
+
+    @classmethod
     def _validate_job_log_quota_gib(cls, value: Any):
         if value is SETTINGS_UNSET:
             return SETTINGS_UNSET
@@ -5429,6 +5454,62 @@ class ControlPlaneService:
                 f"job_log_quota_gib must be an integer between {minimum} and {maximum} GiB"
             )
         return value
+
+    # -- T3 S4: confirmed admin cutoff prune (ADMIN only, destructive) ------
+
+    def _job_log_prune_supported(self) -> bool:
+        return all(
+            hasattr(self.job_repository, name)
+            for name in (
+                "request_job_log_prune",
+                "run_job_log_prune_batch",
+                "job_log_prune_state",
+            )
+        )
+
+    def request_job_log_prune(
+        self,
+        cutoff_date: Any,
+        acknowledge: bool = False,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Accept an admin-confirmed cutoff prune as persisted resumable state.
+
+        Validates a strict YYYY-MM-DD calendar date that is not in the future,
+        requires the explicit acknowledgment, and answers idempotently for the
+        same pending cutoff while a conflicting pending prune raises
+        JobLogPruneConflict. Nothing is scanned or deleted synchronously.
+        """
+        if not self._job_log_prune_supported():
+            raise ValueError(
+                "Cutoff pruning of job logs is unsupported for the in-memory job "
+                "repository: it is nonpersistent, so there is nothing to prune."
+            )
+        if acknowledge is not True:
+            raise ValueError(
+                "Pruning stored job logs is irreversible: the request must "
+                "be acknowledged"
+            )
+        if isinstance(cutoff_date, bool) or not isinstance(cutoff_date, str):
+            raise ValueError("cutoff_date must be a YYYY-MM-DD calendar date string")
+        if not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", cutoff_date):
+            raise ValueError("cutoff_date must be a YYYY-MM-DD calendar date string")
+        try:
+            selected = datetime.fromisoformat(f"{cutoff_date}T00:00:00")
+        except ValueError:
+            raise ValueError(f"cutoff_date is not a real calendar date: {cutoff_date}")
+        if selected.date() > utcnow().date():
+            raise ValueError("cutoff_date must not be a date in the future")
+        result = self.job_repository.request_job_log_prune(cutoff_date, now=now)
+        return {
+            **result,
+            "semantics": JOB_LOG_PRUNE_SEMANTICS,
+        }
+
+    def job_log_prune_state(self) -> Optional[Dict[str, Any]]:
+        if not self._job_log_prune_supported():
+            return None
+        return self.job_repository.job_log_prune_state()
 
     def job_log_maintenance_status(self, maintenance=None) -> Dict[str, Any]:
         """Measured usage and recent quota breach/eviction for Global Settings.
@@ -5457,9 +5538,12 @@ class ControlPlaneService:
             "archive_after_days": getattr(settings, "job_log_archive_after_days", None) if settings is not None else None,
             "retention_days": getattr(settings, "job_log_retention_days", None) if settings is not None else None,
             "quota_gib": getattr(settings, "job_log_quota_gib", None) if settings is not None else None,
+            "quota_enabled": getattr(settings, "job_log_quota_enabled", None) if settings is not None else None,
+            "quota_active": effective_job_log_quota_enabled(settings),
             "usage": None,
             "quota_breached": False,
             "events": [],
+            "prune_state": None,
         }
         if not supported:
             payload["message"] = (
@@ -5469,6 +5553,14 @@ class ControlPlaneService:
             return payload
         payload["usage"] = repo.job_log_usage()
         payload["events"] = repo.job_log_policy_events()
+        if hasattr(repo, "job_log_prune_state"):
+            payload["prune_state"] = repo.job_log_prune_state()
+        # Compact indexing progress (B1): never a jobs-table scan; the UI uses
+        # it to explain a pending prune while the bounded backfill runs.
+        payload["indexing"] = {
+            "complete": bool(payload["usage"].get("complete") or False),
+            "accounted_rows": int(payload["usage"].get("accounted_rows") or 0),
+        }
         if maintenance is not None:
             payload.update(maintenance.status())
             payload["supported"] = supported

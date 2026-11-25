@@ -13,7 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest import mock
 
 import brotli
@@ -24,7 +24,15 @@ from src.control_plane.application.services.control_plane_service import (
     ControlPlaneService,
     SETTINGS_UNSET,
 )
-from src.control_plane.domain.models import JobRecord, JobStatus, SettingsRecord, WorkerRecord, utcnow
+from src.control_plane.domain.models import (
+    JobLogPruneConflict,
+    JobRecord,
+    JobStatus,
+    SettingsRecord,
+    WorkerRecord,
+    effective_job_log_quota_enabled,
+    utcnow,
+)
 from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryInventoryRepository,
     InMemoryJobRepository,
@@ -815,7 +823,7 @@ class RemovalPolicyTests(unittest.TestCase):
 
 
 class MaintenanceServiceTests(unittest.TestCase):
-    def test_disabled_by_default_and_gate_keeps_repositories_untouched(self):
+    def test_disabled_retention_config_still_archives_but_never_deletes(self):
         with tempfile.TemporaryDirectory() as directory:
             repository = SQLiteJobRepository(f"{directory}/control-plane.db")
             service = make_service(repository)
@@ -828,12 +836,19 @@ class MaintenanceServiceTests(unittest.TestCase):
 
             self.assertTrue(result["supported"])
             self.assertFalse(result["enabled"])
-            self.assertEqual(result["actions"], {})
-            expected = stored_log_bytes(f"{directory}/control-plane.db")
-            usage = repository.job_log_usage()
-            self.assertEqual(usage["measured_bytes"], sum(expected.values()))
-            self.assertFalse(usage["complete"])
-            self.assertEqual(repository.job_log_policy_events(), [])
+            # S5: archival is automatic, but nothing is deleted while the
+            # retention opt-in and the quota are both disabled.
+            self.assertGreaterEqual(result["actions"]["archived"], 1)
+            self.assertNotIn("expired", result["actions"])
+            self.assertNotIn("evicted", result["actions"])
+            stored = repository.list()[0]
+            self.assertFalse(getattr(stored, "job_log_removed", False))
+            self.assertTrue(repository.job_log_usage()["complete"])
+            self.assertTrue(any(event["kind"] == "logs_archived" for event in repository.job_log_policy_events()))
+            self.assertEqual(
+                [event["kind"] for event in repository.job_log_policy_events() if event["kind"] not in ("logs_archived",)],
+                [],
+            )
 
     def test_tick_runs_expire_then_archive_then_quota_eviction_with_alert(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1020,6 +1035,624 @@ class MaintenanceServiceTests(unittest.TestCase):
             self.assertGreaterEqual(spans_by_start[1]["start"], spans_by_start[0]["end"])
             self.assertFalse(parallel_done)
             self.assertEqual(lane.status()["last_result"]["enabled"], True)
+
+
+class JobLogPruneRequestTests(unittest.TestCase):
+    """S4: admin cutoff prune requests validate strictly, are idempotent for
+    the same cutoff and reject conflicting pending prunes while the stored
+    log bytes remain untouched."""
+
+    def _make(self, directory):
+        database = f"{directory}/cp.db"
+        repository = SQLiteJobRepository(database)
+        service = make_service(repository)
+        for index in range(2):
+            repository.save(JobRecord(
+                id=f"job-{index}", worker_id="worker-a", command="backup.run",
+                status=JobStatus.SUCCEEDED, log_lines=[BIG_TEXT],
+                finished_at=utcnow() - timedelta(days=60),
+            ))
+        return repository, service
+
+    def test_request_requires_acknowledgment_and_strict_past_calendar_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, service = self._make(directory)
+            for acknowledge in (False, None, "yes", 1):
+                with self.subTest(acknowledge=acknowledge):
+                    with self.assertRaisesRegex(ValueError, "acknowledg"):
+                        service.request_job_log_prune("2026-03-03", acknowledge=acknowledge)
+            for bad_cutoff in (True, 20260303, None, "2026-3-3", "03/03/2026",
+                               "2026-02-30", "2026-13-01", "2026-03-03 ", ""):
+                with self.subTest(cutoff=bad_cutoff):
+                    with self.assertRaisesRegex(ValueError, "cutoff_date"):
+                        service.request_job_log_prune(bad_cutoff, acknowledge=True)
+            future = (utcnow() + timedelta(days=2)).strftime("%Y-%m-%d")
+            with self.assertRaisesRegex(ValueError, "future"):
+                service.request_job_log_prune(future, acknowledge=True)
+            self.assertIsNone(repository.job_log_prune_state())
+
+    def test_accepted_request_persists_pending_state_with_exclusive_next_midnight_cutoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, service = self._make(directory)
+            result = service.request_job_log_prune("2026-03-03", acknowledge=True, now=utcnow())
+            self.assertTrue(result["created"])
+            self.assertEqual(result["cutoff_date"], "2026-03-03")
+            self.assertEqual(result["cutoff"], "2026-03-04T00:00:00")
+            self.assertEqual(result["status"], "pending")
+            self.assertEqual(result["processed"], 0)
+            self.assertEqual(result["bytes_freed"], 0)
+            state = repository.job_log_prune_state()
+            self.assertIsNotNone(state)
+            self.assertEqual(state["cutoff_date"], "2026-03-03")
+            self.assertEqual(state["status"], "pending")
+            # The clear before-or-on-selected-date (UTC) semantics shipped with
+            # the state; no historical counts are fabricated.
+            self.assertIn("before or on", result["semantics"])
+            self.assertNotIn("deleted_jobs", result)
+
+    def test_same_cutoff_is_idempotent_and_conflicting_pending_prune_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, service = self._make(directory)
+            first = service.request_job_log_prune("2026-03-03", acknowledge=True)
+            self.assertTrue(first["created"])
+
+            second = service.request_job_log_prune("2026-03-03", acknowledge=True)
+            self.assertFalse(second["created"])
+            self.assertEqual(second["cutoff_date"], "2026-03-03")
+            self.assertEqual(second["processed"], 0)
+
+            with self.assertRaises(JobLogPruneConflict):
+                service.request_job_log_prune("2026-02-20", acknowledge=True)
+            state = repository.job_log_prune_state()
+            self.assertEqual(state["cutoff_date"], "2026-03-03")
+
+    def test_invalid_and_conflicting_requests_keep_logs_byte_identical(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, service = self._make(directory)
+            before = stored_log_bytes(f"{directory}/cp.db")
+            self.assertGreater(sum(before.values()), 0)
+            service.request_job_log_prune("2026-03-03", acknowledge=True)
+            with self.assertRaises(JobLogPruneConflict):
+                service.request_job_log_prune("2026-02-20", acknowledge=True)
+            with self.assertRaises(ValueError):
+                service.request_job_log_prune("31/12/2025", acknowledge=True)
+            with self.assertRaises(ValueError):
+                service.request_job_log_prune("2026-03-03", acknowledge=False)
+            self.assertEqual(stored_log_bytes(f"{directory}/cp.db"), before)
+
+    def test_new_request_is_accepted_after_previous_prune_completed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, service = self._make(directory)
+            service.request_job_log_prune("2026-03-03", acknowledge=True)
+            repository.backfill_job_log_sizes(batch_size=25)
+            while not repository.run_job_log_prune_batch(batch_size=1)["complete"]:
+                pass
+            self.assertEqual(repository.job_log_prune_state()["status"], "complete")
+            result = service.request_job_log_prune("2026-02-01", acknowledge=True)
+            self.assertTrue(result["created"])
+            self.assertEqual(result["status"], "pending")
+
+
+class JobLogPruneRunTests(unittest.TestCase):
+    """S4: bounded resumable prune batches with a durable ordered cursor."""
+
+    def _make(self, directory):
+        repository = SQLiteJobRepository(f"{directory}/cp.db")
+        service = make_service(repository)
+        return repository, service
+
+    def _eligible(self, repository, job_id, **kwargs):
+        return repository.save(JobRecord(
+            id=job_id, worker_id="worker-a", command="backup.run",
+            status=JobStatus.SUCCEEDED, log_lines=[BIG_TEXT],
+            log_timestamps=["2024-05-05T10:00:00Z"], result_summary={"status_code": 0},
+            **kwargs,
+        ))
+
+    def test_batches_remove_logs_in_durable_cursor_order_until_complete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, _ = self._make(directory)
+            base = datetime(2026, 3, 1, 12, 0, 0)
+            self._eligible(repository, "a-old", finished_at=base)
+            self._eligible(repository, "b-old", finished_at=base + timedelta(days=1))
+            self._eligible(repository, "c-after-cutoff", finished_at=base + timedelta(days=9))
+            protected = repository.save(JobRecord(
+                id="d-diagnostic", worker_id="worker-a", command="backup.run",
+                status=JobStatus.FAILED, log_lines=[BIG_TEXT],
+                finished_at=base + timedelta(days=1),
+                result_summary={"diagnostic_code": "worker_lease_expired"},
+            ))
+            repository.backfill_job_log_sizes(batch_size=25)
+            repository.request_job_log_prune("2026-03-02", now=utcnow())
+
+            first = repository.run_job_log_prune_batch(batch_size=2, now=utcnow())
+            self.assertEqual(len(first["removed"]), 2)
+            self.assertEqual(first["complete"], False)
+            self.assertTrue(first["active"])
+            state = repository.job_log_prune_state()
+            self.assertEqual(state["processed"], 2)
+            self.assertGreater(state["bytes_freed"], 0)
+
+            second = repository.run_job_log_prune_batch(batch_size=2, now=utcnow())
+            self.assertEqual(second["removed"], [])
+            # The protected synthetic failure never stalls the cursor, though
+            # it was processed and is past the cursor.
+            self.assertEqual(second["skipped"], ["d-diagnostic"])
+            self.assertEqual(second["complete"], True)
+            final = repository.job_log_prune_state()
+            self.assertEqual(final["status"], "complete")
+            self.assertEqual(final["processed"], 3)
+            self.assertIsNotNone(final["completed_at"])
+
+            for job_id in ("a-old", "b-old"):
+                stored = repository.get(job_id)
+                self.assertTrue(getattr(stored, "job_log_removed", False))
+                self.assertEqual(stored.result_summary, {"status_code": 0})
+            after = repository.get(protected.id)
+            self.assertEqual(after.log_lines, [BIG_TEXT])
+            self.assertFalse(getattr(after, "job_log_removed", False))
+            kept = repository.get("c-after-cutoff")
+            self.assertEqual(kept.log_lines, [BIG_TEXT])
+            events = repository.job_log_policy_events()
+            self.assertTrue(any(event["kind"] == "logs_pruned" for event in events))
+
+            # Idempotent: a further batch finds nothing and stays complete.
+            again = repository.run_job_log_prune_batch(batch_size=2, now=utcnow())
+            self.assertEqual(again["removed"], [])
+            self.assertTrue(again["complete"])
+
+    def test_prune_state_resumes_across_restart_of_the_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/cp.db"
+            repository = SQLiteJobRepository(database)
+            base = datetime(2026, 3, 1, 12, 0, 0)
+            for index in range(6):
+                repository.save(JobRecord(
+                    id=f"job-{index}", worker_id="worker-a", command="backup.run",
+                    status=JobStatus.SUCCEEDED, log_lines=[BIG_TEXT],
+                    finished_at=base + timedelta(hours=index),
+                ))
+            repository.backfill_job_log_sizes(batch_size=25)
+            repository.request_job_log_prune("2026-03-02", now=utcnow())
+            repository.run_job_log_prune_batch(batch_size=2, now=utcnow())
+
+            restarted = SQLiteJobRepository(database)
+            state = restarted.job_log_prune_state()
+            self.assertEqual(state["status"], "pending")
+            self.assertEqual(state["processed"], 2)
+            while not restarted.run_job_log_prune_batch(batch_size=2, now=utcnow())["complete"]:
+                pass
+            final = restarted.job_log_prune_state()
+            self.assertEqual(final["processed"], 6)
+            self.assertEqual(final["status"], "complete")
+            for job in restarted.list():
+                self.assertTrue(getattr(job, "job_log_removed", False))
+
+    def test_lane_prioritizes_pending_prune_and_defers_archive_until_done(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/cp.db"
+            repository = SQLiteJobRepository(database)
+            service = make_service(repository)
+            old_cutoff = utcnow() - timedelta(days=60)
+            self._eligible(repository, "a-old", finished_at=old_cutoff)
+            between = self._eligible(
+                repository,
+                "b-between",
+                finished_at=utcnow() - timedelta(days=40),
+            )
+            service.update_settings(
+                job_log_maintenance_enabled=True,
+                job_log_archive_after_days=30,
+                job_log_retention_days=90,
+            )
+            repository.backfill_job_log_sizes(batch_size=25)
+            service.request_job_log_prune(
+                (utcnow() - timedelta(days=45)).strftime("%Y-%m-%d"), acknowledge=True
+            )
+            lane = make_maintenance(service, now_fn=lambda: utcnow(), batch_size=2)
+            # Seed enough overdue logs that two bounded batches cannot finish:
+            # the prune keeps priority across ticks.
+            for index in range(12):
+                repository.save(JobRecord(
+                    id=f"seed-{index:02d}", worker_id="worker-a", command="backup.run",
+                    status=JobStatus.SUCCEEDED, log_lines=["z" * 30],
+                    finished_at=old_cutoff + timedelta(minutes=index),
+                ))
+            with mock.patch.object(time, "sleep", lambda *_: None):
+                pending = lane.run_once()
+            self.assertIn("prune", pending)
+            self.assertEqual(pending["prune"]["state"]["status"], "pending")
+            self.assertNotIn("archived", pending["actions"])
+            self.assertNotIn("expired", pending["actions"])
+            # The job inside the archive range was not compressed by the same
+            # tick: the prune had priority for every phase.
+            self.assertFalse(getattr(repository.get(between.id), "job_log_removed", False))
+            self.assertEqual(repository._policy_metadata_for(between.id)["archived"], 0)
+
+            done = lane.run_once()
+            self.assertGreaterEqual(done["actions"]["archived"], 1)
+
+    def test_lane_prune_reaches_legacy_rows_through_bounded_backfill(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/cp.db"
+            repository = SQLiteJobRepository(database)
+            service = make_service(repository)
+            repository.save(JobRecord(
+                id="legacy-1", worker_id="worker-a", command="backup.run",
+                status=JobStatus.SUCCEEDED, log_lines=[BIG_TEXT],
+                finished_at=utcnow() - timedelta(days=60),
+            ))
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("DELETE FROM job_log_sizes")
+                connection.execute("DROP TRIGGER trg_job_log_sizes_insert")
+                connection.execute("DROP TRIGGER trg_job_log_sizes_update")
+                connection.commit()
+            finally:
+                connection.close()
+            self.assertFalse(repository.job_log_usage()["complete"])
+            service.update_settings(job_log_maintenance_enabled=True, job_log_retention_days=90)
+            service.request_job_log_prune(
+                (utcnow() - timedelta(days=45)).strftime("%Y-%m-%d"), acknowledge=True
+            )
+            lane = make_maintenance(service, now_fn=lambda: utcnow())
+            with mock.patch.object(time, "sleep", lambda *_: None):
+                first = lane.run_once()
+                if first["prune"]["state"]["status"] == "pending":
+                    lane.run_once()
+            state = repository.job_log_prune_state()
+            self.assertEqual(state["status"], "complete")
+            self.assertEqual(state["processed"], 1)
+            self.assertTrue(repository.get("legacy-1").job_log_removed)
+            self.assertTrue(repository.job_log_usage()["complete"])
+
+    def test_adversarial_id_keyset_backfill_and_finish_time_cursor_never_skip_rows(self):
+        """B1 regression: index discovery order (id keyset) must never lose
+        finish-time-older rows behind the cursor. The cursor is not read or
+        advanced until the compact backfill is complete."""
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/cp.db"
+            repository = SQLiteJobRepository(database)
+            june = datetime(2025, 6, 15, 12, 0)
+            january = datetime(2025, 1, 10, 12, 0)
+            expected_ids = set()
+            # Adversarial: id lexical order (q... first) disagrees with
+            # finish-time order (January z... rows are the oldest).
+            for index in range(1, 29):
+                repository.save(JobRecord(
+                    id=f"q{index:02d}", worker_id="worker-a", command="backup.run",
+                    status=JobStatus.SUCCEEDED, log_lines=[BIG_TEXT],
+                    finished_at=june + timedelta(minutes=index),
+                ))
+                expected_ids.add(f"q{index:02d}")
+            for index in range(1, 29):
+                repository.save(JobRecord(
+                    id=f"z{index:02d}", worker_id="worker-a", command="backup.run",
+                    status=JobStatus.SUCCEEDED, log_lines=[BIG_TEXT],
+                    finished_at=january,
+                ))
+                expected_ids.add(f"z{index:02d}")
+            # Simulate a legacy database whose compact metadata rows are
+            # rediscovered by the bounded id-keyset backfill: the q rows
+            # (later finished) surface first.
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("DELETE FROM job_log_sizes")
+                connection.execute("DROP TRIGGER trg_job_log_sizes_insert")
+                connection.execute("DROP TRIGGER trg_job_log_sizes_update")
+                connection.execute("DROP TRIGGER trg_job_log_sizes_delete")
+                connection.commit()
+            finally:
+                connection.close()
+            repository.request_job_log_prune("2025-08-01", now=datetime(2025, 11, 1, 12, 0))
+
+            # While indexing is incomplete the prune must not read or advance
+            # the cursor and must not delete anything.
+            before = stored_log_bytes(database)
+            first = repository.backfill_job_log_sizes(batch_size=28)
+            self.assertEqual(first["backfilled"], 28)  # q rows discovered first
+            self.assertFalse(repository.job_log_usage()["complete"])
+            waiting = repository.run_job_log_prune_batch(
+                batch_size=28, now=datetime(2025, 11, 1, 12, 1)
+            )
+            self.assertEqual(waiting["removed"], [])
+            self.assertTrue(waiting["wait_for_indexing"])
+            self.assertFalse(waiting["complete"])
+            self.assertTrue(waiting["active"])
+            self.assertEqual(stored_log_bytes(database), before)
+            waiting_state = repository.job_log_prune_state()
+            self.assertEqual(waiting_state["status"], "pending")
+            self.assertEqual(waiting_state["processed"], 0)
+
+            # Finish the bounded backfill, then resume the prune after a
+            # restart (fresh repository instance over the same database).
+            while not repository.backfill_job_log_sizes(batch_size=28)["complete"]:
+                pass
+            self.assertTrue(repository.job_log_usage()["complete"])
+            restarted = SQLiteJobRepository(database)
+            removed_ids = []
+            while True:
+                batch = restarted.run_job_log_prune_batch(
+                    batch_size=28, now=datetime(2025, 11, 1, 12, 2)
+                )
+                self.assertTrue(batch["active"])
+                removed_ids.extend(batch["removed"])
+                if batch["complete"]:
+                    break
+            self.assertEqual(len(removed_ids), 56)
+            self.assertEqual(set(removed_ids), expected_ids)
+            # Finish-time order after the restart: the January (z) rows first.
+            self.assertTrue(all(job_id.startswith("z") for job_id in removed_ids[:28]))
+            for job in restarted.list():
+                self.assertTrue(getattr(job, "job_log_removed", False))
+                self.assertEqual(job.log_lines, [])
+
+    def test_prune_cutoff_is_strict_before_next_midnight_across_iso_variants(self):
+        """A1: the candidate SQL and the wide-row safety check must both use
+        strict `finished_at < next UTC midnight`, for the plain stored ISO, the
+        exact-boundary form and the `+00:00` / microsecond SQLite variants."""
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/cp.db"
+            repository = SQLiteJobRepository(database)
+            for job_id, finished_sql in (
+                ("before-plain", "2026-03-03T23:59:59"),
+                ("before-tz", "2026-03-03T23:59:59+00:00"),
+                ("before-micro", "2026-03-03T23:59:59.999999"),
+                ("boundary-plain", "2026-03-04T00:00:00"),
+                ("boundary-tz", "2026-03-04T00:00:00+00:00"),
+                ("boundary-micro", "2026-03-04T00:00:00.000001"),
+            ):
+                repository.save(JobRecord(
+                    id=job_id, worker_id="worker-a", command="backup.run",
+                    status=JobStatus.SUCCEEDED, log_lines=[BIG_TEXT],
+                    finished_at=datetime(2026, 3, 4, 0, 0, 0),
+                ))
+            connection = sqlite3.connect(database)
+            try:
+                for job_id, finished_sql in (
+                    ("before-plain", "2026-03-03T23:59:59"),
+                    ("before-tz", "2026-03-03T23:59:59+00:00"),
+                    ("before-micro", "2026-03-03T23:59:59.999999"),
+                    ("boundary-plain", "2026-03-04T00:00:00"),
+                    ("boundary-tz", "2026-03-04T00:00:00+00:00"),
+                    ("boundary-micro", "2026-03-04T00:00:00.000001"),
+                ):
+                    connection.execute(
+                        "UPDATE jobs SET finished_at = ? WHERE id = ?",
+                        (finished_sql, job_id),
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            repository.backfill_job_log_sizes(batch_size=10)
+            repository.request_job_log_prune("2026-03-03", now=datetime(2026, 3, 4, 1, 0))
+            batch = repository.run_job_log_prune_batch(
+                batch_size=10, now=datetime(2026, 3, 4, 1, 1)
+            )
+            self.assertEqual(
+                set(batch["removed"]),
+                {"before-plain", "before-tz", "before-micro"},
+            )
+            self.assertEqual(batch["skipped"], [])
+            self.assertTrue(batch["complete"])
+            for job_id in ("boundary-plain", "boundary-tz", "boundary-micro"):
+                stored = repository.get(job_id)
+                self.assertEqual(stored.log_lines, [BIG_TEXT])
+                self.assertFalse(getattr(stored, "job_log_removed", False))
+                self.assertEqual(
+                    repository._policy_metadata_for(job_id)["payload_present"], 1
+                )
+
+    def test_settings_status_shows_prune_state_and_compact_indexing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/cp.db"
+            repository = SQLiteJobRepository(database)
+            service = make_service(repository)
+            self._eligible(repository, "a-old", finished_at=utcnow() - timedelta(days=60))
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute("DELETE FROM job_log_sizes")
+                connection.execute("DROP TRIGGER trg_job_log_sizes_insert")
+                connection.execute("DROP TRIGGER trg_job_log_sizes_update")
+                connection.commit()
+            finally:
+                connection.close()
+            requested = service.request_job_log_prune("2001-01-01", acknowledge=True)
+            self.assertTrue(requested["created"])
+            status = service.job_log_maintenance_status()
+            self.assertEqual(status["prune_state"]["cutoff_date"], "2001-01-01")
+            self.assertEqual(status["prune_state"]["status"], "pending")
+            # Compact indexing state is surfaced for the pending prune.
+            self.assertFalse(status["indexing"]["complete"])
+            self.assertEqual(status["indexing"]["accounted_rows"], 0)
+
+            repository.backfill_job_log_sizes(batch_size=10)
+            status = service.job_log_maintenance_status()
+            self.assertTrue(status["indexing"]["complete"])
+
+    def test_lane_first_tick_waits_for_the_normal_cadence_after_boot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLiteJobRepository(f"{directory}/cp.db")
+            service = make_service(repository)
+            executed = threading.Event()
+
+            def slow_execute(now):
+                executed.set()
+                return {"supported": True, "enabled": False, "actions": {}}
+
+            lane = job_log_maintenance.JobLogMaintenanceService(
+                service, interval_seconds=0.2, now_fn=lambda: None,
+            )
+            with mock.patch.object(lane, "_execute", side_effect=slow_execute):
+                lane.start()
+                try:
+                    self.assertFalse(executed.wait(0.05), "first tick must not run inline at boot")
+                    self.assertTrue(executed.wait(3))
+                finally:
+                    lane.stop()
+            self.assertFalse(lane._thread.is_alive())
+
+
+class IndependentLogControlsTests(unittest.TestCase):
+    """S5: automatic archival independent of the retention/quota opt-ins."""
+
+    def _make(self, directory):
+        database = f"{directory}/cp.db"
+        repository = SQLiteJobRepository(database)
+        service = make_service(repository)
+        return repository, service
+
+    def _overdue(self, repository, **kwargs):
+        return repository.save(JobRecord(
+            worker_id="worker-a", command="backup.run", status=JobStatus.SUCCEEDED,
+            log_lines=[BIG_TEXT], log_timestamps=["2024-05-05T10:00:00Z"],
+            finished_at=utcnow() - timedelta(days=200), **kwargs,
+        ))
+
+    def test_automatic_archive_runs_with_retention_and_quota_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, service = self._make(directory)
+            job = self._overdue(repository)
+            # Defaults: retention and quota are both opt-ins and stay off.
+            defaults = service.update_settings()
+            self.assertFalse(defaults.job_log_maintenance_enabled)
+            self.assertIsNone(defaults.job_log_quota_gib)
+            lane = make_maintenance(service, now_fn=lambda: utcnow())
+            with mock.patch.object(time, "sleep", lambda *_: None):
+                result = lane.run_once()
+            self.assertGreaterEqual(result["actions"]["archived"], 1)
+            self.assertEqual(repository._policy_metadata_for(job.id)["archived"], 1)
+            self.assertFalse(getattr(repository.get(job.id), "job_log_removed", False))
+            self.assertNotIn("expired", result["actions"])
+            self.assertNotIn("evicted", result["actions"])
+            self.assertFalse(result["quota_breached"])
+            self.assertTrue(any(event["kind"] == "logs_archived" for event in repository.job_log_policy_events()))
+
+    def test_quota_only_deletion_runs_when_retention_is_disabled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository, service = self._make(directory)
+            job = self._overdue(repository)
+            service.update_settings(
+                job_log_maintenance_enabled=False,
+                job_log_quota_enabled=True,
+                job_log_quota_gib=1,
+            )
+            lane = make_maintenance(service, now_fn=lambda: utcnow())
+            with mock.patch(job_log_maintenance.__name__ + ".BYTES_PER_GIB", 10):
+                with mock.patch(
+                    "src.control_plane.infrastructure.repositories.sqlite.JOB_LOG_QUOTA_GIB_TO_BYTES", 10
+                ):
+                    with mock.patch.object(time, "sleep", lambda *_: None):
+                        result = lane.run_once()
+            self.assertTrue(result["quota_breached"])
+            self.assertGreaterEqual(result["actions"]["evicted"], 1)
+            self.assertTrue(getattr(repository.get(job.id), "job_log_removed", False))
+            self.assertNotIn("expired", result["actions"])
+            self.assertTrue(any(event["kind"] == "quota_breach" for event in repository.job_log_policy_events()))
+
+    def test_effective_quota_flag_prefers_explicit_value_and_defaults_to_legacy(self):
+        self.assertFalse(effective_job_log_quota_enabled(None))
+        self.assertFalse(effective_job_log_quota_enabled(SettingsRecord()))
+        self.assertTrue(effective_job_log_quota_enabled(SettingsRecord(
+            job_log_maintenance_enabled=True, job_log_quota_gib=4,
+        )))
+        # A dormant legacy quota never activates by itself.
+        self.assertFalse(effective_job_log_quota_enabled(SettingsRecord(
+            job_log_maintenance_enabled=False, job_log_quota_gib=4,
+        )))
+        self.assertFalse(effective_job_log_quota_enabled(SettingsRecord(
+            job_log_quota_enabled=False, job_log_maintenance_enabled=True, job_log_quota_gib=4,
+        )))
+        self.assertTrue(effective_job_log_quota_enabled(SettingsRecord(
+            job_log_quota_enabled=True, job_log_maintenance_enabled=False, job_log_quota_gib=None,
+        )))
+
+    def test_transactional_recheck_uses_explicit_quota_flag_and_retention_toggle_preserves_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/cp.db"
+            repository = SQLiteJobRepository(database)
+            settings = SQLiteSettingsRepository(database)
+            service = make_service(repository, settings_repository=settings)
+            self._overdue(repository, id="q-old")
+            service.update_settings(
+                job_log_maintenance_enabled=False,
+                job_log_quota_enabled=True,
+                job_log_quota_gib=1,
+            )
+            with mock.patch(
+                "src.control_plane.infrastructure.repositories.sqlite.JOB_LOG_QUOTA_GIB_TO_BYTES", 10
+            ):
+                # The stored recheck honors the explicit flag even though the
+                # legacy maintenance opt-in is disabled.
+                result = repository.evict_job_logs_for_quota(free_to_bytes=0)
+            self.assertEqual(result["evicted"], 1)
+
+            settings = SQLiteSettingsRepository(database)
+            # Toggling retention later preserves the prior explicit quota state.
+            service.update_settings(job_log_maintenance_enabled=True)
+            self.assertTrue(settings.get().job_log_quota_enabled)
+            service.update_settings(job_log_maintenance_enabled=False)
+            self.assertTrue(settings.get().job_log_quota_enabled)
+
+    def test_presence_aware_migration_activates_only_previously_active_legacy_quota(self):
+        legacy_columns = (
+            "id TEXT PRIMARY KEY, restic_repository_base TEXT NOT NULL DEFAULT '', "
+            "restic_password_secret_id TEXT, rclone_conf_secret_id TEXT, "
+            "global_cron_expression TEXT, control_plane_public_url TEXT NOT NULL DEFAULT '', "
+            "snapshot_explorer_listing_max_output_bytes INTEGER, "
+            "job_log_maintenance_enabled INTEGER NOT NULL DEFAULT 0, "
+            "job_log_archive_after_days INTEGER NOT NULL DEFAULT 30, "
+            "job_log_retention_days INTEGER NOT NULL DEFAULT 90, "
+            "job_log_quota_gib INTEGER, updated_at TEXT NOT NULL"
+        )
+        for enabled, quota, expected_flag in ((True, 8, True), (False, 5, False), (True, None, False)):
+            with self.subTest(enabled=enabled, quota=quota):
+                with tempfile.TemporaryDirectory() as directory:
+                    database = f"{directory}/cp.db"
+                    connection = sqlite3.connect(database)
+                    try:
+                        connection.execute(f"CREATE TABLE settings ({legacy_columns})")
+                        connection.execute(
+                            "INSERT INTO settings (id, job_log_maintenance_enabled, job_log_quota_gib, updated_at) "
+                            "VALUES ('default', ?, ?, ?)",
+                            (1 if enabled else 0, quota, utcnow().isoformat()),
+                        )
+                        connection.commit()
+                    finally:
+                        connection.close()
+                    stored = SQLiteSettingsRepository(database).get()
+                    self.assertEqual(stored.job_log_quota_enabled, expected_flag)
+
+    def test_update_settings_validates_quota_enabled_and_roundtrips_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/cp.db"
+            repository = SQLiteJobRepository(database)
+            settings = SQLiteSettingsRepository(database)
+            service = make_service(repository, settings_repository=settings)
+
+            default = service.update_settings()
+            self.assertIsNone(default.job_log_quota_enabled)
+
+            enabled = service.update_settings(job_log_quota_enabled=True)
+            self.assertTrue(enabled.job_log_quota_enabled)
+            explicit = service.update_settings(job_log_quota_enabled=False)
+            self.assertFalse(explicit.job_log_quota_enabled)
+            # An omitted PATCH key never unsets the flag.
+            omitted = service.update_settings(job_log_quota_gib=SETTINGS_UNSET)
+            self.assertFalse(omitted.job_log_quota_enabled)
+
+            for invalid in ("yes", 1, 0, 1.5):
+                with self.subTest(value=invalid):
+                    with self.assertRaises(ValueError):
+                        service.update_settings(job_log_quota_enabled=invalid)
+            with self.assertRaises(ValueError):
+                service.update_settings(job_log_quota_enabled=SETTINGS_UNSET)
+
+            saved = settings.get()
+            self.assertFalse(saved.job_log_quota_enabled)
+            saved.job_log_quota_enabled = True
+            settings.save(saved)
+            self.assertTrue(SQLiteSettingsRepository(database).get().job_log_quota_enabled)
 
 
 if __name__ == "__main__":

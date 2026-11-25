@@ -43,7 +43,9 @@ from src.control_plane.application.services.scheduler_service import (
     SCHEDULER_TIMEZONE_ENV,
     SchedulerService,
 )
-from src.control_plane.domain.models import JobStatus
+from src.control_plane.application.services.job_log_maintenance import JobLogMaintenanceService
+from src.control_plane.application.services.control_plane_service import SETTINGS_UNSET
+from src.control_plane.domain.models import JobLogPruneConflict, JobStatus
 from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryDashboardReadSnapshotRepository,
     InMemoryInventoryRepository,
@@ -454,6 +456,7 @@ class ControlPlaneApplication:
     live_lane: "LiveWorkerLane | None" = None
     filesystem_size_estimates: dict | None = None
     dashboard_read_service: "DashboardReadService | None" = None
+    job_log_maintenance: "JobLogMaintenanceService | None" = None
 
 
 class ControlPlaneHTTPServer(ThreadingHTTPServer):
@@ -558,6 +561,11 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
         server = getattr(self, "server", None)
         application = getattr(server, "application", None)
         return getattr(application, "scheduler", None)
+
+    def _job_log_maintenance_lane(self):
+        server = getattr(self, "server", None)
+        application = getattr(server, "application", None)
+        return getattr(application, "job_log_maintenance", None)
 
     def _target_jsonable(self, target):
         return build_target_view(target, self._control_plane_service(), self._scheduler())
@@ -761,6 +769,16 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                 except ValueError:
                     return self._write_json(404, {"error": "job not found"}, head_only=head_only)
                 return self._write_json(200, result, head_only=head_only)
+            if path == "/api/v1/admin/jobs/logs/prune":
+                # T3 S4: bounded persisted prune state (no historical counts,
+                # no synchronous scan) for the Global Settings date picker.
+                if not self._require_auth(ROLE_ADMIN, head_only=head_only, api_mode=True):
+                    return
+                return self._write_json(
+                    200,
+                    {"state": self._control_plane_service().job_log_prune_state()},
+                    head_only=head_only,
+                )
             if path == "/api/v1/workers":
                 if not self._require_auth(ROLE_VIEWER, head_only=head_only, api_mode=True):
                     return
@@ -883,10 +901,15 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
             if path == "/api/v1/settings":
                 if not self._require_auth(ROLE_ADMIN, head_only=head_only, api_mode=True):
                     return
-                settings = self._control_plane_service().get_settings()
+                svc = self._control_plane_service()
+                settings = svc.get_settings()
                 payload = _to_jsonable(settings or {})
                 scheduler = self._scheduler()
                 payload["scheduler_timezone"] = scheduler.timezone_name if scheduler else DEFAULT_SCHEDULER_TIMEZONE
+                # T2 S3 alert surface: measured usage, recent quota
+                # breach/eviction events and lane metrics (no secrets, no log text).
+                maintenance = self._job_log_maintenance_lane()
+                payload["job_log_maintenance"] = svc.job_log_maintenance_status(maintenance=maintenance)
                 return self._write_json(200, payload, head_only=head_only)
             if path == "/api/v1/settings/rclone-remote":
                 if not self._require_auth(ROLE_ADMIN, head_only=head_only, api_mode=True):
@@ -1131,6 +1154,30 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                             parts[4], body["target_id"], body["confirmation"]
                         ),
                     )
+            # T3 S4: confirmed admin cutoff prune for stored job log bodies.
+            # Strictly validated, explicitly acknowledged, idempotent for the
+            # same cutoff, conflicting pending prune answered with 409. The
+            # request itself deletes nothing; the resumable bounded task
+            # advances via the maintenance lane in later batches.
+            if path == "/api/v1/admin/jobs/logs/prune":
+                if not self._require_auth(ROLE_ADMIN, api_mode=True):
+                    return
+                if not isinstance(body, dict) or set(body) != {"cutoff_date", "acknowledged"}:
+                    raise ValueError("cutoff_date and acknowledged are required")
+                if body.get("acknowledged") is not True:
+                    raise ValueError(
+                        "Pruning stored job logs is irreversible: "
+                        "the request requires acknowledged=true"
+                    )
+                service = self._control_plane_service()
+                try:
+                    result = service.request_job_log_prune(body.get("cutoff_date"), acknowledge=True)
+                except JobLogPruneConflict as exc:
+                    return self._write_json(
+                        409,
+                        {"error": str(exc), "state": service.job_log_prune_state()},
+                    )
+                return self._write_json(202 if result.get("created") else 200, result)
 
             if path == "/api/v1/filesystem-size-estimates":
                 if not self._require_auth(ROLE_ADMIN, api_mode=True):
@@ -1678,6 +1725,15 @@ class ControlPlaneRequestHandler(BaseHTTPRequestHandler):
                     control_plane_public_url=body.get("control_plane_public_url"),
                     snapshot_explorer_listing_max_output_bytes=body.get(
                         "snapshot_explorer_listing_max_output_bytes"
+                    ),
+                    job_log_maintenance_enabled=body.get("job_log_maintenance_enabled"),
+                    job_log_archive_after_days=body.get("job_log_archive_after_days"),
+                    job_log_retention_days=body.get("job_log_retention_days"),
+                    job_log_quota_enabled=body.get("job_log_quota_enabled"),
+                    # An omitted PATCH key keeps the stored quota; an explicit
+                    # JSON null disables the job-log quota.
+                    job_log_quota_gib=(
+                        body["job_log_quota_gib"] if "job_log_quota_gib" in body else SETTINGS_UNSET
                     ),
                 )
                 return self._write_json(200, _to_jsonable(settings))
@@ -2347,6 +2403,7 @@ def build_application() -> ControlPlaneApplication:
         )
         read_model_interval = 5.0
     dashboard_read_service = _build_dashboard_read_service(control_plane_service, scheduler, read_model_interval)
+    job_log_maintenance = JobLogMaintenanceService(control_plane_service)
     app = ControlPlaneApplication(
         auth_service=AuthService.from_runtime(),
         control_plane_service=control_plane_service,
@@ -2355,6 +2412,7 @@ def build_application() -> ControlPlaneApplication:
         live_file_service=LiveFileService(),
         live_lane=LiveWorkerLane(),
         dashboard_read_service=dashboard_read_service,
+        job_log_maintenance=job_log_maintenance,
     )
     return app
 
@@ -2369,11 +2427,15 @@ def run_control_plane(
 
     The dashboard read-model lane starts (hydrated snapshots already loaded)
     together with an asynchronous first refresh of the targets key and the
-    default stats offset, before serving; the finally block stops the lane and
-    the backup scheduler without changing any cron evaluation semantics.
+    default stats offset, before serving; the finally block stops the lane,
+    the job-log maintenance lane and the backup scheduler without changing
+    any cron evaluation semantics. The job-log lane stays idle until job-log
+    maintenance is enabled in Global Settings.
     """
     if application.scheduler is not None:
         application.scheduler.start()
+    if application.job_log_maintenance is not None:
+        application.job_log_maintenance.start()
     if application.tls_manager is not None:
         server = ControlPlaneHTTPSServer(
             (host, port),
@@ -2398,6 +2460,8 @@ def run_control_plane(
     finally:
         if read_service is not None:
             read_service.stop()
+        if application.job_log_maintenance is not None:
+            application.job_log_maintenance.stop()
         if application.scheduler is not None:
             application.scheduler.stop()
         server.server_close()

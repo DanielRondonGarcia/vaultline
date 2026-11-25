@@ -4,6 +4,26 @@ from typing import Any, ClassVar, Dict, List, Optional
 from uuid import uuid4
 
 
+def effective_job_log_quota_enabled(settings: Optional["SettingsRecord"]) -> bool:
+    """T3 S5: whether the job-log quota may enforce deletions.
+
+    An explicit stored flag always wins; the legacy default applies only while
+    the flag has never been stored: `maintenance_enabled AND quota configured`.
+    A dormant legacy value (maintenance disabled) therefore never activates
+    silently, and toggling retention later cannot change the effective quota
+    state once the flag is explicit.
+    """
+    if settings is None:
+        return False
+    flag = getattr(settings, "job_log_quota_enabled", None)
+    if flag is None:
+        return bool(
+            getattr(settings, "job_log_maintenance_enabled", False)
+            and getattr(settings, "job_log_quota_gib", None) is not None
+        )
+    return bool(flag)
+
+
 def utcnow() -> datetime:
     return datetime.utcnow()
 
@@ -34,6 +54,10 @@ class WorkerStatus:
     ONLINE = "online"
     OFFLINE = "offline"
     DISABLED = "disabled"
+
+
+class JobLogPruneConflict(ValueError):
+    """A conflicting job-log prune is already pending (T3 S4 HTTP contract)."""
 
 
 class JobStatus:
@@ -218,6 +242,10 @@ class JobRecord:
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     updated_at: datetime = field(default_factory=utcnow)
+    # T2 S2: set by the SQLite log-retention policy when it removes a job's
+    # stored log payload. It distinguishes "policy removed the log" from a
+    # job that legitimately never had logs; the raw write paths reset it.
+    job_log_removed: bool = False
 
 
 @dataclass
@@ -245,12 +273,34 @@ class SettingsRecord:
     DEFAULT_SNAPSHOT_EXPLORER_LISTING_MAX_OUTPUT_BYTES: ClassVar[int] = 4 * 1024 * 1024
     MIN_SNAPSHOT_EXPLORER_LISTING_MAX_OUTPUT_BYTES: ClassVar[int] = 1 * 1024 * 1024
     MAX_SNAPSHOT_EXPLORER_LISTING_MAX_OUTPUT_BYTES: ClassVar[int] = 16 * 1024 * 1024
+    # T2 S1-S3 job log lifecycle defaults: maintenance is an explicit opt-in
+    # (disabled by default; automated deletion of retained logs); when it is
+    # enabled without explicit day values these defaults apply.
+    DEFAULT_JOB_LOG_ARCHIVE_AFTER_DAYS: ClassVar[int] = 30
+    DEFAULT_JOB_LOG_RETENTION_DAYS: ClassVar[int] = 90
+    MIN_JOB_LOG_MAINTENANCE_DAYS: ClassVar[int] = 1
+    MAX_JOB_LOG_MAINTENANCE_DAYS: ClassVar[int] = 3650
+    MIN_JOB_LOG_QUOTA_GIB: ClassVar[int] = 1
+    MAX_JOB_LOG_QUOTA_GIB: ClassVar[int] = 1024
     restic_repository_base: str = ""
     restic_password_secret_id: Optional[str] = None
     rclone_conf_secret_id: Optional[str] = None
     global_cron_expression: Optional[str] = None
     control_plane_public_url: str = ""
     snapshot_explorer_listing_max_output_bytes: int = DEFAULT_SNAPSHOT_EXPLORER_LISTING_MAX_OUTPUT_BYTES
+    job_log_maintenance_enabled: bool = False
+    job_log_archive_after_days: int = DEFAULT_JOB_LOG_ARCHIVE_AFTER_DAYS
+    job_log_retention_days: int = DEFAULT_JOB_LOG_RETENTION_DAYS
+    # Nullable byte limit exposed as whole gibibytes in the Global Settings
+    # UI; it applies to the logical job-log payload total, never the whole
+    # SQLite database file.
+    job_log_quota_gib: Optional[int] = None
+    # T3 S5: explicit quota activation, independent of the retention opt-in.
+    # None keeps the effective legacy default (`legacy_maintenance_enabled AND
+    # quota configured`), so dormant previously stored values never start
+    # deleting silently after an upgrade; presence-aware migration in the
+    # SQLite settings repository materializes the previously effective combo.
+    job_log_quota_enabled: Optional[bool] = None
     id: str = "default"
     updated_at: datetime = field(default_factory=utcnow)
 

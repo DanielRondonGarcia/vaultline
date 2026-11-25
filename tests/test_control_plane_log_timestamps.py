@@ -1,11 +1,15 @@
 import sqlite3
 import tempfile
 import unittest
+from datetime import timedelta
+from unittest import mock
+
+import brotli
 from cryptography.fernet import Fernet
 
 from src.control_plane.application.services.control_plane_service import ControlPlaneService
 from src.control_plane.application.services.job_event_broker import JobEventBroker
-from src.control_plane.domain.models import JobStatus, WorkerRecord, utcnow
+from src.control_plane.domain.models import JobRecord, JobStatus, WorkerRecord, utcnow
 from src.control_plane.infrastructure.repositories.in_memory import (
     InMemoryInventoryRepository,
     InMemoryJobRepository,
@@ -46,6 +50,152 @@ class ControlPlaneLogTimestampTests(unittest.TestCase):
             settings_repository=InMemorySettingsRepository(),
             job_event_broker=broker,
         )
+
+    def test_archived_job_logs_keep_the_public_view_and_reject_ineligible_jobs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/control-plane.db"
+            repository = SQLiteJobRepository(database)
+            service = self.make_service(repository)
+            now = utcnow()
+            cutoff = now - timedelta(days=30)
+            line = "Backup progress: copied café.txt to disk. " * 100
+            job = JobRecord(
+                worker_id="worker-a", command="backup.run", status=JobStatus.SUCCEEDED,
+                log_lines=[line], log_timestamps=[SOURCE_TIME],
+                finished_at=cutoff, result_summary={"status_code": 0},
+            )
+            repository.save(job)
+            before = service.get_job_view(job.id)
+            self.assertEqual(before["log_lines"], [line])
+            self.assertEqual(before["log_timestamps"], [SOURCE_TIME])
+
+            self.assertGreater(repository.archive_job_log(job.id, cutoff), 0)
+            self.assertEqual(repository.archive_job_log(job.id, cutoff), 0)
+            reopened = self.make_service(SQLiteJobRepository(database))
+            self.assertEqual(reopened.get_job_view(job.id), before)
+
+            for status, finished_at, summary in (
+                (JobStatus.SUCCEEDED, now, None),
+                (JobStatus.IN_PROGRESS, cutoff, None),
+                (JobStatus.FAILED, cutoff, {"diagnostic_code": "worker_lease_expired"}),
+            ):
+                with self.subTest(status=status):
+                    untouched = repository.save(JobRecord(
+                        worker_id="worker-a", command="backup.run", status=status,
+                        log_lines=[line], finished_at=finished_at, result_summary=summary,
+                    ))
+                    self.assertEqual(repository.archive_job_log(untouched.id, cutoff), 0)
+                    self.assertEqual(repository.get(untouched.id), untouched)
+
+    def test_archived_log_timestamps_stay_aligned_for_partial_and_all_null_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/control-plane.db"
+            repository = SQLiteJobRepository(database)
+            service = self.make_service(repository)
+            cutoff = utcnow() - timedelta(days=1)
+            mixed_lines = ["Backup progress: copied text. " * 40, "long line without source time " * 40]
+            mixed = repository.save(JobRecord(
+                worker_id="worker-a", command="backup.run", status=JobStatus.SUCCEEDED,
+                log_lines=mixed_lines, log_timestamps=[SOURCE_TIME, None],
+                finished_at=cutoff, result_summary={"status_code": 0},
+            ))
+            all_none = repository.save(JobRecord(
+                worker_id="worker-a", command="backup.run", status=JobStatus.CANCELED,
+                log_lines=["plain line " * 40], log_timestamps=[None],
+                finished_at=cutoff, result_summary={"status_code": 1},
+            ))
+            mixed_before = service.get_job_view(mixed.id)
+            none_before = service.get_job_view(all_none.id)
+
+            self.assertGreater(repository.archive_job_log(mixed.id, cutoff), 0)
+            self.assertGreater(repository.archive_job_log(all_none.id, cutoff), 0)
+
+            reopened = self.make_service(SQLiteJobRepository(database))
+            self.assertEqual(reopened.get_job_view(mixed.id), mixed_before)
+            self.assertEqual(reopened.get_job_view(mixed.id)["log_timestamps"], [SOURCE_TIME, None])
+            self.assertEqual(reopened.get_job_view(all_none.id), none_before)
+            self.assertNotIn("log_timestamps", reopened.get_job_view(all_none.id))
+            self.assertIsNone(repository.get(all_none.id).log_timestamps)
+            # Bulk reads decode the archive transparently, contract unchanged.
+            self.assertEqual(
+                {job.id: job.log_lines for job in repository.list()},
+                {mixed.id: mixed_lines, all_none.id: ["plain line " * 40]},
+            )
+
+    def test_archive_job_log_treats_legacy_cancelled_as_archivable_but_not_unconfirmed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/control-plane.db"
+            repository = SQLiteJobRepository(database)
+            service = self.make_service(repository)
+            cutoff = utcnow() - timedelta(days=1)
+            legacy = repository.save(JobRecord(
+                worker_id="worker-a", command="backup.run", status=JobStatus.CANCELED,
+                log_lines=["legacy line " * 40], finished_at=cutoff, result_summary={"status_code": 1},
+            ))
+            unconfirmed = repository.save(JobRecord(
+                worker_id="worker-a", command="backup.run", status=JobStatus.UNCONFIRMED,
+                log_lines=["legacy line " * 40], finished_at=cutoff, result_summary={"status_code": 1},
+            ))
+            connection = sqlite3.connect(database)
+            try:
+                connection.execute(
+                    "UPDATE jobs SET status = 'cancelled', updated_at = ? WHERE id = ?",
+                    (utcnow().isoformat(), legacy.id),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertGreater(repository.archive_job_log(legacy.id, cutoff), 0)
+            self.assertEqual(repository.archive_job_log(unconfirmed.id, cutoff), 0)
+
+            reopened = self.make_service(SQLiteJobRepository(database))
+            self.assertEqual(reopened.get_job_view(legacy.id)["log_lines"], ["legacy line " * 40])
+            self.assertEqual(reopened.get_job_view(unconfirmed.id)["log_lines"], ["legacy line " * 40])
+            reopened_repository = SQLiteJobRepository(database)
+            self.assertEqual(reopened_repository.get(legacy.id).status, JobStatus.CANCELED)
+            self.assertEqual(reopened_repository.get(unconfirmed.id).status, JobStatus.UNCONFIRMED)
+
+    def test_archived_log_compression_cannot_drop_a_newer_write_that_lands_during_compression(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = f"{directory}/control-plane.db"
+            repository = SQLiteJobRepository(database)
+            service = self.make_service(repository)
+            cutoff = utcnow() - timedelta(days=1)
+            job = repository.save(JobRecord(
+                worker_id="worker-a", command="backup.run", status=JobStatus.SUCCEEDED,
+                log_lines=["old log line " * 40], finished_at=cutoff, result_summary={"status_code": 0},
+            ))
+            newer_lines = ["newer log line " * 40]
+            newer_job = JobRecord(
+                id=job.id, worker_id="worker-a", command="backup.run",
+                status=JobStatus.SUCCEEDED, log_lines=newer_lines,
+                finished_at=cutoff, result_summary={"status_code": 0},
+            )
+            original_compress = brotli.compress
+
+            def compress_with_landed_write(data, **kwargs):
+                # A competing writer lands between the lock-free snapshot read
+                # and the compare-and-swap; the archive must reject it whole.
+                repository.save(newer_job)
+                return original_compress(data, **kwargs)
+
+            with mock.patch.object(brotli, "compress", side_effect=compress_with_landed_write):
+                self.assertEqual(repository.archive_job_log(job.id, cutoff), 0)
+            self.assertEqual(repository.get(job.id).log_lines, newer_lines)
+            connection = sqlite3.connect(database)
+            try:
+                stored = connection.execute(
+                    "SELECT log_lines_json, job_log_brotli FROM jobs WHERE id = ?", (job.id,)
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertNotEqual(stored[0], "[]")
+            self.assertIsNone(stored[1])
+
+            self.assertGreater(repository.archive_job_log(job.id, cutoff), 0)
+            reopened = self.make_service(SQLiteJobRepository(database))
+            self.assertEqual(reopened.get_job_view(job.id)["log_lines"], newer_lines)
 
     def test_progress_and_terminal_timestamps_persist_and_reach_public_events(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -290,6 +440,12 @@ class ControlPlaneLogTimestampTests(unittest.TestCase):
             try:
                 columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
                 if "log_timestamps_json" in columns:
+                    # The T2 log-size triggers reference the column, so the
+                    # simulated legacy downgrade removes them first; opening
+                    # the repository again recreates them against the
+                    # migrated schema.
+                    connection.execute("DROP TRIGGER IF EXISTS trg_job_log_sizes_update")
+                    connection.execute("DROP TRIGGER IF EXISTS trg_job_log_sizes_insert")
                     connection.execute("ALTER TABLE jobs DROP COLUMN log_timestamps_json")
                 connection.commit()
             finally:
@@ -308,6 +464,44 @@ class ControlPlaneLogTimestampTests(unittest.TestCase):
             self.assertIsNone(job.log_timestamps)
             self.assertEqual(migrated.get_schema_version(), 1)
             self.assertEqual(migrated.get("legacy-job").log_lines, ["old line"])
+
+    def test_removed_marker_roundtrips_through_save_and_get(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database_path = f"{directory}/control-plane.db"
+            repository = SQLiteJobRepository(database_path)
+            job = repository.save(JobRecord(
+                worker_id="worker-a", command="backup.run", id="removed-job",
+                status=JobStatus.SUCCEEDED, log_lines=["old line"],
+                finished_at=utcnow() - timedelta(days=120),
+            ))
+            self.assertFalse(job.job_log_removed)
+            connection = sqlite3.connect(database_path)
+            try:
+                connection.execute(
+                    "UPDATE jobs SET log_lines_json = '[]', log_timestamps_json = NULL, "
+                    "job_log_brotli = NULL, job_log_removed = 1 WHERE id = ?",
+                    ("removed-job",),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            removed = repository.get("removed-job")
+            self.assertTrue(removed.job_log_removed)
+            self.assertEqual(removed.log_lines, [])
+            # The full-record replace path persists the observed marker value.
+            removed.updated_at = utcnow()
+            repository.save(removed)
+            self.assertTrue(repository.get("removed-job").job_log_removed)
+            self.assertEqual(memory_job_marker(), False)
+
+
+def memory_job_marker():
+    """In-memory records carry the same marker field with a False default."""
+    from src.control_plane.infrastructure.repositories.in_memory import InMemoryJobRepository
+
+    in_memory = InMemoryJobRepository()
+    job = in_memory.save(JobRecord(worker_id="worker-a", command="backup.run"))
+    return job.job_log_removed
 
 
 if __name__ == "__main__":

@@ -85,7 +85,8 @@ backups en una hora distinta de la configurada.
 ## Mantenimiento de logs de jobs (opcional)
 
 El mantenimiento de logs esta **desactivado por defecto**; se activa en la UI
-(Settings → Control Plane → "Mantenimiento de logs de jobs"). Al activarlo:
+(Settings → Cuota → Compresión y retención). La compresión funciona siempre;
+la retención y la cuota tienen controles independientes.
 
 1. **Haz un backup de `control_plane.db` antes de activarlo.** La politica
    elimina definitivamente los payloads de logs (el borrado es irreversible);
@@ -127,8 +128,10 @@ El mantenimiento de logs esta **desactivado por defecto**; se activa en la UI
    el opt-in explicito de borrado y la cuota tiene su propio interruptor de
    activacion; una cuota antigua dormida no comienza a eliminar sola tras la
    actualizacion.
-7. **Prune manual por fecha (irreversible):** desde la misma tarjeta UI, un
-   admin elige una fecha pasada (UTC) y confirma; la peticion aceptada guarda
+7. **Limpieza histórica (irreversible):** en **Settings → Cuota**, elige la
+   fecha de corte (UTC), pulsa **Revisar limpieza** y confirma con **Eliminar
+   logs**. La tarjeta actualiza el avance cada 30 segundos mientras está
+   visible y hay una limpieza pendiente. La petición aceptada guarda
    un estado acotado y persistente (corte, cursor ordenado, progreso) que
    continua por lotes automaticamente, incluso tras reiniciar el proceso, y
    tiene prioridad sobre el archivo, la retencion y la cuota mientras este

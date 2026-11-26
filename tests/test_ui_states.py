@@ -156,97 +156,164 @@ class SnapshotExplorerUiStateTests(unittest.TestCase):
             'state.settings.job_log_maintenance?.prune_state ?? null',
             'function jobLogPruneState()',
             "irreversible",
-            "finalizados el dia seleccionado o antes",
+            "finalizados hasta el",
             "El corte no puede ser una fecha futura",
-            "esperando la indexacion compacta",
+            "Preparando el historial",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, self.source)
 
-    def test_prune_status_and_confirmation_derive_from_nested_state_after_refresh(self):
-        """A2: actual JS harness — status reads the nested prune state only,
-        POST unifies the nested update keys and the payload is shaped from the
-        actual state after refresh."""
-        helpers = re.search(
-            r"    function jobLogPruneState\(\) \{.*?\n    \}\n\n    function renderJobLogPruneStatus\(\) \{.*?\n    \}\n\n    async function confirmJobLogPrune\(btn\) \{.*?\n    \}",
-            self.source,
-            re.S,
-        )
-        self.assertIsNotNone(helpers)
+    def test_prune_confirmation_requires_explicit_click_and_keeps_accepted_status(self):
+        start = self.source.index("    function jobLogPruneState()")
+        end = self.source.index("    function renderNotificationChannelManager()", start)
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
-        script = helpers.group(0) + r'''
-const state = { settings: { job_log_maintenance: {
-  usage: { complete: true, accounted_rows: 12 },
-  prune_state: { status: "pending", cutoff_date: "2001-01-01", processed: 8 },
-} } };
-const escapeHtml = (value) => String(value);
-const statusEl = { innerHTML: "", textContent: "" };
-const confirmBtn = { dataset: { pruneArmed: "false" }, disabled: false };
-const input = { value: "2001-01-01" };
-const document = {
-  getElementById: (id) => (id === "jobLogPruneStatus" ? statusEl : (id === "settingsJobLogPruneDate" ? input : null)),
-  querySelector: (selector) => (selector === "[data-job-log-prune-confirm]" ? confirmBtn : null),
+        script = self.source[start:end] + r'''
+const assert = require("node:assert/strict");
+const state = { settings: { job_log_maintenance: {} } };
+const nodes = {
+  settingsJobLogPruneDate: { value: "2001-01-01" },
+  jobLogPruneStatus: { focus() {} }, jobLogPruneCutoff: {}, jobLogPruneError: {},
+  jobLogPruneAccept: { disabled: false }, jobLogPruneCancel: { disabled: false },
+  jobLogPruneDialog: {
+    open: false, dataset: {},
+    showModal() { this.open = true; }, close() { this.open = false; },
+  },
 };
-let posted = null;
+const trigger = {};
+const document = { getElementById: (id) => nodes[id], querySelector: () => trigger };
+const posts = [];
+let fail = true;
 const apiPost = async (path, body) => {
-  posted = { path, body };
-  return { status: "complete", cutoff_date: "2001-01-01", processed: 12 };
+  posts.push({path, body});
+  if (fail) throw new Error("Network unavailable");
+  return { status: "pending", cutoff_date: "2001-01-01", processed: 0 };
 };
-const withBtnLoading = (btn, asyncFn, label) => asyncFn();
-const showFeedback = () => {};
+(async () => {
+  const dialog = nodes.jobLogPruneDialog;
+  const input = nodes.settingsJobLogPruneDate;
+  openJobLogPruneDialog();
+  assert.equal(dialog.open, true);
+  assert.match(nodes.jobLogPruneCutoff.textContent, /2001-01-01/);
+  assert.equal(posts.length, 0);
+  dialog.close(); // Cancel / Escape does not submit.
+  await confirmJobLogPrune();
+  assert.equal(posts.length, 0);
+  openJobLogPruneDialog();
+  input.value = "2001-02-01"; // Send the cutoff displayed in the dialog.
+  await confirmJobLogPrune();
+  assert.equal(dialog.open, true);
+  assert.match(nodes.jobLogPruneError.textContent, /Network unavailable/);
+  fail = false;
+  await confirmJobLogPrune();
+  assert.equal(dialog.open, false);
+  assert.deepEqual(posts[1], {path: "/api/v1/admin/jobs/logs/prune", body: {
+    cutoff_date: "2001-01-01", acknowledged: true,
+  }});
+  assert.equal(state.settings.job_log_maintenance.prune_state.status, "pending");
+  assert.equal(trigger.disabled, true);
+  assert.match(nodes.jobLogPruneStatus.textContent, /2001-01-01/);
+  openJobLogPruneDialog();
+  assert.equal(dialog.open, false);
+  state.settings.job_log_maintenance = {};
+  renderJobLogPruneStatus();
+  assert.equal(trigger.disabled, false);
+  input.value = "9999-01-01";
+  openJobLogPruneDialog();
+  assert.equal(dialog.open, false);
+  assert.match(nodes.jobLogPruneStatus.textContent, /futura/);
+  assert.equal(posts.length, 2);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
+'''
+        result = subprocess.run(["node", "--eval", script], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_prune_progress_refreshes_without_replacing_settings(self):
+        start = self.source.index("    function jobLogPruneState()")
+        end = self.source.index("    function openJobLogPruneDialog()", start)
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        script = self.source[start:end] + r'''
+const assert = require("node:assert/strict");
+const state = { settings: { keep: "original", job_log_maintenance: {
+  usage: { complete: false, accounted_rows: 331 },
+  prune_state: { status: "pending", cutoff_date: "2026-11-25", processed: 0 },
+} } };
+const status = {}, trigger = {};
+const steps = Array.from({length: 3}, () => ({
+  dataset: {}, attrs: {},
+  setAttribute(key, value) { this.attrs[key] = value; },
+  removeAttribute(key) { delete this.attrs[key]; },
+}));
+const diagram = { hidden: true, querySelectorAll: () => steps };
+const panel = { isConnected: true, hidden: false };
+const document = {
+  getElementById: (id) => ({ jobLogPruneStatus: status, jobLogPruneTimeline: diagram })[id],
+  querySelector: () => trigger,
+};
+const timers = [];
+const setTimeout = (fn, ms) => { assert.equal(ms, 30000); timers.push(fn); };
+const calls = [];
+let fail = true;
+const apiGet = async (path, options) => {
+  calls.push({ path, options });
+  if (fail) throw new Error("offline");
+  return { keep: "must not replace settings", job_log_maintenance: {
+    usage: { complete: true },
+    prune_state: { status: "complete", cutoff_date: "2026-11-25", processed: 25, bytes_freed: 1024 },
+  } };
+};
 (async () => {
   renderJobLogPruneStatus();
-  const pending = { disabled: confirmBtn.disabled, html: statusEl.innerHTML };
-  await confirmJobLogPrune(confirmBtn);
-  const armed = { armed: confirmBtn.dataset.pruneArmed, noPost: posted === null, text: statusEl.innerHTML };
-  await confirmJobLogPrune(confirmBtn);
-  const confirmed = { posted, nestedPruneState: state.settings.job_log_maintenance.prune_state,
-                      reRender: { disabled: confirmBtn.disabled, html: statusEl.innerHTML } };
-  input.value = "9999-01-01";
-  confirmBtn.dataset.pruneArmed = "false";
-  posted = null;
-  await confirmJobLogPrune(confirmBtn);
-  const futureCheck = { noPost: posted === null, text: statusEl.textContent };
-  input.value = "2001-01-01";
-  // After a refresh the actual payload replaces the derived state.
-  state.settings.job_log_maintenance = {};
-  confirmBtn.disabled = true;
-  statusEl.innerHTML = "";
+  assert.match(status.textContent, /331 registros/);
+  assert.equal(diagram.hidden, false);
+  assert.deepEqual(steps.map(step => step.dataset.state), ["current", "upcoming", "upcoming"]);
+  assert.equal(steps[0].attrs["aria-current"], "step");
+  state.settings.job_log_maintenance.usage.complete = true;
   renderJobLogPruneStatus();
-  const emptyState = { disabled: confirmBtn.disabled, html: statusEl.innerHTML };
-  process.stdout.write(JSON.stringify({ pending, armed, confirmed, futureCheck, emptyState }));
-})().catch((error) => { process.stderr.write(String(error)); process.exit(1); });
+  assert.deepEqual(steps.map(step => step.dataset.state), ["done", "current", "upcoming"]);
+  assert.equal(steps[0].attrs["aria-current"], undefined);
+  state.settings.job_log_maintenance.usage.complete = false;
+  watchJobLogPruneProgress(panel);
+  panel.hidden = true;
+  await timers.shift()();
+  assert.equal(calls.length, 0);
+  panel.hidden = false;
+  await timers.shift()();
+  assert.match(status.textContent, /331 registros/);
+  assert.match(status.textContent, /No se pudo actualizar/);
+  fail = false;
+  await timers.shift()();
+  assert.deepEqual(calls[1], {path: "/api/v1/settings", options: {cache: "no-store"}});
+  assert.equal(state.settings.keep, "original");
+  assert.match(status.textContent, /completada/);
+  assert.match(status.textContent, /25 logs procesados/);
+  assert.deepEqual(steps.map(step => step.dataset.state), ["done", "done", "done"]);
+  assert.equal(steps.some(step => step.attrs["aria-current"]), false);
+  assert.equal(trigger.disabled, false);
+  panel.isConnected = false;
+  await timers.shift()();
+  assert.equal(timers.length, 0);
+  assert.equal(calls.length, 2);
+})().catch((error) => { console.error(error); process.exitCode = 1; });
 '''
-        result = subprocess.run(
-            ["node", "--input-type=commonjs", "--eval", script],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        result = subprocess.run(["node", "--eval", script], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        output = json.loads(result.stdout)
-        self.assertTrue(output["pending"]["disabled"])
-        self.assertIn("2001-01-01", output["pending"]["html"])
-        self.assertIn("8", output["pending"]["html"])
-        self.assertEqual(output["armed"]["armed"], "true")
-        self.assertTrue(output["armed"]["noPost"])
-        self.assertIn("2001-01-01", output["armed"]["text"])
-        self.assertEqual(
-            output["confirmed"]["posted"],
-            {"path": "/api/v1/admin/jobs/logs/prune",
-             "body": {"cutoff_date": "2001-01-01", "acknowledged": True}},
-        )
-        self.assertEqual(
-            output["confirmed"]["nestedPruneState"],
-            {"status": "complete", "cutoff_date": "2001-01-01", "processed": 12},
-        )
-        self.assertFalse(output["confirmed"]["reRender"]["disabled"])
-        self.assertIn("completado", output["confirmed"]["reRender"]["html"])
-        self.assertTrue(output["futureCheck"]["noPost"])
-        self.assertIn("futura", output["futureCheck"]["text"])
-        self.assertFalse(output["emptyState"]["disabled"])
-        self.assertIn("Sin prune", output["emptyState"]["html"])
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_job_log_settings_use_a_separate_quota_tab(self):
+        panel = self.source.split('id="settingsPanelQuota"', 1)[1].split("</section>", 1)[0]
+        self.assertIn('data-settings-panel="quota"', panel)
+        self.assertIn('id="settingsJobLogMaintenanceQuotaGiB"', panel)
+        self.assertIn('id="settingsJobLogPruneDate"', panel)
+        self.assertIn('<ol id="jobLogPruneTimeline"', panel)
+        self.assertIn('id="settingsTabQuota"', self.source)
+        self.assertIn('<dialog id="jobLogPruneDialog"', self.source)
+        self.assertIn("Eliminar logs", self.source)
+        self.assertNotIn("pruneArmed", self.source)
 
     def test_job_log_view_distinguishes_removed_by_policy_from_empty(self):
         target_renderer = re.search(

@@ -682,6 +682,17 @@ details.form-section[open] > .form-body { border-top: 1px solid var(--border); p
 .settings-card-header { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 4px; }
 .settings-card-header h3 { margin: 0; font-size: 15px; font-weight: 700; }
 .settings-card-sub { font-size: 12px; color: var(--muted-foreground); margin-top: 2px; }
+.job-log-progress { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.job-log-timeline:not([hidden]) { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.job-log-timeline { list-style: none; margin: 0 0 12px; padding: 0; }
+.job-log-timeline li { position: relative; display: grid; justify-items: center; align-content: start; gap: 5px; padding-inline: 3px; text-align: center; color: var(--muted-foreground); font-size: 12px; overflow-wrap: anywhere; }
+.job-log-timeline li:not(:last-child)::after { content: ""; position: absolute; height: 1px; background: var(--border); top: 13px; left: calc(50% + 17px); width: calc(100% - 34px); }
+.job-log-step-number { display: grid; place-items: center; width: 27px; height: 27px; border-radius: 50%; border: 1px solid var(--border); line-height: 1; }
+.job-log-timeline li[data-state="current"] { color: var(--foreground); font-weight: 700; }
+.job-log-timeline li[data-state="current"] .job-log-step-number { border-color: var(--foreground); outline: 1px solid var(--foreground); outline-offset: 2px; }
+.job-log-timeline li[data-state="done"] .job-log-step-number { color: var(--success); border-color: var(--success); font-size: 0; }
+.job-log-timeline li[data-state="done"] .job-log-step-number::after { content: "✓"; font-size: 14px; }
+.job-log-timeline li[data-state="done"]::after { background: var(--success); }
 .header-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; flex-shrink: 0; flex-wrap: wrap; }
 .settings-icon { font-size: 22px; line-height: 1; flex-shrink: 0; width: 40px; height: 40px; display: flex; align-items: center; justify-content: center; border-radius: 10px; background: var(--accent); }
 .settings-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 16px; margin-top: 8px; padding-top: 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }

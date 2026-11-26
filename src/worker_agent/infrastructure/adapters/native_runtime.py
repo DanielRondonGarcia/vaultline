@@ -29,6 +29,13 @@ from src.restic_executable import (
     restic_subprocess_environment,
 )
 from src.rclone_executable import resolve_rclone_executable
+from src.native_file_filter import (
+    NATIVE_FILE_FILTER_COMMAND_MARKER,
+    NATIVE_FILE_FILTER_TAG_ENV,
+    NATIVE_FILE_REGEX_ENV,
+    filter_scope_tag,
+    scoped_forget_argv,
+)
 
 MAX_RESOLVED_FILES = 32
 MAX_RESOLVED_FILE_BYTES = 1024 * 1024
@@ -259,9 +266,54 @@ class NativeRuntimeAdapter(RuntimePort):
         environment["BACKUP_RUNTIME_TYPE"] = "native"
         environment["BACKUP_STOP_CONTAINERS"] = "false"
         environment["BACKUP_SOURCES_JSON"] = json.dumps(filesystem_paths, ensure_ascii=False, separators=(",", ":"))
-        command = RuntimeCommandPolicy.validate(payload.get("command"))
+        # Native file regex filter (S2): the regex is read ONLY from the scoped
+        # target payload environment; a worker-wide value is never inherited.
+        # The engine performs the bounded scan and regex validation itself,
+        # failing loudly before any repository contact.
+        environment.pop(NATIVE_FILE_REGEX_ENV, None)
+        environment.pop(NATIVE_FILE_FILTER_TAG_ENV, None)
+        raw_filter_regex = raw_environment.get(NATIVE_FILE_REGEX_ENV)
+        filter_active = isinstance(raw_filter_regex, str) and bool(raw_filter_regex.strip())
+        filter_tag = None
+        if filter_active:
+            # A scoped target keeps its snapshot under one stable tag derived
+            # from the target ID; a missing target ID stays fail-closed (the
+            # engine rejects the regex without the tag).
+            if isinstance(payload.get("target_id"), str) and payload.get("target_id").strip():
+                filter_tag = filter_scope_tag(payload.get("target_id"))
+            environment[NATIVE_FILE_REGEX_ENV] = raw_filter_regex
+            if filter_tag:
+                environment[NATIVE_FILE_FILTER_TAG_ENV] = filter_tag
+        marker_used = False
+        raw_command = payload.get("command")
+        if isinstance(raw_command, str):
+            stripped = raw_command.strip()
+            if stripped.startswith(f"{NATIVE_FILE_FILTER_COMMAND_MARKER} "):
+                marker_used = True
+                raw_command = stripped[len(NATIVE_FILE_FILTER_COMMAND_MARKER) + 1 :]
+        elif isinstance(raw_command, (list, tuple)) and raw_command and raw_command[0] == NATIVE_FILE_FILTER_COMMAND_MARKER:
+            marker_used = True
+            raw_command = list(raw_command[1:])
+        # The internal marker is a fail-closed mixed-version guard: only a new
+        # native worker with the regex configured unwraps it, so an old worker
+        # rejects the unknown prefix instead of silently backing up everything
+        # or running an unscoped forget.
+        if marker_used and not filter_active:
+            raise ValueError(
+                f"{NATIVE_FILE_FILTER_COMMAND_MARKER} commands require {NATIVE_FILE_REGEX_ENV} "
+                "in the target runtime environment"
+            )
+        command = RuntimeCommandPolicy.validate(raw_command)
         RuntimeCommandPolicy.validate_snapshot_scope(payload, command)
+        if marker_used:
+            if command != ["/root/backup.sh"] and not (len(command) >= 2 and command[:2] == ["restic", "forget"]):
+                raise ValueError(
+                    f"{NATIVE_FILE_FILTER_COMMAND_MARKER} commands only allow the native backup "
+                    "default or a bounded restic forget"
+                )
         command = RuntimeCommandPolicy.apply_lock_policy(command, self.no_lock)
+        if filter_active and command[:2] == ["restic", "forget"]:
+            command = scoped_forget_argv(command, filter_tag)
         if command == ["/root/backup.sh"]:
             environment["PYTHONIOENCODING"] = "utf-8"
             return self._backup_engine_command(), environment

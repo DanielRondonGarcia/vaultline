@@ -2144,7 +2144,7 @@ docker compose up -d
                <div class="form-grid" style="margin-top:8px">
                  ${hasDefaultPassword ? `<div class="field"><label for="targetResticPasswordSecret">Password restic (secret) — opcional</label><select id="targetResticPasswordSecret"><option value="">-- Usar default de Settings --</option>${passwordSecretOptions}</select><div class="helper">Si lo dejas vacio, se usara el password default del Control Plane.</div></div>` : ""}
                  <div class="field"><label for="targetRuntimeCommand">Comando de backup (opcional)</label><input id="targetRuntimeCommand" placeholder="Por defecto: /root/backup.sh" /></div>
-                 <div class="field full"><label for="targetRuntimeEnvironment">Runtime environment JSON (opcional)</label><textarea id="targetRuntimeEnvironment" placeholder="{}">{}</textarea></div>
+                 <div class="field full"><label for="targetRuntimeEnvironment">Runtime environment JSON (opcional)</label><textarea id="targetRuntimeEnvironment" placeholder="{}">{}</textarea><div class="helper" data-runtime-section="native">Solo worker nativo: agrega <code>"BACKUP_NATIVE_FILE_REGEX": "regex"</code> para backupear únicamente los archivos regulares del primer nivel cuyo nombre coincida exactamente (p. ej. <code>vzdump-(?:qemu|lxc)-(?:100|105)-[0-9_]+-[0-9_]+\\.(?:vma|tar)\\.zst</code>). Sin matches o con regex inválida el job falla antes de tocar el repositorio.</div></div>
                  <div class="field full"><label for="targetRestoreDefaults">Restore defaults JSON (opcional)</label><textarea id="targetRestoreDefaults" placeholder="{}">{"layout":"auto"}</textarea></div>
                </div>
              </details>
@@ -5672,7 +5672,7 @@ docker compose up -d
                 <summary>Opciones avanzadas</summary>
                 <div class="form-grid" style="margin-top:8px">
                   <div class="field"><label for="etRuntimeCommand">Comando de backup (opcional)</label><input id="etRuntimeCommand" value="${escapeHtml(target.runtime_command || "")}" placeholder="Por defecto: /root/backup.sh" /></div>
-                  <div class="field full"><label for="etRuntimeEnvironment">Runtime environment JSON (opcional)</label><textarea id="etRuntimeEnvironment">${escapeHtml(JSON.stringify(target.runtime_environment || {}, null, 2))}</textarea></div>
+                  <div class="field full"><label for="etRuntimeEnvironment">Runtime environment JSON (opcional)</label><textarea id="etRuntimeEnvironment">${escapeHtml(JSON.stringify(target.runtime_environment || {}, null, 2))}</textarea><div class="helper" data-runtime-section="native">Solo worker nativo: agrega <code>"BACKUP_NATIVE_FILE_REGEX": "regex"</code> para backupear únicamente los archivos regulares del primer nivel cuyo nombre coincida exactamente (p. ej. <code>vzdump-(?:qemu|lxc)-(?:100|105)-[0-9_]+-[0-9_]+\\.(?:vma|tar)\\.zst</code>). Sin matches o con regex inválida el job falla antes de tocar el repositorio.</div></div>
                   <div class="field full"><label for="etRestoreDefaults">Restore defaults JSON (opcional)</label><textarea id="etRestoreDefaults">${escapeHtml(JSON.stringify(target.restore_defaults || {}, null, 2))}</textarea></div>
                 </div>
               </details>

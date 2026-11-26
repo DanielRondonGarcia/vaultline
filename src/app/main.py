@@ -16,6 +16,10 @@ except ModuleNotFoundError:  # Native workers do not require the Docker SDK.
 from src.app.infrastructure.adapters.notifier.influx_notifier import InfluxNotifier
 from src.app.infrastructure.adapters.backup_strategy import ResticBackupStrategy
 from src.restic_retention import restic_retention_config_from_environment
+from src.native_file_filter import (
+    NATIVE_FILE_FILTER_TAG_ENV,
+    NATIVE_FILE_REGEX_ENV,
+)
 
 class FlushingStreamHandler(logging.StreamHandler):
     def emit(self, record):
@@ -199,6 +203,22 @@ def main():
             raise RuntimeError("Docker SDK is required for non-native backup runtime")
         container_port = DockerAdapter()
 
+    # Native file regex filter (native runtime only): the regex must come from
+    # the scoped runtime environment and always with the worker-derived stable
+    # scope tag; a whitespace-only value means unset.
+    native_file_regex = None
+    native_file_filter_tag = None
+    if runtime_type == "native":
+        raw_regex = os.environ.get(NATIVE_FILE_REGEX_ENV)
+        if isinstance(raw_regex, str) and raw_regex.strip():
+            native_file_regex = raw_regex
+            native_file_filter_tag = (os.environ.get(NATIVE_FILE_FILTER_TAG_ENV) or "").strip() or None
+            if not native_file_filter_tag:
+                raise ValueError(
+                    "Native file regex requires the filter scope tag "
+                    f"(missing {NATIVE_FILE_FILTER_TAG_ENV})"
+                )
+
     if _env_bool("RESTORE_MODE"):
         if runtime_type == "native" and _env_bool("RESTORE_STOP_CONTAINERS"):
             raise ValueError("native restore must not stop containers")
@@ -264,6 +284,8 @@ def main():
         backup_strategy=backup_strategy_name,
         pre_backup_command=pre_backup_cmd,
         post_backup_command=post_backup_cmd,
+        native_file_regex=native_file_regex,
+        native_file_filter_tag=native_file_filter_tag,
         **restic_retention,
     )
 

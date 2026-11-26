@@ -16,6 +16,18 @@ from src.app.domain.models import BackupConfig, BackupResult, RestoreConfig, Res
 from src.app.application.ports.ports import BackupStrategy, RestoreStrategy
 from src.app.domain.restore_ownership import RestoreOwnershipPolicy, parse_uid_gid
 from src.restic_retention import build_restic_forget_command
+from src.native_file_filter import (
+    NATIVE_FILE_FILTER_TAG_ENV,
+    NATIVE_FILE_FILTER_TAG_PREFIX,
+    NATIVE_FILE_FORGET_GROUP_BY,
+    log_match_line,
+    remove_nul_separated_manifest,
+    scoped_forget_argv,
+    select_native_matches,
+    write_nul_separated_manifest,
+)
+
+_FILTERED_TAG_PREFIX = NATIVE_FILE_FILTER_TAG_PREFIX + "-"
 from src.restic_executable import (
     resolve_restic_executable,
     restic_command_with_backend_options,
@@ -806,10 +818,32 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             
         sources = config.source_paths
         logger.info(f"Running restic backup for {sources}")
-        
+
+        manifest_path = None
         try:
             restic = _require_executable("restic") or "restic"
             env = restic_subprocess_environment(env)
+            # Native file regex filter (S2): selection happens BEFORE any
+            # repository contact, so no matches or an invalid regex can never
+            # initialize or mutate the repository.
+            filter_regex = getattr(config, "native_file_regex", None)
+            filter_sources = list(sources)
+            filter_tag = getattr(config, "native_file_filter_tag", None)
+            if filter_regex:
+                filter_sources = select_native_matches(sources, filter_regex)
+                logger.info(
+                    f"Native file regex matched {len(filter_sources)} regular file(s); "
+                    "backing up only those entries"
+                )
+                for match in filter_sources:
+                    logger.info("Native file filter match: %s", log_match_line(match))
+                if not filter_tag:
+                    raise RuntimeError(
+                        "Native file regex requires the filter scope tag "
+                        f"(missing {NATIVE_FILE_FILTER_TAG_ENV})"
+                    )
+                manifest_path = write_nul_separated_manifest(filter_sources)
+
             # Check if repo is initialized
             init_check_cmd = [restic, "snapshots", "--json", "--latest", "1"]
             check_stdout, check_stderr, check_status = self._run_with_lock_recovery(
@@ -829,7 +863,14 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                     logger.error(f"Failed to initialize restic repository: {e}")
                     raise e
 
-            cmd = [restic, "backup", "--json"] + sources
+            cmd = [restic, "backup", "--json"]
+            if filter_regex:
+                cmd.extend([
+                    "--tag", filter_tag, "--group-by", NATIVE_FILE_FORGET_GROUP_BY,
+                    "--files-from-raw", manifest_path,
+                ])
+            else:
+                cmd.extend(sources)
             stdout, stderr, return_code = self._run_with_lock_recovery(
                 restic, env, lambda: self._run_incremental_backup(cmd, env, output_callback)
             )
@@ -860,6 +901,12 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                 keep_yearly=config.restic_keep_yearly,
                 prune=config.restic_prune,
             )
+            if filter_regex:
+                prune_cmd = scoped_forget_argv(prune_cmd, filter_tag)
+                logger.info(
+                    "Scoping native file filter retention to tag %s (grouped by host and tags)",
+                    filter_tag,
+                )
             prune_cmd[0] = restic
             logger.info(
                 "Pruning old snapshots..."
@@ -908,6 +955,9 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                 success=False,
                 error=str(e)
             )
+        finally:
+            if manifest_path:
+                remove_nul_separated_manifest(manifest_path)
 
     def restore(self, source_path: str, config: RestoreConfig) -> RestoreResult:
         timestamp = datetime.now()
@@ -939,10 +989,27 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             policy = _ownership_policy(config)
             snapshot = source_path or config.source or "latest"
             restore_specs = [snapshot]
+
+            def _verify_subtree(subtree: str) -> str:
+                # The exact-source `restic ls --json` preflight also reads the
+                # snapshot header: a snapshot tagged with the reserved native
+                # file filter tag only ever contains the matched files, so a
+                # replace-target restore would clear every unmatched entry on
+                # the host and is refused here, BEFORE any mutation.
+                kind, filtered_tag = self._inspect_native_subtree(restic, env, snapshot, subtree)
+                if filtered_tag and not preserve_only:
+                    raise NativeSourceSelectionError(
+                        f"Filtered native snapshots require preserve mode: snapshot {snapshot} "
+                        f"carries the native file filter tag {filtered_tag} and a replace-target "
+                        "restore would clear unmatched host files",
+                        "filtered_native_snapshot_force_rejected",
+                    )
+                return kind
+
             selection = _select_native_source_subtree(config)
             if selection is not None:
                 selected_source, subtree = selection
-                self._inspect_native_subtree(restic, env, snapshot, subtree)
+                _verify_subtree(subtree)
                 restore_specs = [f"{snapshot}:{subtree}"]
                 message = f"Original-path restore selected configured source subtree: {subtree}"
                 actions.append(message)
@@ -952,7 +1019,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                 direct_specs = _plan_native_direct_restore_specs(
                     config,
                     snapshot,
-                    lambda subtree: self._inspect_native_subtree(restic, env, snapshot, subtree),
+                    lambda subtree: _verify_subtree(subtree),
                 )
                 if direct_specs is not None:
                     restore_specs = direct_specs
@@ -1067,7 +1134,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _inspect_native_subtree(self, restic: str, env: dict[str, str], snapshot: str, subtree: str) -> str:
+    def _inspect_native_subtree(self, restic: str, env: dict[str, str], snapshot: str, subtree: str) -> tuple[str, str | None]:
         """Validate the selected snapshot subtree with `restic ls --json` BEFORE any
         destructive action and classify it. The listing is streamed with a bounded
         byte budget (existing restic metadata helpers) and a node is only accepted
@@ -1075,7 +1142,11 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
         compared case-insensitively, mirroring filesystem semantics); a child line
         alone is never accepted. A file source is rejected, a missing subtree fails
         closed, and malformed or over-budget output fails closed — both without
-        touching the restore target."""
+        touching the restore target. The snapshot header line's tags are also
+        surfaced: the return value is ``(kind, filtered_tag)``, where
+        ``filtered_tag`` is the reserved native file filter tag when present.
+        Note: the early-exit on the matched node stops the read-only listing
+        right after the header, so the header is always observed first."""
         from src.app.infrastructure.adapters.restic_metadata import (
             MAX_STDERR_TAIL_BYTES,
             _drain_stderr,
@@ -1090,6 +1161,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
         stderr_tail = bytearray()
         stderr_errors: list[Exception] = []
         matched = None
+        filtered_tag = None
         failure = None
         finished = False
         budget = self._LS_PREFLIGHT_BUDGET_BYTES
@@ -1148,6 +1220,15 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                             "native_subtree_unverified",
                         )
                         break
+                    if payload.get("struct_type") == "snapshot":
+                        # The restic ls header exposes the snapshot tags; a
+                        # reserved native file filter tag marks snapshots that
+                        # only ever contained the matched files.
+                        for tag in payload.get("tags") or ():
+                            if isinstance(tag, str) and tag.startswith(_FILTERED_TAG_PREFIX):
+                                filtered_tag = tag
+                                break
+                        continue
                     if payload.get("struct_type") != "node":
                         continue
                     path = payload.get("path")
@@ -1211,7 +1292,7 @@ class ResticBackupStrategy(BackupStrategy, RestoreStrategy):
                 f"in snapshot {snapshot}; original-path restore requires a directory source",
                 "native_source_file_rejected",
             )
-        return "dir"
+        return "dir", filtered_tag
 
     @staticmethod
     def _subtree_rejection(message: str, category: str) -> NativeSourceSelectionError:

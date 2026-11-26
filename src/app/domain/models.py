@@ -31,6 +31,11 @@ class BackupConfig:
     restic_keep_last: Optional[int] = None
     restic_keep_hourly: Optional[int] = None
     restic_prune: bool = True
+    # Native file regex filter (native runtime only): when set, only the
+    # immediate regular files matching the regex are backed up and every
+    # snapshot/retention command is scoped with the stable filter tag.
+    native_file_regex: Optional[str] = None
+    native_file_filter_tag: Optional[str] = None
 
 @dataclass
 class ContainerConfig:

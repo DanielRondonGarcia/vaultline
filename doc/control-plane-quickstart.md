@@ -738,6 +738,56 @@ y montaje esperado para restore.
 curl http://127.0.0.1:8080/api/v1/targets/<target_id>/validate
 ```
 
+### Backup nativo filtrado por expresión regular (solo archivos concretos)
+
+Un target de filesystem nativo puede configurar `BACKUP_NATIVE_FILE_REGEX` en
+`runtime_environment` (opción exclusiva del runtime nativo). Con el filtro
+activo, el worker nativo recorre una sola vez los directorios configurados y
+selecciona únicamente los archivos regulares del primer nivel cuyo nombre
+coincide de forma exacta (`fullmatch`) con la expresión regular; los
+subdirectorios, enlaces simbólicos y coincidencias parciales nunca se
+incluyen, y no se ejecuta ningún shell. Una regex inválida o cero
+coincidencias falla el job antes de tocar el repositorio, sin respaldo a
+"todo el directorio".
+
+Para Proxmox, agrega la ruta real de los dumps (por ejemplo,
+`/var/lib/vz/dump`) a **Filesystem paths** del target nativo. En
+**Runtime environment JSON**, agrega esta clave sin reemplazar las opciones
+de almacenamiento existentes. El ejemplo selecciona los archivos comprimidos
+de las máquinas 100 y 105:
+
+```json
+{
+  "BACKUP_NATIVE_FILE_REGEX": "vzdump-(?:qemu|lxc)-(?:100|105)-[0-9_]+-[0-9_]+\\.(?:vma|tar)\\.zst"
+}
+```
+
+El log del job registra el número de coincidencias y cada ruta seleccionada:
+los nombres aparecen escapados en JSON, por lo que un nombre de archivo no
+puede inyectar saltos de línea falsos en el log.
+
+Retención: cada snapshot filtrado recibe una etiqueta reservada
+`vaultline-file-filter-<hash-del-target>` (no configurable por el usuario);
+el olvido automático del motor y un `restic forget` manual sobre un target
+filtrado se limitan a `--tag <alcance> --group-by host,tags`, de modo que los
+nombres dinámicos de archivo siguen formando un solo grupo de retención. Se
+recomienda un repositorio dedicado por target filtrado: un `restic forget`
+sin ese alcance sobre un repositorio compartido no conoce esta etiqueta.
+
+Para restaurar en el mismo lugar, elige el directorio original y deja
+activado el modo **preservación**: el worker recupera los archivos faltantes
+sin modificar los que ya existen, coincidan o no con la expresión. El worker
+rechaza el modo de reemplazo de un snapshot filtrado al restaurar el
+subárbol nativo en el directorio original, incluso si quitaste la regex del
+target después del backup. No uses el modo de reemplazo con un snapshot
+filtrado al restaurar hacia la raíz del sistema de archivos.
+
+Versiones mixtas: el marcaje interno `vaultline-native-file-filter` solo lo
+entiende un worker nativo actualizado; un worker antiguo rechaza el job
+filtrado en lugar de hacer un backup completo o un forget sin alcance, así
+que actualiza primero el Control Plane y después el worker nativo antes de
+usar el filtro.
+
 ## 6. Operaciones
 
 ### Disparar backup para un target

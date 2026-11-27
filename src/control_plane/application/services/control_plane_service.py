@@ -12,6 +12,7 @@ import ssl
 import threading
 import time
 import urllib.request
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,6 +61,10 @@ from src.control_plane.domain.models import (
 )
 from src.control_plane.application.services.backup_audit_report import build_backup_audit_report, parse_audit_period
 from src.restic_retention import apply_target_retention_policy, build_restic_forget_command
+from src.native_file_filter import (
+    NATIVE_FILE_FILTER_COMMAND_MARKER,
+    NATIVE_FILE_REGEX_ENV,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2661,6 +2666,22 @@ class ControlPlaneService:
             raise ValueError("RESTORE_READ_ONLY_PATHS exceeds the permitted size")
         return encoded
 
+    @staticmethod
+    def _native_file_filter_command(command: Any, target: BackupTargetRecord, environment: Any) -> Any:
+        """Prefix the filtered native payload command with the internal
+        mixed-version marker (S2): the marker only applies to native targets
+        whose runtime environment configures BACKUP_NATIVE_FILE_REGEX. An old
+        native worker fails closed on the unknown prefix instead of silently
+        backing up every file or running an unscoped forget."""
+        if getattr(target, "runtime_type", None) != "native" or not isinstance(environment, Mapping):
+            return command
+        regex_value = environment.get(NATIVE_FILE_REGEX_ENV)
+        if not isinstance(regex_value, str) or not regex_value.strip():
+            return command
+        if isinstance(command, list):
+            return [NATIVE_FILE_FILTER_COMMAND_MARKER, *command]
+        return f"{NATIVE_FILE_FILTER_COMMAND_MARKER} {command or '/root/backup.sh'}"
+
     def _build_backup_payload(
         self,
         target: BackupTargetRecord,
@@ -2719,6 +2740,7 @@ class ControlPlaneService:
             "labels": target.labels,
             "storage_context": storage_context,
         }
+        payload["command"] = self._native_file_filter_command(payload["command"], target, environment)
         return payload
 
     def _build_snapshot_list_payload(self, target: BackupTargetRecord) -> Dict[str, Any]:
@@ -2946,6 +2968,7 @@ class ControlPlaneService:
             prune=policy.prune,
         )
 
+        command = " ".join(command_parts)
         return {
             "target_id": target.id,
             "runtime_type": target.runtime_type,
@@ -2954,7 +2977,7 @@ class ControlPlaneService:
             "compose_project": target.compose_project,
             "filesystem_paths": list(getattr(target, "filesystem_paths", []) or []),
             "image": target.runtime_image,
-            "command": " ".join(command_parts),
+            "command": self._native_file_filter_command(command, target, environment),
             "environment": environment,
             "volumes": volumes,
             "network_mode": target.runtime_network_mode,

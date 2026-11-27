@@ -2144,7 +2144,7 @@ docker compose up -d
                <div class="form-grid" style="margin-top:8px">
                  ${hasDefaultPassword ? `<div class="field"><label for="targetResticPasswordSecret">Password restic (secret) — opcional</label><select id="targetResticPasswordSecret"><option value="">-- Usar default de Settings --</option>${passwordSecretOptions}</select><div class="helper">Si lo dejas vacio, se usara el password default del Control Plane.</div></div>` : ""}
                  <div class="field"><label for="targetRuntimeCommand">Comando de backup (opcional)</label><input id="targetRuntimeCommand" placeholder="Por defecto: /root/backup.sh" /></div>
-                 <div class="field full"><label for="targetRuntimeEnvironment">Runtime environment JSON (opcional)</label><textarea id="targetRuntimeEnvironment" placeholder="{}">{}</textarea></div>
+                 <div class="field full"><label for="targetRuntimeEnvironment">Runtime environment JSON (opcional)</label><textarea id="targetRuntimeEnvironment" placeholder="{}">{}</textarea><div class="helper" data-runtime-section="native">Solo worker nativo: agrega <code>"BACKUP_NATIVE_FILE_REGEX": "regex"</code> para backupear únicamente los archivos regulares del primer nivel cuyo nombre coincida exactamente (p. ej. <code>vzdump-(?:qemu|lxc)-(?:100|105)-[0-9_]+-[0-9_]+\\.(?:vma|tar)\\.zst</code>). Sin matches o con regex inválida el job falla antes de tocar el repositorio.</div></div>
                  <div class="field full"><label for="targetRestoreDefaults">Restore defaults JSON (opcional)</label><textarea id="targetRestoreDefaults" placeholder="{}">{"layout":"auto"}</textarea></div>
                </div>
              </details>
@@ -5672,7 +5672,7 @@ docker compose up -d
                 <summary>Opciones avanzadas</summary>
                 <div class="form-grid" style="margin-top:8px">
                   <div class="field"><label for="etRuntimeCommand">Comando de backup (opcional)</label><input id="etRuntimeCommand" value="${escapeHtml(target.runtime_command || "")}" placeholder="Por defecto: /root/backup.sh" /></div>
-                  <div class="field full"><label for="etRuntimeEnvironment">Runtime environment JSON (opcional)</label><textarea id="etRuntimeEnvironment">${escapeHtml(JSON.stringify(target.runtime_environment || {}, null, 2))}</textarea></div>
+                  <div class="field full"><label for="etRuntimeEnvironment">Runtime environment JSON (opcional)</label><textarea id="etRuntimeEnvironment">${escapeHtml(JSON.stringify(target.runtime_environment || {}, null, 2))}</textarea><div class="helper" data-runtime-section="native">Solo worker nativo: agrega <code>"BACKUP_NATIVE_FILE_REGEX": "regex"</code> para backupear únicamente los archivos regulares del primer nivel cuyo nombre coincida exactamente (p. ej. <code>vzdump-(?:qemu|lxc)-(?:100|105)-[0-9_]+-[0-9_]+\\.(?:vma|tar)\\.zst</code>). Sin matches o con regex inválida el job falla antes de tocar el repositorio.</div></div>
                   <div class="field full"><label for="etRestoreDefaults">Restore defaults JSON (opcional)</label><textarea id="etRestoreDefaults">${escapeHtml(JSON.stringify(target.restore_defaults || {}, null, 2))}</textarea></div>
                 </div>
               </details>
@@ -8446,10 +8446,12 @@ docker compose up -d
       const keepDaily = retentionRuleValue(policy, "keep_daily");
       const keepWeekly = retentionRuleValue(policy, "keep_weekly");
       const keepMonthly = retentionRuleValue(policy, "keep_monthly");
+      const keepYearly = retentionRuleValue(policy, "keep_yearly");
       if (keepLast) clauses.push(`Conservará los últimos ${keepLast} snapshots disponibles`);
       if (keepDaily) clauses.push(`cubrirá hasta ${keepDaily} días con snapshots disponibles`);
       if (keepWeekly) clauses.push(`cubrirá hasta ${keepWeekly} semanas con snapshots disponibles`);
       if (keepMonthly) clauses.push(`cubrirá hasta ${keepMonthly} meses con snapshots disponibles`);
+      if (keepYearly) clauses.push(`cubrirá hasta ${keepYearly} ${keepYearly === 1 ? "año" : "años"} con snapshots disponibles`);
       return clauses.length
         ? `${clauses.join("; ")}.`
         : "No se ha configurado ninguna regla de conservación.";
@@ -8471,6 +8473,7 @@ docker compose up -d
         keep_daily: count("rpKeepDaily"),
         keep_weekly: count("rpKeepWeekly"),
         keep_monthly: count("rpKeepMonthly"),
+        keep_yearly: count("rpKeepYearly"),
         prune: true,
       };
     }
@@ -8492,8 +8495,9 @@ docker compose up -d
             <td class="mono">${escapeHtml(String(policy.keep_daily ?? "—"))}</td>
             <td class="mono">${escapeHtml(String(policy.keep_weekly ?? "—"))}</td>
             <td class="mono">${escapeHtml(String(policy.keep_monthly ?? "—"))}</td>
+            <td class="mono">${escapeHtml(String(policy.keep_yearly ?? "—"))}</td>
           </tr>`).join("")
-        : `<tr><td colspan="5" class="empty-state">Sin políticas de retención</td></tr>`;
+        : `<tr><td colspan="6" class="empty-state">Sin políticas de retención</td></tr>`;
       content.innerHTML = `
         <div class="page-header"><div><h2>Retention Policies</h2><div class="subtitle">Políticas de retención de backups</div></div></div>
         <div class="retention-layout">
@@ -8506,13 +8510,14 @@ docker compose up -d
                   <div class="field"><label for="rpKeepDaily">Keep daily</label><input id="rpKeepDaily" type="number" min="0" value="7" /></div>
                   <div class="field"><label for="rpKeepWeekly">Keep weekly</label><input id="rpKeepWeekly" type="number" min="0" value="4" /></div>
                   <div class="field"><label for="rpKeepMonthly">Keep monthly</label><input id="rpKeepMonthly" type="number" min="0" value="6" /></div>
+                  <div class="field"><label for="rpKeepYearly">Keep yearly</label><input id="rpKeepYearly" type="number" min="0" value="0" /></div>
                 </div>
                 <div class="btn-row"><button type="submit" class="btn primary sm">Crear política</button></div>
               </form>
             </div></details>
             <div class="page-header"><div><h2>Políticas configuradas</h2><div class="subtitle">Selecciona una fila para ver su resumen</div></div></div>
             <div class="table-wrap"><div class="sheet"><table class="table retention-policy-table" aria-label="Políticas de retención configuradas">
-              <thead><tr><th>Nombre</th><th>Keep last</th><th>Keep daily</th><th>Keep weekly</th><th>Keep monthly</th></tr></thead>
+              <thead><tr><th>Nombre</th><th>Keep last</th><th>Keep daily</th><th>Keep weekly</th><th>Keep monthly</th><th>Keep yearly</th></tr></thead>
               <tbody>${policyRows}</tbody>
             </table></div></div>
           </div>
@@ -8521,7 +8526,7 @@ docker compose up -d
               <h3 id="retentionGuideTitle">Cómo funciona la retención</h3>
               <p><strong>Keep last</strong> conserva las últimas snapshots que ya existen, sin importar su fecha.</p>
               <p><strong>Keep daily</strong> conserva hasta una snapshot disponible por cada día dentro del límite indicado.</p>
-              <p><strong>Keep weekly</strong> y <strong>Keep monthly</strong> aplican el mismo criterio por semana y por mes.</p>
+              <p><strong>Keep weekly</strong>, <strong>Keep monthly</strong> y <strong>Keep yearly</strong> aplican el mismo criterio por semana, mes y año. Usa 0 para desactivar una regla.</p>
               <p>Las reglas se combinan como una <strong>unión</strong>: se conserva una snapshot si cumple al menos una regla.</p>
               <p>Estas reglas retienen snapshots existentes; no crean backups ni prometen snapshots para días o semanas sin backups.</p>
               <p>Cuando la retención se ejecuta, <strong>prune</strong> libera datos sin referencias que ya no necesita ninguna snapshot retenida.</p>
@@ -8533,7 +8538,7 @@ docker compose up -d
           </aside>
         </div>
       `;
-      const draftInputs = ["rpKeepLast", "rpKeepDaily", "rpKeepWeekly", "rpKeepMonthly"];
+      const draftInputs = ["rpKeepLast", "rpKeepDaily", "rpKeepWeekly", "rpKeepMonthly", "rpKeepYearly"];
       const showDraftSummary = () => {
         document.querySelectorAll(".retention-policy-row.is-selected").forEach(row => {
           row.classList.remove("is-selected");
@@ -8573,6 +8578,7 @@ docker compose up -d
               keep_daily: retentionPolicyFromForm().keep_daily,
               keep_weekly: retentionPolicyFromForm().keep_weekly,
               keep_monthly: retentionPolicyFromForm().keep_monthly,
+              keep_yearly: retentionPolicyFromForm().keep_yearly,
             });
             await refreshAll();
           }, "Creando...").catch(() => {});

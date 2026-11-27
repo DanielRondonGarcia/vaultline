@@ -2074,6 +2074,46 @@ process.stdout.write("unknown outcome explanation passed");
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "unknown outcome explanation passed")
 
+    @unittest.skipUnless(shutil.which("node"), "node is required for the retention UI harness")
+    def test_retention_page_previews_sends_and_displays_yearly_count(self):
+        functions = self.source.split("    function retentionRuleValue(", 1)[1].split("    function renderSecrets(", 1)[0]
+        script = """
+const assert = require('node:assert/strict');
+let submitted;
+const fields = new Map(Object.entries({
+  rpName: {value: 'Annual'}, rpKeepLast: {value: '7'}, rpKeepDaily: {value: '7'},
+  rpKeepWeekly: {value: '4'}, rpKeepMonthly: {value: '6'}, rpKeepYearly: {value: '2'},
+  retentionPolicySummary: {}, createRetentionForm: {},
+}));
+for (const field of fields.values()) field.addEventListener = (name, fn) => { field[name] = fn; };
+const document = {getElementById: id => fields.get(id), querySelectorAll: () => []};
+const state = {retentionPolicies: [{id: 'annual', name: 'Annual', keep_yearly: 2}]};
+const escapeHtml = String;
+const withBtnLoading = (_, run) => run();
+const apiPost = async (...args) => { submitted = args; };
+const refreshAll = async () => {};
+""" + "    function retentionRuleValue(" + functions + r"""
+(async () => {
+  const content = {};
+  renderRetention(content);
+  assert.match(content.innerHTML, /<input id="rpKeepYearly" type="number" min="0"/);
+  assert.ok(content.innerHTML.includes('<th>Keep yearly</th>'));
+  assert.ok(content.innerHTML.includes('<td class="mono">2</td>'));
+  assert.match(fields.get('retentionPolicySummary').innerHTML, /2 años/);
+  fields.get('rpKeepYearly').value = '3';
+  fields.get('rpKeepYearly').input();
+  assert.match(fields.get('retentionPolicySummary').innerHTML, /3 años/);
+  await fields.get('createRetentionForm').submit({preventDefault() {}});
+  assert.deepEqual(submitted, ['/api/v1/retention-policies', {
+    name: 'Annual', keep_last: 7, keep_daily: 7, keep_weekly: 4, keep_monthly: 6, keep_yearly: 3,
+  }]);
+})().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+        result = subprocess.run(["node", "-"], input=script, capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
     def test_retention_guide_explains_union_prune_and_updates_draft_or_selected_policy_summary(self):
         retention = re.search(r"function renderRetention\(content\) \{.*?\n    \}\n\n    function renderSecrets", self.source, re.S)
         self.assertIsNotNone(retention)

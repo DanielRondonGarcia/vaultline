@@ -148,6 +148,54 @@ class NativeFilesystemTargetTests(unittest.TestCase):
         self.assertNotIn("/backup", "\n".join(job.payload["filesystem_paths"]))
         self.assertEqual(job.payload["volumes"], {})
 
+    def test_filtered_native_dispatch_carries_marker_and_plain_native_does_not(self):
+        service = self.make_service()
+        filtered = service.register_target(
+            "proxmox-tasks",
+            "worker-native",
+            runtime_type="native",
+            filesystem_paths=["C:\\Proxmox dump"],
+            runtime_environment={
+                "RESTIC_REPOSITORY": "local:/repo",
+                "RESTIC_PASSWORD": "pw",
+                "BACKUP_NATIVE_FILE_REGEX": "vzdump-(?:qemu|lxc)-(?:100|105)-[0-9_]+-[0-9_]+\\.(?:vma|tar)\\.zst",
+            },
+        )
+        job = service.dispatch_backup_for_target(filtered.id)
+        self.assertEqual(
+            job.payload["command"],
+            "vaultline-native-file-filter /root/backup.sh",
+        )
+        policy = service.create_retention_policy("filtered", keep_last=1)
+        target = service.target_repository.get(filtered.id)
+        target.retention_policy_id = policy.id
+        service.target_repository.save(target)
+        retention = service._build_retention_payload(target)
+        self.assertEqual(
+            retention["command"],
+            "vaultline-native-file-filter restic forget --keep-last 1 --prune",
+        )
+
+        plain = service.register_target(
+            "native-plain",
+            "worker-native",
+            runtime_type="native",
+            filesystem_paths=["/srv/data"],
+            runtime_environment={"RESTIC_REPOSITORY": "local:/repo", "RESTIC_PASSWORD": "pw"},
+        )
+        plain_job = service.dispatch_backup_for_target(plain.id)
+        self.assertNotIn(
+            "vaultline-native-file-filter", str(plain_job.payload["command"])
+        )
+        plain_target = service.target_repository.get(plain.id)
+        plain_target.retention_policy_id = policy.id
+        service.target_repository.save(plain_target)
+        plain_retention = service._build_retention_payload(plain_target)
+        self.assertEqual(
+            plain_retention["command"],
+            "restic forget --keep-last 1 --prune",
+        )
+
     def test_native_target_rejects_implicit_or_mixed_source_configuration(self):
         service = self.make_service()
 
